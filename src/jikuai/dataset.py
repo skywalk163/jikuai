@@ -1,6 +1,6 @@
 from pathlib import Path
 import random
-
+import sys
 IMG_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif',
                   '.tiff', '.webp')
 

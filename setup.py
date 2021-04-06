@@ -8,7 +8,7 @@ setuptools.setup(
     version="0.0.8",
     author="Skywalk",
     author_email="skywalk163@vip.qq.com",
-    description="A small tools for AI",
+    description="A small tools for AI ",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/skywalk163/jikuai",

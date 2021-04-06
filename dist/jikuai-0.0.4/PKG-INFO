@@ -1,0 +1,19 @@
+Metadata-Version: 2.1
+Name: jikuai
+Version: 0.0.4
+Summary: A small tools for AI
+Home-page: https://github.com/skywalk163/jikuai
+Author: Skywalk
+Author-email: skywalk163@vip.qq.com
+License: UNKNOWN
+Project-URL: Bug Tracker, https://github.com/skywalk163/jikuai/issues
+Description: # jikuai Package
+        
+        This is a simple tools package for AI.
+        0.04
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown

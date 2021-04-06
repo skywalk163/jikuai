@@ -21,12 +21,13 @@ AI训练小工具
 
 1.  
 想把数据集列表放在哪里，就在哪个目录下执行下面的命令。这里我们生成数据集列表文件在~/ ,以notebook cell单元格格式为例：
-'
+```
 %cd ~/
 from jikuai.dataset import Dataset
 dataset = Dataset("work/data/螺栓质量检测-训练集") # 参数为数据集所在的位置，是分类目录的上一级目录
 dataset.paddleclasout(0.8) # 生成训练集和测试集列表，参数为两者划分的比例值
-'
+
+```
 这样就会在~/目录，生成train.txt和eval.txt两个文件。使用PaddleClas分类训练的时候，在yaml配置文件中设置这两个文件参数即可。
 
 dataset.paddleclasout可跟的参数为：

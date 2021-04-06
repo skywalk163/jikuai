@@ -122,3 +122,4 @@ def make_dataset(dir, class_to_idx, extensions, is_valid_file=None):
 if __name__ == "__main__":
     dataset = Dataset(".")
     print(dataset.paddleclastxt(0.8))
+#0.08

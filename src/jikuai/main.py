@@ -8,7 +8,7 @@ from .evaluator import Evaluator, JiKuaiError
 from .errors import ErrorFormatter
 
 
-VERSION = "0.3.2"
+VERSION = "0.4.1"
 BANNER = f"""
 ╔══════════════════════════════════╗
 ║   极快 JiKuai v{VERSION}                  ║

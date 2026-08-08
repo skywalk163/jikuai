@@ -202,6 +202,7 @@ class Import(Node):
     module: str
     names: Optional[List[str]] = None
     alias: Optional[str] = None
+    kind: str = 'jk'   # 'jk' 或 'python'（ADR-10：`蟒:` 前缀路由）
 
 
 @dataclass

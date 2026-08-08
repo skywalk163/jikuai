@@ -229,8 +229,10 @@ class ReplSession:
         self.state = STATE_IDLE
         self.out = out if out is not None else sys.stdout
         self.err = err if err is not None else sys.stderr
-        # D-04 / ADR-06：会话级用户定义名白名单，跨输入累积后注入 Lexer，
-        # 使上一次输入里定义的方法/字段名在后续输入的调用点不被切碎。
+        # D-04 / ADR-06 / DEF-02：会话级用户定义名白名单，跨输入累积后注入 Lexer。
+        # DEF-02 起改为 `(name, kind, owner_class)` 三元组集合，使类内 method/field
+        # 在下一次分词时不被提升为会话全域（顶层仍走内建动词语义），而仅在 `.成员`
+        # 松弛路径可命中。
         self._session_defs = set()
 
     # ---------- 纯逻辑：判定与解析 ----------
@@ -331,10 +333,12 @@ class ReplSession:
             self.state = STATE_CONTINUE
             return 'continue'
         try:
-            # D-04：注入会话级白名单，并把本次收集到的定义名累积回会话
+            # D-04 / DEF-02：注入会话级白名单，并把本次收集到的定义**签名**
+            # （name, kind, owner_class）累积回会话——携带类归属才能在下一次
+            # 分词时把类内 method/field 限定回类作用域。
             lexer = Lexer(src, external_defs=self._session_defs)
             tokens = lexer.tokenize()
-            self._session_defs |= set(lexer.get_user_defs())
+            self._session_defs |= set(lexer.get_user_def_signatures())
             self.evaluator._current_source = src
             result = self.evaluator.eval(parse(tokens), source=src)
             if result is not None:

@@ -423,22 +423,50 @@ class Parser:
 
     # ---------- 导入 ----------
 
+    #: ADR-10：Python 桥导入前缀。lexer 把 `蟒:math` 整体产出为一个 IDENT，
+    #: 因此这里只需按前缀切分，不需要额外 token 类型。
+    PY_IMPORT_PREFIXES = ('蟒:', '蟒：')
+
+    @classmethod
+    def _split_python_prefix(cls, text):
+        """`蟒:math` → `('python', 'math')`；普通模块名 → `('jk', 原文)`。"""
+        for prefix in cls.PY_IMPORT_PREFIXES:
+            if text.startswith(prefix):
+                return 'python', text[len(prefix):]
+        return 'jk', text
+
     def _parse_import(self):
         tok = self._cur()
         self._advance()  # 消费 "导入"
         mod_tok = self._expect_type(TokenType.IDENT, "导入后期望模块名")
+        kind, module = self._split_python_prefix(mod_tok.value)
+        if kind == 'python' and not module:
+            raise ParseError("「蟒:」后期望 Python 模块名", mod_tok)
         alias = None
         if self._match_kw_set(KW_AS):
             alias_tok = self._expect_type(TokenType.IDENT, "作为后期望别名")
             alias = alias_tok.value
         self._skip_period()
-        return self._loc(Import(module=mod_tok.value, alias=alias), tok)
+        # Python 侧默认绑定顶层名（`蟒:os.path` → `os`）
+        default_alias = module.split('.')[0] if kind == 'python' else None
+        return self._loc(
+            Import(module=module,
+                   alias=alias if alias is not None else default_alias,
+                   kind=kind),
+            tok)
 
     def _parse_from_import(self):
         """解析 从 模块 导入 名字1 名字2。"""
         tok = self._cur()
         self._advance()  # 消费 "从"
         mod_tok = self._expect_type(TokenType.IDENT, "从后期望模块名")
+        kind, module = self._split_python_prefix(mod_tok.value)
+        if kind == 'python':
+            # ADR-10：`从 蟒:X 导入 名字` 未纳入本期契约（名字级导入会绕开
+            # PyModule 拒绝清单检查点）。显式拒绝，不静默降级。
+            raise ParseError(
+                "暂不支持「从 蟒:模块 导入 名字」；请写「导入 蟒:模块。」后用"
+                "「模块.函数(参数)」调用", mod_tok)
         if not self._match_kw_set(KW_IMPORT):
             raise ParseError("从...期望 导入", self._cur())
         names = []
@@ -449,7 +477,7 @@ class Parser:
         if not names:
             raise ParseError("导入后期望名字列表", self._cur())
         self._skip_period()
-        return self._loc(Import(module=mod_tok.value, names=names, alias=None), tok)
+        return self._loc(Import(module=module, names=names, alias=None), tok)
 
     def _parse_export(self):
         """解析 导出 名字1 名字2。"""

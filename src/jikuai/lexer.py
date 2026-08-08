@@ -1,22 +1,31 @@
 # -*- coding: utf-8 -*-
 """极快语言 - 无空格词法分析器（Lexer）。
 
-分词策略（v0.3.1 · ADR-06 方案 A：白名单最优先）：
-  1. 用户定义名白名单严格匹配（`_try_user_def_strict`）
+分词策略（v0.4.0 · ADR-09 方案 X1：类作用域限定白名单）：
+  1. 用户定义名白名单严格匹配（`_try_user_def_strict`，**按位置查 ScopeMap**）
   2. 最长关键字/动词匹配（贪心）
   3. 百家姓标识符识别
   4. 中文数字字面量转换
   5. 一般汉字标识符
 
-白名单来源 = 本次源码预扫描（`_prescan_definitions`）∪ 外部注入
-（`external_defs`，REPL 会话级累积）。
+白名单来源 = 本次源码预扫描（`_prescan_definitions` 构建 `ScopeMap`）∪
+外部注入（`external_defs`，REPL 会话级累积，全域可见）。
 
-⚠️ ADR-06 方案 A 副作用（同次分词全域生效）：
-一旦某内建动词名被登记进 user_defs 白名单，该名字在同次分词的**全域范围内**
-（包含类定义之外的顶层语句、同类其他方法体内、REPL 同一会话的后续输入）都
-失去内建动词语义、被整体识别为 IDENT。规避方式：方法/字段命名避开内建动词名，
-或把含动词名的类定义与使用同名动词的代码拆到不同 .jk 文件。
+关键区别（ADR-09 vs ADR-06 方案 A）：
+  - **顶层 `定义/函数/类 X`**：scope=[定义点, EOF)，全域可见（与旧行为等价）。
+  - **类内 `方法 X` / `自身.X=`**：scope=[类块起点, 类块终点)，**仅该类字符区间内**
+    生效；类外恢复内建动词/关键字语义。
+  - **成员访问后**（前一 token 为 `.`）：作用域检查松弛为「本次分词全部用户定义
+    名」，保证 `实例.成员` 无论跨类都能整体识别（AC-67 / AC-70）。
+  - `external_defs`：会话级注入，视作全域可见（scope=[0, EOF)）。
+
+回退开关：环境变量 `JIKUAI_LEGACY_ADR06=1` 时，`ScopeMap.visible_at` 退化为
+返回全部用户定义名（等价旧的平坦集合行为），用于紧急兜底。
 """
+
+import os
+from dataclasses import dataclass
+from typing import Optional
 
 from .tokens import Token, TokenType
 from .keywords import (
@@ -24,6 +33,115 @@ from .keywords import (
     CHINESE_DIGITS, CHINESE_UNITS, chinese_to_number
 )
 from .surnames import is_surname, is_compound_surname, COMPOUND_SURNAMES
+
+
+# ---------------------------------------------------------------------------
+# ADR-09 数据模型：DefEntry / ScopeMap
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DefEntry:
+    """一条用户定义名的字符可见区间记录。
+
+    Attributes:
+        name:          标识符名字（不含边界）。
+        kind:          'class' | 'func' | 'define' | 'method' | 'field' | 'external'。
+        scope_start:   源码字符偏移（闭区间起点）。
+        scope_end:     源码字符偏移（开区间终点）；`-1` 代表 EOF。
+        owner_class:   若属于类内成员（method/field），记录所属类名；否则为 None。
+
+    空区间约定（DEF-02）：`scope_start == scope_end == 0` 表示「**任何位置都不
+    可见**」。用于 REPL 注入的类内成员——本次源码里找不到其 owner_class 的类块
+    时登记为空区间，使它只能通过 `.成员` 松弛路径命中，不会在顶层夺走内建动词
+    语义。
+    """
+    name: str
+    kind: str
+    scope_start: int
+    scope_end: int
+    owner_class: Optional[str] = None
+
+
+# DEF-02 空区间哨兵：[0, 0) 为空集合，`visible_at` 任何 offset 都不命中。
+EMPTY_SCOPE = (0, 0)
+
+# 受类作用域约束的成员类别（不可提升为全域可见）
+SCOPED_KINDS = frozenset({'method', 'field'})
+
+
+class ScopeMap:
+    """字符位置 → 可见用户定义名集合。
+
+    ADR-09 语义：一个名字可以有**多条**登记记录（不同类各自登记同名方法），
+    `visible_at(offset)` 返回**所有覆盖该 offset 的记录**的名字并集。
+
+    ⚠️ 稳定契约：
+      - `all_names()` 返回本次分词内出现过的全部用户定义名（供 `.成员` 松弛路径
+        与 `get_user_defs()` 旧契约使用）。
+      - `signatures()` 返回 `(name, kind, owner_class)` 三元组集合（供 REPL
+        会话级累积，DEF-02 起替代平坦名字集合）。
+      - `visible_at(offset)` 若 `JIKUAI_LEGACY_ADR06=1`，则退化为 `all_names()`。
+    """
+
+    def __init__(self, legacy: bool = False):
+        self._entries: list[DefEntry] = []
+        self._legacy = legacy
+        self._names_cache: Optional[frozenset[str]] = None
+
+    def add(self, entry: DefEntry) -> None:
+        self._entries.append(entry)
+        self._names_cache = None
+
+    def add_global(self, name: str, kind: str = 'external',
+                   owner_class: Optional[str] = None) -> None:
+        """便捷方法：登记一个全域可见的用户定义名。"""
+        self.add(DefEntry(
+            name=name, kind=kind,
+            scope_start=0, scope_end=-1,
+            owner_class=owner_class,
+        ))
+
+    def add_member_only(self, name: str, kind: str,
+                        owner_class: Optional[str] = None) -> None:
+        """DEF-02：登记一个「仅成员访问可见」的名字（空区间）。
+
+        用于 REPL 注入的类内 method/field，其 owner_class 的类块不在本次源码中：
+        名字仍进入 `all_names()`（`.成员` 松弛路径可命中），但 `visible_at()`
+        在任何位置都不返回它——顶层 `打印 长度 列 1 2 3` 因此仍走内建动词。
+        """
+        start, end = EMPTY_SCOPE
+        self.add(DefEntry(
+            name=name, kind=kind,
+            scope_start=start, scope_end=end,
+            owner_class=owner_class,
+        ))
+
+    def visible_at(self, offset: int) -> frozenset[str]:
+        """返回 offset 处可见的名字集合。"""
+        if self._legacy:
+            return self.all_names()
+        names = set()
+        for e in self._entries:
+            if offset < e.scope_start:
+                continue
+            if e.scope_end != -1 and offset >= e.scope_end:
+                continue
+            names.add(e.name)
+        return frozenset(names)
+
+    def all_names(self) -> frozenset[str]:
+        """本次分词内出现过的全部用户定义名（不做作用域过滤）。"""
+        if self._names_cache is None:
+            self._names_cache = frozenset(e.name for e in self._entries)
+        return self._names_cache
+
+    def signatures(self) -> frozenset:
+        """返回 `(name, kind, owner_class)` 三元组集合（DEF-02 会话级累积契约）。"""
+        return frozenset((e.name, e.kind, e.owner_class) for e in self._entries)
+
+    def entries(self) -> list[DefEntry]:
+        """暴露内部条目列表（供测试/调试用，返回副本）。"""
+        return list(self._entries)
 
 
 def _is_han(ch):
@@ -57,16 +175,73 @@ class Lexer:
         all_words = set(ALL_KEYWORDS) | set(VERB_ARITY.keys()) | set(ADVERBS)
         self.max_word_len = max(len(w) for w in all_words) if all_words else 4
         self._word_set = all_words
+        # T-06 · ADR-09 回退开关：JIKUAI_LEGACY_ADR06=1 → 退回旧的平坦集合行为。
+        self.legacy_adr06 = os.environ.get('JIKUAI_LEGACY_ADR06') == '1'
         # 用户定义标识符（预扫描获取，防止被切分）。
-        # external_defs：外部注入的用户定义名集合（REPL 会话级），与 prescan 结果取并集。
+        # external_defs：外部注入的用户定义名（REPL 会话级）。DEF-02 起支持两种
+        # 元素形态：`str`（旧契约，全域可见）与 `(name, kind, owner_class)` 三元组
+        # （类内 method/field 保持类作用域，不提升为会话全域）。
         # _scan_src：注释与字符串内容被掩码为空格的源码副本（长度/行结构不变），
         # 供预扫描使用，避免注释里的 `-- 定义函数` 把 `函数` 误登记为用户名。
         self._scan_src = self._mask_source()
-        self._user_defs = self._prescan_definitions()
+        # T-01/T-02/T-03：预扫描输出 ScopeMap（含每条 def 的字符区间）
+        self.scope_map = self._prescan_definitions()
         if external_defs:
-            self._user_defs |= set(external_defs)
-        # 按长度降序缓存，供 _try_user_def_strict 使用（R-A 规则 1）
+            self._register_external_defs(external_defs)
+        # 全量名字集合（供 get_user_defs 契约与 `.成员` 松弛路径使用）
+        self._user_defs = set(self.scope_map.all_names())
+        # 按长度降序缓存候选名（长名优先，`返回值` 先于 `返回`）——R-A 规则 1
         self._defs_by_len = sorted(self._user_defs, key=len, reverse=True)
+
+    def _register_external_defs(self, external_defs):
+        """DEF-02：把外部注入的定义名按作用域登记进 `ScopeMap`。
+
+        元素形态：
+          - `str` → 全域可见（`kind='external'`）。保持 v0.3.1 `external_defs`
+            旧契约，供直接调用 `tokenize(src, external_defs={'X'})` 的既有测试。
+          - `(name, kind, owner_class)` → 按 kind 分流：
+            * kind ∈ `SCOPED_KINDS`（method/field）且 owner_class 非空：
+              若本次源码中存在同名类块 → 登记到该类的每个字符区间；
+              否则 → `add_member_only`（空区间，只能经 `.成员` 松弛命中）。
+            * 其他 kind（class/func/define/external）→ 全域可见。
+
+        这条规则是 DEF-02 的核心修复：REPL 上一轮定义的 `方法 长度` 不再被
+        提升为会话全域，因此下一轮顶层 `打印 长度 列 1 2 3。` 仍走内建动词。
+        """
+        regions_by_class = self._class_regions_by_name()
+        for item in external_defs:
+            if isinstance(item, str):
+                self.scope_map.add_global(item, kind='external')
+                continue
+            try:
+                name, kind, owner = item
+            except (TypeError, ValueError):
+                # 非预期形态：保守地按全域名字处理，不让分词整体失败
+                self.scope_map.add_global(str(item), kind='external')
+                continue
+            if kind in SCOPED_KINDS and owner:
+                regions = regions_by_class.get(owner)
+                if regions:
+                    for start, end in regions:
+                        self.scope_map.add(DefEntry(
+                            name=name, kind=kind,
+                            scope_start=start, scope_end=end,
+                            owner_class=owner,
+                        ))
+                else:
+                    self.scope_map.add_member_only(name, kind, owner)
+            else:
+                self.scope_map.add_global(name, kind=kind or 'external',
+                                          owner_class=owner)
+
+    def _class_regions_by_name(self):
+        """类名 → 该类的字符区间列表（同名类多次定义时可有多段）。"""
+        out = {}
+        for start, end in self._class_regions():
+            cname = self._class_name_at(start)
+            if cname:
+                out.setdefault(cname, []).append((start, end))
+        return out
 
     # ------------------------------------------------------------------
     # 预扫描（user_defs 白名单）
@@ -112,12 +287,23 @@ class Lexer:
         return ''.join(out)
 
     def _prescan_definitions(self):
-        """预扫描源码中的关键字后紧跟的标识符，收集到 user_defs 白名单。
+        """T-02/T-03：预扫描源码，构建并返回 `ScopeMap`（不再是平坦 `set[str]`）。
 
-        覆盖：`定义 X`、`函数 X`、`方法 X`、`类 X`，以及（v0.3.1 扩容）
-        `类` 块作用域内的 `自身.X =` 字段赋值名。这样后续 `_read_han`
-        的 `_try_user_def_strict` 能优先匹配到完整名字，避免姓氏后跟随的
-        动词字符（如 `乘`、`加`）把标识符切成两段。
+        覆盖：`定义 X`、`函数 X`、`方法 X`、`类 X`，以及 `类` 块作用域内的
+        `自身.X =` 字段赋值名。
+
+        ADR-09 作用域规则：
+
+        | 标记       | kind     | scope_start        | scope_end        | owner_class |
+        |------------|----------|--------------------|------------------|-------------|
+        | `定义 X`   | define   | 标记字位置         | -1（EOF）        | None        |
+        | `函数 X`   | func     | 标记字位置         | -1（EOF）        | None        |
+        | `类 X`     | class    | 标记字位置         | -1（EOF）        | None        |
+        | `方法 X`   | method   | 所属类块起点       | 所属类块终点     | 类名        |
+        | `自身.X =` | field    | 所属类块起点       | 所属类块终点     | 类名        |
+
+        `方法 X` 若落在任何类块之外（语法上非法的写法，但预扫描是纯文本扫描），
+        退化为「标记字位置 → EOF」的全域记录，保持保守不误切。
 
         IDENT 提取规则：从关键字紧邻位置开始（先跳过空白），首字必须是
         汉字/字母/下划线（不能是数字），随后贪婪读取连续的汉字/字母/
@@ -126,22 +312,25 @@ class Lexer:
         标记字前置边界：标记（`定义`/`函数`/`方法`/`类`）必须位于源码开头
         或紧跟一个非汉字字符，避免 `分类` 这类词内命中产生噪声名字。
         """
-        defs = set()
+        scope_map = ScopeMap(legacy=self.legacy_adr06)
         s = self._scan_src  # 使用掩码源码（注释/字符串内容已替换为空格）
-        # (keyword, keyword_len)
-        markers = [('定义', 2), ('函数', 2), ('方法', 2), ('类', 1)]
-        i = 0
         n = len(s)
+        regions = self._class_regions()
+        # (keyword, keyword_len, kind)
+        markers = [('定义', 2, 'define'), ('函数', 2, 'func'),
+                   ('方法', 2, 'method'), ('类', 1, 'class')]
+        i = 0
         while i < n:
             matched = None
-            for kw, klen in markers:
+            for kw, klen, kind in markers:
                 if s[i:i + klen] == kw and (i == 0 or not _is_han(s[i - 1])):
-                    matched = (kw, klen)
+                    matched = (kw, klen, kind)
                     break
             if matched is None:
                 i += 1
                 continue
-            kw, klen = matched
+            kw, klen, kind = matched
+            marker_pos = i
             j = i + klen
             # 跳过空白（不含换行会造成歧义，故仅跳过空格/制表符）
             while j < n and s[j] in ' \t':
@@ -157,16 +346,73 @@ class Lexer:
                     else:
                         break
                 if name:
-                    defs.add(''.join(name))
+                    scope_map.add(self._make_entry(
+                        ''.join(name), kind, marker_pos, regions))
             i = j if j > i else i + 1
-        defs |= self._prescan_self_fields()
-        return defs
+        # 类内 `自身.X =` 字段：作用域严格限定在所属类块区间
+        for region in regions:
+            start, end = region
+            owner = self._class_name_at(start)
+            for name in self._collect_self_fields(start, end):
+                scope_map.add(DefEntry(
+                    name=name, kind='field',
+                    scope_start=start, scope_end=end,
+                    owner_class=owner,
+                ))
+        return scope_map
 
-    def _prescan_self_fields(self):
-        """R-D：收集 `类` 块作用域内 `自身.X =` 形式的字段赋值名。
+    def _make_entry(self, name, kind, marker_pos, regions):
+        """按 kind 与位置生成 `DefEntry`（ADR-09 作用域规则表见上）。"""
+        if kind == 'method':
+            region = self._region_of(marker_pos, regions)
+            if region is not None:
+                start, end = region
+                return DefEntry(
+                    name=name, kind=kind,
+                    scope_start=start, scope_end=end,
+                    owner_class=self._class_name_at(start),
+                )
+        # define / func / class，以及类块外的孤立 `方法 X`：全域可见
+        return DefEntry(
+            name=name, kind=kind,
+            scope_start=marker_pos, scope_end=-1,
+            owner_class=None,
+        )
+
+    @staticmethod
+    def _region_of(pos, regions):
+        """返回包含 pos 的最内层类块区间；无则 None。"""
+        best = None
+        for start, end in regions:
+            if start <= pos < end:
+                if best is None or start >= best[0]:
+                    best = (start, end)
+        return best
+
+    def _class_name_at(self, region_start):
+        """从类块起点解析类名（`类 X：` / `类 X 继承 Y：`）。解析不到返回 None。"""
+        s = self._scan_src
+        n = len(s)
+        i = region_start
+        # 跳过缩进
+        while i < n and s[i] in ' \t':
+            i += 1
+        if not s.startswith('类', i):
+            return None
+        j = i + 1
+        while j < n and s[j] in ' \t':
+            j += 1
+        name = []
+        while j < n and (_is_han(s[j]) or s[j].isalnum() or s[j] == '_'):
+            name.append(s[j])
+            j += 1
+        return ''.join(name) or None
+
+    def _collect_self_fields(self, start, end):
+        """R-D：在给定区间 [start, end) 内收集 `自身.X =` 形式的字段赋值名。
 
         只有紧随 `=`（可含空格/制表符）的成员名才算字段赋值；
-        `自身.X 加 1` 这类读取表达式不纳入。类外出现的 `自身.X =` 一律不收集。
+        `自身.X 加 1` 这类读取表达式不纳入。
 
         v0.3.2（D-12）：使用 `_scan_src`（注释/字符串内容已掩码为空格）而非原文，
         避免 `-- 类 X` 这类注释里 `自身.Y = 1` 被误登记，或字符串字面量里出现
@@ -174,23 +420,33 @@ class Lexer:
         """
         fields = set()
         s = self._scan_src
+        i = start
+        while i < end:
+            k = s.find('自身.', i, end)
+            if k < 0:
+                break
+            j = k + 3
+            name = []
+            while j < end and (_is_han(s[j]) or s[j].isalnum() or s[j] == '_'):
+                name.append(s[j])
+                j += 1
+            m = j
+            while m < end and s[m] in ' \t':
+                m += 1
+            if name and m < end and s[m] == '=':
+                fields.add(''.join(name))
+            i = max(j, k + 3)
+        return fields
+
+    def _prescan_self_fields(self):
+        """兼容保留：返回所有类块内 `自身.X =` 字段名的平坦集合。
+
+        ADR-09 起字段作用域由 `_prescan_definitions` 直接登记到 `ScopeMap`；
+        本方法仅供外部工具/诊断使用，不参与分词判定。
+        """
+        fields = set()
         for start, end in self._class_regions():
-            i = start
-            while i < end:
-                k = s.find('自身.', i, end)
-                if k < 0:
-                    break
-                j = k + 3
-                name = []
-                while j < end and (_is_han(s[j]) or s[j].isalnum() or s[j] == '_'):
-                    name.append(s[j])
-                    j += 1
-                m = j
-                while m < end and s[m] in ' \t':
-                    m += 1
-                if name and m < end and s[m] == '=':
-                    fields.add(''.join(name))
-                i = max(j, k + 3)
+            fields |= self._collect_self_fields(start, end)
         return fields
 
     def _class_regions(self):
@@ -240,8 +496,21 @@ class Lexer:
         return regions
 
     def get_user_defs(self):
-        """暴露本次 tokenize 收集到的 user_defs（供 REPL 会话级累积）。"""
-        return frozenset(self._user_defs)
+        """暴露本次 tokenize 收集到的 user_defs（供 REPL 会话级累积）。
+
+        ADR-09 契约保持：返回**全部**用户定义名的平坦 frozenset（不含作用域信息）。
+        DEF-02 起 REPL 改走 `get_user_def_signatures()` 携带 kind/owner_class 累积，
+        本方法保留为向下兼容契约（v0.3.x 测试直接依赖它）。
+        """
+        return self.scope_map.all_names()
+
+    def get_user_def_signatures(self):
+        """DEF-02：返回 `(name, kind, owner_class)` 三元组集合。
+
+        REPL 会话级 `_session_defs` 使用本方法累积，以便下一次分词时按类归属
+        判定是否提升为会话全域（顶层可见）或维持类作用域（仅 `.成员` 可见）。
+        """
+        return self.scope_map.signatures()
 
     # ------------------------------------------------------------------
     # 主循环
@@ -422,18 +691,34 @@ class Lexer:
     # ------------------------------------------------------------------
 
     def _read_han(self):
-        """核心：汉字分词。ADR-06 新优先级：
+        """核心：汉字分词。ADR-06 优先级 + ADR-09 作用域限定：
 
-          1. `_try_user_def_strict()`   ← 最高优先（方案 A 白名单）
-          2. `_try_longest_keyword()`   ← 降为第二
+          1. `_try_user_def_strict()`   ← 最高优先（白名单，**按 pos 查 ScopeMap**）
+          2. `_try_longest_keyword()`   ← 第二（类外恢复内建动词/关键字语义）
           3. 百家姓标识符
           4. 中文数字
           5. 一般标识符
 
-        DP-4 / R-E：原先位于 keyword 之后的 `_try_user_def` 调用点已删除，
-        白名单只有这一条路径，禁止双路径并存。
+        DP-4 / R-E：白名单只有 `_try_user_def_strict` 这一条入口路径，
+        禁止双路径并存。ADR-09 只改变**候选集合的来源**（平坦集合 → 按位置
+        查询的 ScopeMap），不新增分支。
+
+        ADR-10 · v0.4.0：`蟒:` Python 桥前缀在此处最优先短路。`蟒` 单字
+        既非关键字也非动词/百家姓，只有紧跟 `:` / `：` 才启用该短路，
+        因此不会与既有词法（例如常见词 `蟒蛇`）冲突。
         """
         start_col = self.col
+
+        # 0. ADR-10 · `蟒:` Python 桥前缀（最优先，避免被 `_read_general_ident`
+        #    切成两个 token）。产出一个 value 为 `蟒:X` 的 IDENT，parser 侧
+        #    在 `_parse_import` 中识别前缀并路由到 `Import(kind='python')`。
+        py_prefix = self._try_python_prefix()
+        if py_prefix is not None:
+            self.tokens.append(Token(TokenType.IDENT, py_prefix,
+                                     self.line, start_col))
+            self.pos += len(py_prefix)
+            self.col += len(py_prefix)
+            return
 
         # 1. 用户定义名白名单（最高优先）
         user_ident = self._try_user_def_strict()
@@ -472,31 +757,78 @@ class Lexer:
         ident = self._read_general_ident()
         self.tokens.append(Token(TokenType.IDENT, ident, self.line, start_col))
 
+    # ------------------------------------------------------------------
+    # ADR-10 · `蟒:` Python 桥前缀
+    # ------------------------------------------------------------------
+
+    #: `蟒:` 前缀的引导字。选它的理由：单字 `蟒` 不在 `ALL_KEYWORDS` /
+    #: `VERB_ARITY` / `ADVERBS` / 百家姓表中的任一集合内，因此不会夺走
+    #: 任何既有词法语义。
+    PY_PREFIX_CHAR = '蟒'
+    #: 允许的分隔符：ASCII `:` 与全角 `：`（两者在 `PUNCTUATION` 里都映射 COLON）
+    PY_PREFIX_SEPS = ':：'
+
+    def _try_python_prefix(self):
+        """尝试匹配 `蟒:<模块名>`，命中返回整段文本（含前缀），否则 None。
+
+        约束（避免与百家姓/动词/关键字冲突）：
+          1. 必须以单字 `蟒` 开头，且**紧邻**（无空格）一个 `:` 或 `：`；
+             仅 `蟒` 本身（如 `蟒蛇`）不触发，仍走原有分词路径。
+          2. 模块名允许 ASCII 字母/数字/下划线/`.`（`os.path` 形态），
+             同时也接受汉字，仅用于给出中文诊断（`py_import` 会因非法字符
+             拒收，让 AC-96 得到「找不到 Python 模块」而不是 jk 加载错误）。
+          3. 模块名为空（如 `蟒:。`）时不匹配，交由原路径。
+        """
+        s = self.source
+        p = self.pos
+        if s[p] != self.PY_PREFIX_CHAR:
+            return None
+        if p + 1 >= len(s) or s[p + 1] not in self.PY_PREFIX_SEPS:
+            return None
+        j = p + 2
+        # 首字符：ASCII 字母/下划线 或 汉字（后者仅用于错误诊断）
+        if j >= len(s):
+            return None
+        first = s[j]
+        if not ((first.isascii() and (first.isalpha() or first == '_'))
+                or _is_han(first)):
+            return None
+        while j < len(s):
+            c = s[j]
+            if _is_han(c) or (c.isascii() and (c.isalnum() or c == '_' or c == '.')):
+                j += 1
+            else:
+                break
+        # 末尾的 `.` 不并入模块名（`蟒:math.` 里的句点归还给 DOT）
+        while j > p + 2 and s[j - 1] == '.':
+            j -= 1
+        return s[p:j]
+
     def _try_user_def_strict(self):
-        """R-A 严格匹配用户定义名。仅在 `_read_han` 入口（起始位置）触发。
+        """T-04：按 `self.pos` 查 `ScopeMap` 的严格用户定义名匹配。
 
-        规则：
-          1. 按名字长度降序尝试（长名优先，`返回值` 先于 `返回`）
-          2. `source[pos:pos+len(name)] == name`（完整匹配，不允许前缀命中）
-          3. 匹配后的下一个字符必须是"边界"：非汉字/非字母数字/非下划线，
-             或 EOF；若下一位置本身起始于一个完整关键字/动词，也视为边界
-             （使 `自身.次数加1` 这类"名字+动词"紧邻写法仍可切分）。
-
-        ⚠️ 作用范围（QA 实测取证）：白名单命中**不做位置/作用域区分**，
-        `self._user_defs` 是整次分词共享的平坦集合。因此一旦某内建动词名进入
-        白名单，它在**同次分词的全域**都被识别为 IDENT，具体包括：
-          - 类定义之外的顶层语句（如 `打印 长度 郑列` → `名称错误：未定义的标识符：长度`）
-          - 同一个类里其他方法的方法体（如 `长度 自身.吴项`）
-          - REPL 同一会话的后续输入（`_session_defs` 会话级累积所致）
-        括号写法（`长度(郑列)`）**不能**规避：名字已是 IDENT，`FuncCall` 按环境
-        变量解析而非 `verbs` 内建表。唯一可行规避是命名避开内建动词名，
-        或把定义与使用拆到不同 .jk 文件（不同次分词）。
+        规则（R-A · ADR-09 版本）：
+          1. 候选集合 = `scope_map.visible_at(self.pos)`（作用域过滤）；
+             若前一 token 是 `.`（成员访问），则松弛为「本次分词全部用户定义名」，
+             使 `实例.成员` 在类外也能整体识别（AC-67 / AC-70）。
+          2. 按名字长度降序尝试（长名优先，`返回值` 先于 `返回`）
+          3. `source[pos:pos+len(name)] == name`（完整匹配，不允许前缀命中）
+          4. 匹配后的下一个字符必须是"边界"：非汉字/非字母数字/非下划线，
+             或 EOF；若下一位置本身起始于一个完整关键字/动词，也视为边界。
 
         Returns: 完整名字 str 或 None
         """
         s = self.source
         p = self.pos
-        for name in self._defs_by_len:
+        # 后缀 `.成员` 松弛路径：跨作用域的成员访问不受类作用域限制
+        if self._is_member_access_position():
+            candidates = self._defs_by_len
+        else:
+            visible = self.scope_map.visible_at(p)
+            if not visible:
+                return None
+            candidates = [n for n in self._defs_by_len if n in visible]
+        for name in candidates:
             end = p + len(name)
             if s[p:end] != name:
                 continue
@@ -504,6 +836,10 @@ class Lexer:
                 continue
             return name
         return None
+
+    def _is_member_access_position(self):
+        """判断当前 `_read_han` 入口的前一个 token 是否为 `.`（DOT）。"""
+        return bool(self.tokens) and self.tokens[-1].type == TokenType.DOT
 
     def _is_def_boundary(self, idx):
         """判断 idx 处是否构成用户定义名的右边界（R-A 规则 3）。"""

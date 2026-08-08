@@ -796,13 +796,13 @@ def test_ac35_no_ctor_anywhere_is_safe():
     assert run(src) == 1
 
 
-# ---------- v0.3.0-beta：版本对齐（AC-36） ----------
+# ---------- 版本对齐（AC-36） ----------
 
-def test_ac36_version_is_beta():
-    """AC-36: main.py / __init__.py / pyproject.toml 三处均为 0.3.2。"""
+def test_ac36_version_consistency():
+    """AC-36: main.py / __init__.py / pyproject.toml 三处均为 0.4.1。"""
     import jikuai
     from jikuai.main import VERSION
-    expected = '0.3.2'
+    expected = '0.4.1'
     assert VERSION == expected, VERSION
     assert jikuai.__version__ == expected, jikuai.__version__
     toml_path = os.path.join(os.path.dirname(__file__), '..', 'pyproject.toml')

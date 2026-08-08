@@ -649,6 +649,12 @@ class Evaluator:
     def _eval_Try(self, node, env):
         try:
             return self._eval_body(node.body, Environment(env))
+        except (ReturnSignal, BreakSignal, ContinueSignal):
+            # D-13 / ADR-08：三种控制流信号不是错误，尝试/捕获/最终 不得吞掉。
+            # 必须原样透传给外层函数体/循环去处理；此 raise 早于下方
+            # `except JiKuaiError` 与 `except Exception` 兜底，避免被 捕获 分支误接。
+            # finally 分支（若存在）仍会在 raise 穿透前执行，见 Python 语义保证。
+            raise
         except JiKuaiError as e:
             if node.catch_body:
                 catch_env = Environment(env)
@@ -670,7 +676,18 @@ class Evaluator:
         raise JiKuaiError(str(value))
 
     def _eval_Import(self, node, env):
-        """M2-1: 委托 ModuleLoader 加载 .jk 模块。"""
+        """M2-1: 加载 .jk 模块；ADR-10: `蟒:` 前缀路由到 Python 桥。"""
+        if getattr(node, 'kind', 'jk') == 'python':
+            from .pybridge import py_import
+            # 语义（对齐 Python `import x.y`）：
+            #   `导入 蟒:os.path。`            → env['os']  = <os>（顶层）
+            #   `导入 蟒:os.path 作为 王p。`   → env['王p'] = <os.path>
+            top_name = node.module.split('.')[0]
+            bind_to_top = (node.alias is None
+                           or node.alias == top_name and '.' in node.module)
+            module = py_import(node.module, top_level=bind_to_top)
+            env.set(node.alias or top_name, module)
+            return None
         module = self.module_loader.load(node.module, self._current_file)
         if node.names:
             # 从 模块 导入 名字1 名字2
@@ -713,6 +730,26 @@ class Evaluator:
         try:
             return env.get(node.name)
         except JiKuaiError:
+            # AC-68b：若未定义标识符恰好是内建动词名，则本次求值走到这里，
+            # 一定是「lexer 已在本作用域将该名字降级为 IDENT」的结果——即
+            # 本作用域内用户定义（方法/字段）遮蔽了同名内建动词。此时保留
+            # 作用域模型不动（裁决边界），仅把诊断文案改为可操作提示，
+            # 避免「未定义的标识符」这种误导性表述。
+            from .keywords import VERB_ARITY
+            if node.name in VERB_ARITY:
+                msg = (
+                    f"「{node.name}」已被本作用域内的用户定义"
+                    f"（方法/字段）遮蔽，内建动词语义在此不可用。"
+                    f"请改用其他名字（如「王{node.name}」），"
+                    f"或将类定义与顶层脚本拆分到不同文件。"
+                )
+                info = ErrorInfo(
+                    category=ErrorCategory.NAME,
+                    message=msg,
+                    line=node.line, col=node.col,
+                    source_line=self._source_line(node.line),
+                )
+                raise JiKuaiError(info=info) from None
             # 未定义标识符：附带拼写建议（候选=当前作用域变量名+动词名）
             candidates = list(self._collect_names(env))
             sugg = spelling_suggestion(node.name, candidates)
@@ -776,12 +813,20 @@ class Evaluator:
             if isinstance(target, BoundMethod):
                 return self._invoke_method(target.instance, target.method_def,
                                            args, target.closure_env)
+            # ADR-10/11: PyCallable 直接调用（括号已在 AST 层确认）
+            from .pybridge import PyCallable as _PyCallable
+            if isinstance(target, _PyCallable):
+                return target(*args)
             return self._call_function(target, args, env)
         func = self._eval_node(node.func, env)
         args = self._eval_args(node.args, env)
         if isinstance(func, BoundMethod):
             return self._invoke_method(func.instance, func.method_def,
                                        args, func.closure_env)
+        # ADR-10/11: PyCallable 通过标识符直接调用（理论上不常见，以防万一）
+        from .pybridge import PyCallable as _PyCallable
+        if isinstance(func, _PyCallable):
+            return func(*args)
         return self._call_function(func, args, env)
 
     def _eval_Pipeline(self, node, env):
@@ -865,6 +910,16 @@ class Evaluator:
         from .module_loader import ModuleValue
         if isinstance(obj, ModuleValue):
             return obj.get(node.attr)
+        # M2-2 · ADR-10/11: Python 桥模块成员访问
+        from .pybridge import PyCallable, PyModule
+        if isinstance(obj, PyModule):
+            value = obj.member(node.attr)
+            if auto_invoke and isinstance(value, PyCallable):
+                # ADR-11：Python 函数必须括号调用。裸 `math.sqrt` 不进免括号
+                # 元数路径、也不能作为值流转，这里直接抛 SYNTAX 中文诊断，
+                # 避免 `math.sqrt 16` 静默 fallthrough 成两条语句（AC-94）。
+                raise self._py_paren_required_error(obj, node)
+            return value
         if isinstance(obj, JiKuaiInstance):
             attr = node.attr
             # 字段优先
@@ -894,6 +949,23 @@ class Evaluator:
         except ReturnSignal as r:
             return r.value
         return None
+
+    def _py_paren_required_error(self, py_module, node):
+        """ADR-11：Python 桥函数缺括号的 SYNTAX 诊断（AC-94）。
+
+        返回（不抛出）一个携带 `ErrorInfo(category=SYNTAX)` 的 `JiKuaiError`，
+        由调用方 `raise`，便于在 `_member_lookup` 里表达"取值失败"语义。
+        """
+        qual = f"{py_module.name}.{node.attr}"
+        detail = (f"Python 桥函数「{qual}」必须使用括号调用，"
+                  f"例如 {qual}(参数)。免括号（元数驱动）写法只适用于中文动词。")
+        return JiKuaiError(f"语法错误：{detail}", info=ErrorInfo(
+            category=ErrorCategory.SYNTAX,
+            message=detail,
+            line=getattr(node, 'line', 0),
+            col=getattr(node, 'col', 0),
+            source_line=self._source_line(getattr(node, 'line', 0)),
+        ))
 
     def _reject_bound_method(self, value, node):
         """DP-3：BoundMethod 不可赋值 / 传参 / 返回。"""

@@ -1,6 +1,6 @@
 [project]
 name = "jikuai"
-version = "0.3.2"
+version = "0.4.1"
 description = "极快 - 适合中国国情的中文编程语言"
 readme = "README.md"
 license = "MIT"

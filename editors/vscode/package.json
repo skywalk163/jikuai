@@ -1,0 +1,75 @@
+{
+  "name": "jikuai-vscode",
+  "displayName": "极快 JiKuai",
+  "description": "极快 JiKuai 中文编程语言的 VS Code 支持：语法高亮 + LSP（实时校验 / 补全 / hover）。",
+  "version": "0.6.0",
+  "publisher": "jikuai",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "jikuai",
+    "极快",
+    "chinese",
+    "中文编程"
+  ],
+  "activationEvents": [
+    "onLanguage:jikuai"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "jikuai",
+        "aliases": [
+          "极快",
+          "JiKuai",
+          "jikuai"
+        ],
+        "extensions": [
+          ".jk"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "jikuai",
+        "scopeName": "source.jikuai",
+        "path": "./syntaxes/极快.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "极快 JiKuai",
+      "properties": {
+        "极快.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "用于启动极快 LSP Server 的 Python 解释器路径（会执行 `<pythonPath> -m jikuai_lsp`）。"
+        },
+        "极快.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用极快 LSP（实时校验 / 补全 / hover）。关闭后仅保留语法高亮。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/vscode": "^1.75.0",
+    "@types/node": "^20.0.0"
+  }
+}

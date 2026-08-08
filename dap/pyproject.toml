@@ -1,0 +1,27 @@
+[project]
+name = "jikuai-dap"
+version = "0.7.0"
+description = "极快语言 DAP 适配器 - Debug Adapter Protocol MVP（M6-P3 · ADR-20）"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "skywalk163"}
+]
+keywords = ["jikuai", "dap", "debug-adapter", "中文编程"]
+dependencies = [
+    "jikuai",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+jikuai-dap = "jikuai_dap.adapter:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jikuai_dap*"]

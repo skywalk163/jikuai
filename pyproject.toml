@@ -1,6 +1,6 @@
 [project]
 name = "jikuai"
-version = "0.4.1"
+version = "0.6.0"
 description = "极快 - 适合中国国情的中文编程语言"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ dev = ["pytest>=7.0"]
 
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]

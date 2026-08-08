@@ -307,7 +307,13 @@ def test_error_spelling_suggestion():
 
 
 def test_error_formatter():
-    """ErrorFormatter 格式化输出。"""
+    """ErrorFormatter 格式化输出。
+
+    v0.5.0（裁决 D-03）：建议文案由「建议：是否想输入 "x"？」改为
+    「您是否想输入 `x`？」。按 ADR-14「错误码是稳定契约，渲染文案不是」，
+    这里只断言**建议内容出现在输出中**，不再锚定具体句式；句式层面的
+    结构断言在 tests/test_v0_5_0_diagnostics.py 中对 Diagnostic.suggestions 做。
+    """
     info = ErrorInfo(
         category=ErrorCategory.NAME,
         message="未定义的标识符：赵丙",
@@ -321,7 +327,8 @@ def test_error_formatter():
     assert "名称错误" in text
     assert "赵丙。" in text
     assert "^" in text
-    assert '是否想输入 "赵甲"' in text
+    assert "赵甲" in text          # 建议内容必须可见
+    assert "是否想输入" in text    # 仍是"你是不是想输入"语义的提示
 
 
 # ---------- M2-1: 模块系统测试 ----------
@@ -799,10 +806,10 @@ def test_ac35_no_ctor_anywhere_is_safe():
 # ---------- 版本对齐（AC-36） ----------
 
 def test_ac36_version_consistency():
-    """AC-36: main.py / __init__.py / pyproject.toml 三处均为 0.4.1。"""
+    """AC-36: main.py / __init__.py / pyproject.toml 三处版本号一致。"""
     import jikuai
     from jikuai.main import VERSION
-    expected = '0.4.1'
+    expected = '0.6.0'
     assert VERSION == expected, VERSION
     assert jikuai.__version__ == expected, jikuai.__version__
     toml_path = os.path.join(os.path.dirname(__file__), '..', 'pyproject.toml')

@@ -1,0 +1,16 @@
+[project]
+name = "jikuai-aot"
+version = "0.7.0.dev0"
+description = "极快 AOT 跨端编译试验（Experimental · M6-P4 · ADR-19）"
+requires-python = ">=3.10"
+dependencies = ["jikuai"]
+
+[project.scripts]
+jikuai-aot = "jikuai_aot.driver:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jikuai_aot*"]

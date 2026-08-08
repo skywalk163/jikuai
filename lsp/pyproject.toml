@@ -1,0 +1,28 @@
+[project]
+name = "jikuai-lsp"
+version = "0.5.0"
+description = "极快语言 LSP 桩 - Language Server Protocol 实现（M4 桩阶段）"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "skywalk163"}
+]
+keywords = ["jikuai", "lsp", "language-server", "中文编程"]
+dependencies = [
+    "jikuai",
+]
+
+[project.optional-dependencies]
+pygls = ["pygls>=2.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+jikuai-lsp = "jikuai_lsp.server:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jikuai_lsp*"]

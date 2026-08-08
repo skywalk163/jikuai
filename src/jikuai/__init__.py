@@ -23,7 +23,7 @@ from .evaluator import JiKuaiError
 from .main import main, repl, run_file, run_source
 from .pybridge import load
 
-__version__ = "0.4.1"
+__version__ = "0.6.0"
 __all__ = [
     'run_source', 'run_file', 'repl', 'main',
     'load', 'JiKuaiError', 'ErrorInfo', 'ErrorCategory', 'ErrorFormatter',

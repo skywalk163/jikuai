@@ -165,12 +165,19 @@ _ALLOWED_NON_TOKEN = {
 class Lexer:
     """极快语言词法分析器。"""
 
-    def __init__(self, source, external_defs=None):
+    def __init__(self, source, external_defs=None, class_regions=None):
         self.source = source
         self.pos = 0
         self.line = 1
         self.col = 1
         self.tokens = []
+        # ADR-06 X2（v0.5.0）：可选的「权威类区间」。为 None 时走行文本启发式
+        # `_heuristic_class_regions`（与 v0.4.x 字节级等价，258 基线零回归）；
+        # 非 None 时用 parser 权威区间替代启发式，由 frontend.compile_source
+        # 在两遍分词的 Pass2 注入。格式：[(start_char, end_char), ...]，坐标与
+        # `_scan_src` 的字符偏移一致（掩码保持长度不变，故等同原始源码偏移）。
+        self._external_class_regions = class_regions
+        self._class_regions_cache = None
         # 预计算关键字和动词按长度分组
         all_words = set(ALL_KEYWORDS) | set(VERB_ARITY.keys()) | set(ADVERBS)
         self.max_word_len = max(len(w) for w in all_words) if all_words else 4
@@ -450,6 +457,27 @@ class Lexer:
         return fields
 
     def _class_regions(self):
+        """类块字符区间 [(start, end), ...]。
+
+        ADR-06 X2（v0.5.0）分流：
+          - 若 frontend 注入了权威区间（`_external_class_regions` 非 None），
+            直接采用——这是 parser 权威结果，消除行文本启发式的边界歧义。
+          - 否则回退到 `_heuristic_class_regions()`（原行文本启发式，
+            与 v0.4.x 字节级等价）。
+
+        结果缓存，避免 `_prescan_definitions` / `_class_regions_by_name` /
+        `_prescan_self_fields` 三处调用重复计算。
+        """
+        if self._class_regions_cache is not None:
+            return self._class_regions_cache
+        if self._external_class_regions is not None:
+            regions = list(self._external_class_regions)
+        else:
+            regions = self._heuristic_class_regions()
+        self._class_regions_cache = regions
+        return regions
+
+    def _heuristic_class_regions(self):
         """R-D：定位 `类` 块的字符区间列表 [(start, end), ...]。
 
         判定（纯文本启发式，不依赖 parser）：
@@ -936,9 +964,12 @@ class Lexer:
         return ''.join(chars)
 
 
-def tokenize(source, external_defs=None):
+def tokenize(source, external_defs=None, class_regions=None):
     """对极快源代码进行词法分析。
 
     external_defs：可选的外部用户定义名集合（REPL 会话级白名单）。
+    class_regions：可选的权威类块字符区间 [(start, end), ...]（ADR-06 X2）。
+        为 None 时走行文本启发式（默认，与 v0.4.x 等价）；非 None 时由
+        frontend 在两遍分词 Pass2 注入 parser 权威区间。
     """
-    return Lexer(source, external_defs).tokenize()
+    return Lexer(source, external_defs, class_regions).tokenize()

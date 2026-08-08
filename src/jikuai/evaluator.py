@@ -333,10 +333,35 @@ def _num_to_chinese(n):
     return result.rstrip('零') or '零'
 
 
+class ExecHook:
+    """执行钩子（M6-P3 · T-M6-D01）。默认实现全是 no-op。
+
+    唯一侵入点：`Evaluator._eval_body` 在每条语句执行前回调 `before_stmt`。
+    `hook is None` 时求值器只多做一次局部变量判空，不产生函数调用开销。
+
+    调试层（`jikuai_dap`）继承本类实现断点判定与暂停。
+    反向依赖禁止：本模块不得 import 任何 DAP 相关模块。
+    """
+
+    def before_stmt(self, node, env) -> None:
+        """每条语句执行前调用。node 为 AST 语句节点（含 .line/.col），env 为当前环境。
+
+        语义约定：本方法抛出的异常不被求值器捕获或吞掉，会沿调用栈原样上抛
+        （调试层用它实现「终止调试」）。
+        """
+        pass
+
+    def on_break(self, node, env) -> None:
+        """命中断点/单步暂停点时调用。由 `before_stmt` 的实现自行判定后回调。"""
+        pass
+
+
 class Evaluator:
     """极快语言树遍历求值器。"""
 
-    def __init__(self):
+    def __init__(self, hook=None):
+        # T-M6-D01：可选执行钩子（ExecHook 或 None）。None 时零额外开销。
+        self._hook = hook
         self.global_env = Environment()
         self._setup_builtins()
         self.classes = {}
@@ -473,7 +498,10 @@ class Evaluator:
 
     def _eval_body(self, stmts, env):
         result = None
+        hook = self._hook          # T-M6-D01：提到循环外，无 hook 时每条语句仅一次判空
         for stmt in stmts:
+            if hook is not None:
+                hook.before_stmt(stmt, env)
             result = self._eval_node(stmt, env)
         return result
 

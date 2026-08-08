@@ -148,12 +148,13 @@ def test_d11_module_runs_example():
 
 
 def test_d11_module_version_flag():
-    """`python -m jikuai -v` 与 `python -m jikuai.main -v` 输出一致，含 0.4.1。"""
+    """`python -m jikuai -v` 与 `python -m jikuai.main -v` 输出一致，含版本号。"""
     r1 = _run_module(['-v'])
     r2 = _run_module_main(['-v'])
     assert r1.returncode == 0
     assert r1.stdout == r2.stdout
-    assert '0.4.1' in r1.stdout
+    from jikuai.main import VERSION
+    assert VERSION in r1.stdout
 
 
 def test_d11_module_help_flag():
@@ -162,7 +163,8 @@ def test_d11_module_help_flag():
     r2 = _run_module_main(['-h'])
     assert r1.returncode == 0
     assert r1.stdout and r1.stdout == r2.stdout
-    assert '0.4.1' in r1.stdout
+    from jikuai.main import VERSION
+    assert VERSION in r1.stdout
 
 
 # ============================================================

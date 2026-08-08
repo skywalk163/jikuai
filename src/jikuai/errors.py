@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""极快语言 - 错误定位与格式化。"""
+"""极快语言 - 错误定位与格式化。
+
+v0.5.0（ADR-14）起本模块降级为**兼容外壳**：诊断的唯一真源是
+`jikuai.diagnostics` 包。这里保留的全部公开符号（`ErrorCategory` /
+`ErrorInfo` / `ErrorFormatter` / `spelling_suggestion`）签名与语义不变，
+以守住 v0.4.x 嵌入 API 的兼容红线；内部的建议文案渲染委托给
+`diagnostics.spelling.format_suggestions`，确保 CLI 与 LSP 文案同源。
+"""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -7,11 +14,18 @@ from typing import Optional, List
 
 
 class ErrorCategory(Enum):
+    # v0.3.x 起的原始 5 类，名称与中文值均不可变更
     LEXER = "词法错误"
     SYNTAX = "语法错误"
     NAME = "名称错误"
     TYPE = "类型错误"
     RUNTIME = "运行错误"
+    # v0.5.0 追加（ADR-14），仅新增不改旧
+    MODULE = "模块错误"
+    INTEROP = "互操作错误"
+    CONTRACT = "契约错误"
+    LIMITATION = "已知限制"
+
 
 
 @dataclass
@@ -40,9 +54,14 @@ class ErrorFormatter:
             # col 是 1-based code point 序号，需要对齐到显示位置
             pointer = "  " + " " * (info.col - 1) + "^"
             parts.append(pointer)
-        # 建议
+        # 建议（v0.5.0 · 裁决 D-03：文案改为「您是否想输入 `x`？」，
+        # 渲染委托诊断内核以保证 CLI / LSP 同源。文案非稳定契约。）
         if info.suggestion:
-            parts.append(f"建议：是否想输入 \"{info.suggestion}\"？")
+            from .diagnostics.model import Suggestion
+            from .diagnostics.spelling import format_suggestions
+            parts.append(
+                format_suggestions((Suggestion(text=info.suggestion, distance=1),))
+            )
         return "\n".join(parts)
 
 

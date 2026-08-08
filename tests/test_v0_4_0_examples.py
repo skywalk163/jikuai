@@ -143,14 +143,14 @@ def test_ac107_readme_pipeline_correct_filter_is_18():
 
 
 # ============================================================
-# 版本号一致性（0.4.1）
+# 版本号一致性
 # ============================================================
 
 def test_v041_version_consistency():
-    """main.py / __init__.py / pyproject.toml 三处均为 0.4.1。"""
+    """main.py / __init__.py / pyproject.toml 三处版本号一致。"""
     import jikuai
     from jikuai.main import VERSION
-    expected = '0.4.1'
+    expected = '0.6.0'
     assert VERSION == expected, VERSION
     assert jikuai.__version__ == expected, jikuai.__version__
     toml_path = os.path.join(_ROOT, 'pyproject.toml')

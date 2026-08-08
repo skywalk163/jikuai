@@ -35,13 +35,38 @@
   JiKuaiClass    不跨界   ┐ 触发诊断（category=TYPE，与 DP-3 一致）
   BoundMethod    禁止跨界 ┘
 
-安全约束
-  - 默认拒绝清单（`DENY_LIST`）：os.system / subprocess.Popen /
-    builtins.eval / builtins.exec
-  - `load` 拒绝 `..` 路径穿越与绝对路径逃逸
-  - 跨语言异常携带 `ErrorInfo(category=RUNTIME)`，含 Python 类型名 +
-    原始 message，绝对路径被 `_scrub_paths` 抹去
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+安全边界（v0.6.0 · ADR-21 · 必读）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+**pybridge 不提供完整沙箱隔离，仅基于黑名单做缓解。**
+
+  拒绝清单（`DENY_LIST`，黑名单机制）：
+    os.system / subprocess.Popen / builtins.eval / builtins.exec
+
+  已知绕过路径（黑名单的固有局限，不是缺陷）：
+    - `importlib.import_module("os").system(...)` 等间接引用
+    - `getattr(__builtins__, "e" + "val")` 等动态名字构造
+    - 任何未列入清单的危险 API（清单是枚举而非语义分析）
+
+  适用场景：
+    运行**你自己编写的**或**来源可信的** Python 代码。
+
+  禁用场景（明确不支持）：
+    - 执行不受信任的第三方代码 / 用户上传的代码
+    - 多租户环境下的代码隔离
+    - 面向公网的代码执行服务
+
+  若必须承载不可信输入：**pybridge 不能作为安全边界**，须在其外叠加
+  进程级或容器级隔离（如独立子进程 + seccomp / 容器 + 只读挂载）。
+
+  其他既有约束：
+    - `load` 拒绝 `..` 路径穿越与绝对路径逃逸（`_validate_script_path`）
+    - 跨语言异常携带 `ErrorInfo(category=RUNTIME)`，含 Python 类型名 +
+      原始 message，绝对路径被 `_scrub_paths` 抹去
+
+  完整声明见 `docs/安全边界.md` 与 `docs/ADR-21-pybridge安全边界.md`。
 """
+
 
 import importlib
 import os

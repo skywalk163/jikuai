@@ -121,16 +121,17 @@ class CompletionEngine:
         self._static = set(ALL_KEYWORDS) | set(VERB_ARITY.keys()) | {HELP_WORD}
 
     def candidates(self, prefix):
-        pool = set(self._static)
+        # M5 / T-M5-L04：候选计算下移到 jikuai.completion.repl_candidates。
+        # 函数内 import 是刻意的：避免 completion 与 repl_session 模块级互引。
+        from .completion import repl_candidates
         ev = self.evaluator
+        extra = None
         if ev is not None:
             try:
-                pool |= set(ev.global_env.vars.keys())
+                extra = set(ev.global_env.vars.keys())
             except AttributeError:
-                pass
-        if not prefix:
-            return sorted(pool)
-        return sorted(w for w in pool if w.startswith(prefix))
+                extra = None
+        return repl_candidates(prefix, extra_names=extra)
 
     # readline 回调协议：completer(text, state)
     def complete(self, text, state):

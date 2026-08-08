@@ -372,10 +372,17 @@ class Parser:
                     break
             else:
                 break
+        # ADR-06 X2（v0.5.0）：记录类块收尾 `。` 所在行，供 frontend 构造
+        # 权威 ClassRegionTable。取 `_require_block_close` 消费前的当前 token 行。
+        close_line = self._cur().line if not self._at_end() else 0
         self._require_block_close()
-        return ClassDef(name=name_tok.value, parent=parent,
+        node = ClassDef(name=name_tok.value, parent=parent,
                         ctor_params=ctor_params, ctor_body=ctor_body,
                         methods=methods, ctor_defined=ctor_defined)
+        # 类名 token 与 `类` 关键字同行，故用它标注类块起始行
+        self._loc(node, name_tok)
+        node.end_line = close_line or node.line
+        return node
 
     # ---------- 异常 ----------
 

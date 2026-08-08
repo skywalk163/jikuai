@@ -1,6 +1,246 @@
 # 极快 JiKuai · 变更日志
 
+## v0.6.0（2026-08-08）
+
+M5 里程碑：**LSP 语言服务正式实现 + 三个中文特色标准库模块 + 安全边界声明**。
+四条并行支线（P1 LSP / P2 VS Code / P3 标准库 / P4 安全声明）合并交付。
+
+测试：408 → **533 passed**，原有用例零回归（G3 基线只增不减）。
+
+### 新增
+
+- **会话与位置服务层 `src/jikuai/service/`（L3，LSP 与 DAP 共用）**：
+  - `text_document_store.py`：`TextDocumentStore` 维护 uri → (text, version, lines)，
+    处理 `didOpen` / `didChange` / `didClose` 生命周期。
+  - `position.py`：`codepoint_to_utf16` / `utf16_to_codepoint` 双向换算。极快内部用
+    1-based Unicode 码点列，LSP 用 0-based UTF-16 单元列，BMP 外字符（emoji、
+    生僻汉字）占 2 个单元。
+  - `session_host.py`：`SessionHost` 绑定文档存储与诊断缓存，
+    `compile_and_diagnose(uri)` 调用 `frontend.compile_source` 并缓存结果。
+    这一层的抽出让 M6 的 DAP 可以直接复用（ADR-20）。
+- **`src/jikuai/completion.py`**：从 `repl_session.CompletionEngine` 提取为纯函数
+  API，REPL 与 LSP 共用同一套候选生成逻辑，行为不再两处漂移。
+- **LSP 正式实现（ADR-15 · F3 冻结）**：`lsp/jikuai_lsp/server.py` 从 M4 协议桩
+  升级为正式服务，能力集：
+  - `textDocumentSync`：`{ openClose: true, change: 1 }`（Full sync）
+  - `completionProvider`：`{ resolveProvider: false, triggerCharacters: [".", "，"] }`
+  - `hoverProvider`：`true`（内建动词返回中文说明 + 元数）
+  - `positionEncoding`：`"utf-16"`
+  - `publishDiagnostics`：同时推送错误（`ParseError`）与警告（`JK-W1001` 副词透传）
+- **标准库 · 中文正则 `stdlib/正则.jk` + `.py`**：导出 `匹配` / `搜索` / `替代` /
+  `编译`。`搜索` 返回 `{文本, 起始, 结束}` 字典。支持字面量、字符类（含 `[一-十]`
+  中文范围）、量词、分组、`|`，以及中文别名 `\汉`；不支持反向引用与断言。
+  无命中返回空/假而非报错。
+- **标准库 · 成语断言 `stdlib/成语.jk` + `.py`**：导出 `是成语` / `成语释义`。
+  内置 **313 条**常用成语（版本 `v0.6.0-300`），`frozenset` + `dict` O(1) 查找，
+  零第三方依赖。
+- **标准库 · 中文分词 `stdlib/分词.jk` + `.py`**：导出 `分词`。内置 **565 条**
+  常用词，最长 5 字，单字词不入库。正向最大匹配；兜底策略：空白不产出 /
+  半角字母数字整体成词 / 其余单字成词。**幂等且无全域副作用**（G12）。
+- **安全边界声明（ADR-21 · US-M5-08）**：`docs/安全边界.md` 作为权威声明，
+  覆盖 pybridge / AOT 产物 / DAP 调试器 / 模块加载四块的信任前提。
+  `pybridge.py` docstring 与 `README.md` 同步声明。
+
+### 变更
+
+- **`pybridge.py` docstring 重写安全边界段**：从「安全约束」列表升级为完整的
+  「不提供完整沙箱隔离」声明 —— 明确 `DENY_LIST` 是黑名单缓解手段、列出
+  `importlib` 等已知绕过路径、区分适用场景与禁用场景、给出进程级/容器级
+  隔离的替代方案。
+- **`README.md` Python 互操作段**：置顶安全声明，指向 `docs/安全边界.md`。
+- **`repl_session.CompletionEngine`**：内部改为委托 `completion` 模块，
+  对外行为不变。
+
+### 门禁
+
+- G1 全量测试全绿：533 passed
+- G2 示例逐文件 exit 0：新增 3 个 stdlib 示例（正则/成语/分词），全部通过
+- G3 测试数只增不减：408 → 533
+- G4 零破坏性回归：原有用例一条不红
+- G10 标准库契约：`工具` / `校验` / `简繁` / `排版` / `正则` / `成语` / `分词`
+  七个模块导出集合 == `docs/标准库.md` 声明
+- G11 LSP 契约：pytest + subprocess 协议级测试，完全脱离手工 VS Code；
+  initialize / didOpen→publishDiagnostics / completion / hover / shutdown+exit 全通
+- G12 分词幂等：AC-M5-07-01/02/03 三条全绿。除行为断言外，另加**静态防回归**——
+  正则扫描 `分词.py` 断言无 `global` 语句，且词典必须是 `frozenset`
+
+### 冻结点
+
+- **F3 LSP 能力集冻结**：上述 capabilities 结构由 `capabilities.freeze_signature()`
+  返回规范化 dict，测试断言其稳定性。后续变更需走 ADR。
+- **F4 标准库公共 API 冻结**：七个模块的导出符号进入 v0.7 兼容承诺范围，
+  是 M6 AOT 试验的前置条件。
+
+### 已知限制与语言层遗留
+
+- **`正则` 的替换 API 命名为 `替代` 而非 `替换`**：`替换` 是内建动词
+  （`VERB_ARITY['替换'] = 3`），`lexer._try_longest_keyword()` 做最长关键字匹配，
+  会把 `替换` 及任何以 `替换` 开头的名字切成 `VERB` token；而 `parser` 的成员访问
+  要求 `.` 之后必须是 `IDENT`，因此 `正则.替换(...)` 过不了语法分析。
+  **这是语言层约束而非命名偏好**。根治需要一个 ADR 允许 parser 在 `.` 之后接受
+  VERB token —— 已登记为待裁决项。
+- **`.jk` 字符串字面量吞未知转义的反斜杠**：`lexer._read_string` 的
+  `esc_map.get(esc, esc)` 对未知转义丢掉反斜杠，所以 `.jk` 里 `"\d+"` 实际等于
+  `"d+"`。这是既有语言行为，已在 `docs/标准库.md` 加「反斜杠陷阱（必读）」小节，
+  推荐用 `[0-9]` / `[一-鿿]` 字符类规避，并加了一条测试把该行为钉成契约。
+- 简繁对照表约 1230 条，覆盖高频字，冷僻字原样透传；不做词汇级差异转换。
+- LSP hover 只覆盖内建动词与关键字；用户定义函数缺乏 docstring 基础设施。
+- LSP 文本同步为 Full 而非 Incremental，大文件编辑时每次重传全文。
+- `编译` 返回的字典含内部键 `_编译对象`（`re.Pattern`），属实现细节，
+  不作为稳定 API。
+
+## v0.5.0（2026-08-08）
+
+
+M4 里程碑：**诊断内核 + 标准库契约 + ADR-06 X2 闭环 + LSP 协议桩**。
+四条并行支线（P1 诊断 / P2 标准库 / P3 两遍分词 / P4 LSP 桩）合并交付。
+
+测试：258 → **408 passed**，原有用例零回归（G3 基线只增不减）。
+
+### 新增
+
+- **诊断内核 `src/jikuai/diagnostics/`（ADR-14 · F1 冻结契约）**：极快诊断的
+  唯一真源，CLI 与 LSP 均为纯投影消费者。
+  - `model.py`：`Position` / `Span`（end 独占）/ `Suggestion` / `Diagnostic`，
+    全部 `frozen` 不可变；`Diagnostic.sort_key()` 提供决定性排序。
+  - `codes.py`：错误码表 `JK-{E|W}{段位}{序号}`，段位 0xxx 词法 / 1xxx 语法 /
+    2xxx 名称 / 3xxx 元数 / 4xxx 类型 / 5xxx 模块 / 6xxx 互操作 / 7xxx AOT /
+    8xxx 调试 / 9xxx 内部。**码一经发布只增不改不复用。**
+  - `sink.py`：`DiagnosticSink` 协议 + `ListSink`（drain 稳定排序）/ `NullSink`。
+  - `spelling.py`：多候选拼写纠错，编辑距离 ≤2，排序规则「距离升序 → 文本码点序」，
+    并列候选整组保留（不被 `MAX_SUGGESTIONS` 硬截断）。
+  - `static_check.py`：编译期静态诊断，当前覆盖 `JK-W1001`（副词内部接非内建
+    动词的原值透传）。
+  - `reporter.py` / `adapters.py`：`render_text` / `render_json` /
+    `to_lsp_diagnostic` / `from_error_info` / `to_error_info` 纯投影函数。
+- **`JK-W1001` 副词透传编译期提示**：`皆` / `只` / `归` 内部接用户函数或拼错的
+  动词时，代码不报错但按原值透传、不产生预期效果——这是新手高频坑，现在编译期
+  会给出带位置的警告。警告不影响退出码，程序照常执行。
+- **两遍分词编排 `src/jikuai/frontend.py`（ADR-17 · ADR-06 X2）**：
+  `compile_source` 串联「分词 → 解析 → 静态诊断」。Pass1 用行文本启发式定位
+  类块并解析出 AST，从 AST 提取**权威 `ClassRegionTable`** 后 Pass2 重扫，
+  token 序列结构等价即收敛；未收敛则发 `JK-W9001` 并回退首遍结果，不崩。
+  **性能优化**：AST 不含 `ClassDef` 时直接跳过 Pass2（Spike 实测无条件两遍
+  会使编译阶段 +87%，绝大多数脚本不含类）。
+- **`lexer.tokenize(source, external_defs=None, class_regions=None)`**：新增
+  `class_regions` 可选参数接收权威类区间。为 `None` 时走原行文本启发式，
+  与 v0.4.x 字节级等价。
+- **标准库契约（ADR-16 · G10）**：
+  - `src/jikuai/stdlib_contract.py`：静态解析 `.jk` 的 `导出` 语句，
+    提供 `parse_exports` / `declared_exports` / `list_stdlib_modules` /
+    `has_python_backing` / `default_stdlib_dir`。
+  - `scripts/check_stdlib_contract.py`：比对实际导出与 `docs/标准库.md` 声明，
+    不一致退出码 1；支持 `--json`。
+  - **混合模块加载**：`module_loader` 用 `importlib.util.spec_from_file_location`
+    隔离加载同名 `.py`（不污染 `sys.path`），把其公共可调用对象注入 `.jk` 模块
+    环境。`.jk` 是唯一对外门面，`.py` 为内部实现；与 `蟒:` 前缀的 `sys.path`
+    语义互不干扰。
+- **标准库新模块**：
+  - `stdlib/简繁.jk` + `.py`：`转繁体` / `转简体`，内置约 1230 条常用字映射；
+    10 组一简对多繁的固定口径见 `docs/标准库.md`。无可转换字符时输出恒等于输入。
+  - `stdlib/排版.jk` + `.py`：`规范化文本` / `插入间距` / `规范标点`，中英文间距、
+    全半角标点规范化，**保证幂等**。
+- **LSP 协议桩 `lsp/`（ADR-15）**：独立发行包 `jikuai-lsp`，自实现
+  JSON-RPC over stdio（`transport.py`）。`python -m jikuai_lsp` 可启动，
+  支持 `initialize` / `didOpen` / `didChange` / `shutdown` / `exit`，
+  `publishDiagnostics` 推送**真实诊断**（`ParseError.info` → `from_error_info`
+  → `to_lsp_diagnostic`，含 UTF-16 列换算）。主包不依赖 `lsp/`，反向单向依赖。
+- **回退开关 `JIKUAI_DIAGNOSTICS=off`**：`make_default_sink()` 返回 `NullSink`，
+  关闭诊断收集与 stderr 输出（G8 新增守护点）。
+- **文档**：`docs/基线校正说明-v0.5.0.md`、`docs/ADR-14-诊断内核.md`、
+  `docs/ADR-16-标准库契约.md`、`docs/ADR-21-pybridge安全边界.md`、
+  `docs/诊断编码表.md`、`docs/路线图-v0.5.0.md`、`docs/标准库.md`。
+- **示例**：`examples/stdlib/简繁示例.jk`、`examples/stdlib/排版示例.jk`。
+
+### 变更
+
+- **`errors.py` 降级为兼容外壳**：`ErrorCategory` / `ErrorInfo` /
+  `ErrorFormatter` / `spelling_suggestion` 全部公开符号与签名保持不变（嵌入 API
+  兼容红线），内部建议文案渲染委托 `diagnostics.spelling.format_suggestions`。
+- **`ErrorCategory` 追加 4 个成员**：`MODULE` / `INTEROP` / `CONTRACT` /
+  `LIMITATION`。原有 5 个成员的名称与中文值不变。
+- **诊断建议文案**：`建议：是否想输入 "x"？` → `您是否想输入 \`x\`？`（裁决 D-03）。
+  按 ADR-14「**错误码是稳定契约，渲染文案不是**」，属 `Changed` 而非 BREAKING；
+  相应地把测试中对旧文案的精确字符串断言改为对结构化字段断言。
+- **`main.run_source(source, evaluator=None, file=None)`**：新增可选 `file`
+  参数；编译改走 `frontend.compile_source`；警告类诊断输出到 stderr，
+  不影响返回值与退出码。
+- **`module_loader` 错误消息带码**：`找不到模块：X` → `[JK-E5001] 找不到模块：X`；
+  `模块 X 未导出：Y` → `[JK-E5002] 模块 X 未导出：Y`。消息主体不变。
+
+### 修复
+
+- **`parser` 未标注 `ClassDef` 位置**：`ClassDef` 节点的 `line` / `col` 一直是 0
+  （从未走 `_loc`），导致任何依赖类块行号的下游分析都拿不到位置。现用类名 token
+  标注 `line` / `col`，并新增 `end_line` 记录类块收尾 `。` 所在行。这是实现
+  ADR-06 X2 权威区间时暴露出的既有缺陷。
+- **`lexer._class_regions()` 重复计算**：该方法在 `__init__` 期间被
+  `_prescan_definitions` / `_class_regions_by_name` / `_prescan_self_fields`
+  三处调用，每次都重新全文扫描。现加结果缓存。
+- **`scripts/check_stdlib_contract.py` 在 Windows 下输出编码错误**：控制台默认
+  GBK 导致被 `subprocess` 以 UTF-8 捕获时解码失败。现强制 stdout/stderr 用 UTF-8。
+
+### ADR
+
+- **ADR-14 诊断内核**：新建 `diagnostics/` 为唯一真源，`errors.py` 降级为兼容
+  外壳（候选 A 原地扩字段 / **B 新建包** / C 完全重写中选 B）。两条硬约束：
+  错误码是契约文案不是；`diagnostics/` 不得 import `evaluator`（后者持有
+  `JiKuaiError`，会形成循环耦合）——由静态源码扫描测试守护。
+- **ADR-15 LSP 技术栈**：本机 pygls 为 2.x，API 与 1.x 差异大；M4 桩只需 4 个
+  生命周期方法 + 2 个通知，故自实现约 60 行 JSON-RPC 帧格式。pygls 登记在
+  `lsp/pyproject.toml` 的 optional-dependencies，M5 可平滑切换。
+- **ADR-16 标准库契约**：**沿用现有运行期 `导出` 语句**作为唯一导出声明机制，
+  不引入 `__导出__` 变量（基线核对发现真实机制是 `导出` 语句 +
+  `evaluator._current_exports` + `ModuleValue`）。`stdlib/` 固定在仓库根，
+  因 `module_loader._search_paths()` 依赖 `'..','..','stdlib'` 上溯逻辑，移动会
+  破坏解析。
+- **ADR-17 ADR-06 X2 闭环**：两遍分词 + 权威 `ClassRegionTable` + 收敛检测 +
+  `JK-W9001` 兜底 + `JIKUAI_LEGACY_ADR06=1` 强制单遍。
+- **ADR-21 pybridge 安全边界**：文档级 ADR，明确 pybridge **不提供完整沙箱
+  隔离**，`DENY_LIST` 仅为黑名单缓解，`importlib` 等间接路径可绕过。适用于运行
+  自己或可信来源的 Python 代码；**不适用于执行不受信任的第三方代码**。
+
+### 冻结点
+
+- **F1 诊断契约冻结**：`Diagnostic` / `Span` / `Sink` 数据结构 + 错误码表。
+  通过判据含「CLI + LSP 桩双消费者实证」——LSP 桩推送的是真实诊断，非空数组。
+- **F2 标准库契约冻结**：`导出` 声明机制 + `JK-E5001` / `JK-E5002` 错误码。
+
+### 门禁
+
+- G1 全量测试全绿：408 passed
+- G2 示例逐文件 exit 0：22 个 `.jk`（含新增 2 个）全部通过
+- G3 测试数只增不减：258 → 408
+- G4 零破坏性回归：原有用例一条不红
+- G8 回退开关有守护：`JIKUAI_LEGACY_ADR06`（既有）+ `JIKUAI_DIAGNOSTICS=off`（新增）
+- G9 诊断内核契约：字段完整性 / 码表分段 / 可复现性 / 兼容红线均有断言
+- G10 标准库契约：`工具` / `校验` / `简繁` / `排版` 四个模块导出集合 == 文档声明
+
+### 性能（D-06 触发条件 T1 量测结论）
+
+用 `scripts/bench_compile.py` 按中位数（60 轮、预热 1 轮）消噪量测：
+
+- 原路径 `tokenize+parse`：42.82 ms
+- frontend 两遍（含"无类跳过 Pass2"优化）：47.98 ms（+12.1%，含静态诊断开销）
+- **两遍分词机制本身的净开销：仅 +5.9% 编译阶段**（26 个样本文件含 1 个类文件）
+
+编译阶段只占整体执行的一小部分；258 基线子集全量耗时 5.03s，两遍机制的
+2.5ms 净开销可忽略。**未触及 D-06 的 T1 阈值（总套件回归 >10%），ADR-06 X2
+真正闭环，无需降级。**
+
+### 已知限制
+
+- 简繁对照表约 1230 条，覆盖高频字，冷僻字原样透传；不做词汇级差异转换
+  （如「软件/軟體」）。
+- `规范标点` 只对紧邻表意文字的半角标点转全角，`3.14` / `a, b` 保持原样。
+- 纯 `.py` 标准库模块（`历法`）没有 `.jk` 门面，不参与 G10 硬失败，仅提示。
+- LSP 桩未声明 `completionProvider` / `hoverProvider`——LSP 契约「声明即承诺
+  响应」，M4 未实现故不提前声明，留待 M5。
+- `lexer` 抛出的 `JiKuaiError`（如非法字符）不携带标准 `ErrorInfo` 位置格式，
+  LSP 桩暂不将其投影为诊断，M5 需让 lexer 改走 `DiagnosticSink` 路径。
+
 ## v0.4.1（2026-08-08）
+
 
 GA 后遗留清理版（patch）。仅修 bug 与测试命名，无语言语义/接口新增。
 

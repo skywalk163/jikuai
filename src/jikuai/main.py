@@ -6,9 +6,11 @@ from .lexer import tokenize
 from .parser import parse, ParseError
 from .evaluator import Evaluator, JiKuaiError
 from .errors import ErrorFormatter
+from .frontend import compile_source
+from .diagnostics import NullSink, make_default_sink, render_all_text
 
 
-VERSION = "0.4.1"
+VERSION = "0.6.0"
 BANNER = f"""
 ╔══════════════════════════════════╗
 ║   极快 JiKuai v{VERSION}                  ║
@@ -18,14 +20,34 @@ BANNER = f"""
 """
 
 
-def run_source(source, evaluator=None):
-    """编译并执行极快源代码。返回最终结果。"""
+def run_source(source, evaluator=None, file=None):
+    """编译并执行极快源代码。返回最终结果。
+
+    v0.5.0（ADR-17）：编译走 `frontend.compile_source`（两遍分词 + 静态诊断）。
+    收集到的**警告/提示**类诊断打印到 stderr，不影响返回值与退出码——
+    警告不是错误，程序照常执行。`JIKUAI_DIAGNOSTICS=off` 时不打印。
+    """
     if evaluator is None:
         evaluator = Evaluator()
     evaluator._current_source = source
-    tokens = tokenize(source)
-    ast = parse(tokens)
-    return evaluator.eval(ast, source=source)
+
+    result = compile_source(source, file=file)
+    _report_diagnostics(result.diagnostics, source)
+    return evaluator.eval(result.ast, source=source)
+
+
+def _report_diagnostics(diagnostics, source):
+    """把非错误级诊断渲染到 stderr。错误级诊断由异常路径负责，这里不重复输出。"""
+    if not diagnostics:
+        return
+    if isinstance(make_default_sink(), NullSink):   # JIKUAI_DIAGNOSTICS=off
+        return
+    non_fatal = [d for d in diagnostics if d.severity != "错误"]
+    if not non_fatal:
+        return
+    print(render_all_text(non_fatal, source_lines=source.split('\n')),
+          file=sys.stderr)
+
 
 
 def run_file(filepath):
@@ -45,7 +67,7 @@ def run_file(filepath):
     evaluator._current_file = os.path.abspath(filepath)
     evaluator._current_source = source
     try:
-        run_source(source, evaluator)
+        run_source(source, evaluator, file=os.path.abspath(filepath))
     except JiKuaiError as e:
         if getattr(e, 'info', None) is not None:
             print(ErrorFormatter.format(e.info), file=sys.stderr)

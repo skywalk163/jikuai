@@ -1,0 +1,127 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "极快",
+  "scopeName": "source.jikuai",
+  "fileTypes": [
+    "jk"
+  ],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#currency" },
+    { "include": "#numbers" },
+    { "include": "#constants" },
+    { "include": "#keywords" },
+    { "include": "#builtins" },
+    { "include": "#adverbs" },
+    { "include": "#types" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.jikuai",
+          "match": "#.*$"
+        },
+        {
+          "name": "comment.line.double-dash.jikuai",
+          "match": "--.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.jikuai",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.jikuai",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.chinese.jikuai",
+          "begin": "\u201c",
+          "end": "\u201d",
+          "patterns": [
+            {
+              "name": "constant.character.escape.jikuai",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "currency": {
+      "patterns": [
+        {
+          "name": "constant.numeric.currency.jikuai",
+          "match": "[￥¥][0-9]+(?:\\.[0-9]+)?"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.jikuai",
+          "match": "(?:[0-9]+(?:\\.[0-9]+)?|[零〇一二两三四五六七八九十百千万亿]+)"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.jikuai",
+          "match": "(?:真|假|空)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.jikuai",
+          "match": "(?:否则如果|否则|如果|那么|遍历|重复|跳出|跳过|函数|接收|返回|继承|构造|方法|新建|自身|尝试|捕获|最终|抛出|导入|导出|文件|作为|定义|赋值|设为)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        },
+        {
+          "name": "keyword.control.jikuai",
+          "match": "(?:当|于|从|到|次|类)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.jikuai",
+          "match": "(?:校验社会信用代码|提取身份证信息|农历完整日期|公历转农历|校验身份证|校验银行卡|判断运营商|校验手机号|大写金额|汉字数字|干支纪年|转字符串|校验车牌|大于等于|小于等于|绝对值|不等于|转整数|转小数|人民币)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        },
+        {
+          "name": "support.function.builtin.jikuai",
+          "match": "(?:农历|大于|小于|等于|取余|整除|加上|减去|乘以|除以|长度|追加|连接|包含|反转|排序|去重|取值|范围|拼接|分割|替换|子串|大写|小写|求和|最大|最小|平均|打印|输入|读取|写入|首个|其余|末个|生肖)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        },
+        {
+          "name": "support.function.builtin.jikuai",
+          "match": "(?:加|减|乘|除|幂|且|或|非|列|负)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        }
+      ]
+    },
+    "adverbs": {
+      "patterns": [
+        {
+          "name": "keyword.operator.adverb.jikuai",
+          "match": "(?:皆|只|归)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.jikuai",
+          "match": "(?:字符串|人民币|整数|小数|布尔|列表|字典|日期)(?=[^\\u4e00-\\u9fff\\u3400-\\u4dbf\\uf900-\\ufaff]|$)"
+        }
+      ]
+    }
+  }
+}

@@ -305,13 +305,21 @@ def _atomic_write_text(path: str, text: str) -> None:
 
 
 def _atomic_copy(src: str, dst: str) -> None:
-    """同上，但用于二进制产物。"""
+    """同上，但用于二进制产物。
+
+    坑：`shutil.copyfile` 只搬内容不搬权限；而 `tempfile.mkstemp` 在 POSIX 上
+    以 mode 0600 建文件——`os.replace` 之后目标文件缺**可执行位**，Linux
+    上直接 `PermissionError [Errno 13]`。Windows 靠扩展名判断可执行性所以
+    没暴露这个坑，但 CI 是 Ubuntu，之前 T2a 的 8 条 e2e 用例全部 Errno 13
+    死在这里。修法是让临时文件继承源产物（gcc 已带 0755）的 mode。
+    """
     _ensure_parent(dst)
     parent = os.path.dirname(os.path.abspath(dst))
     fd, tmp = tempfile.mkstemp(dir=parent, prefix=".jkaot_", suffix=".tmp")
     os.close(fd)
     try:
         shutil.copyfile(src, tmp)
+        shutil.copymode(src, tmp)   # 关键：把源的可执行位传下去
         os.replace(tmp, dst)
     except BaseException:
         if os.path.exists(tmp):

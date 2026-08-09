@@ -1,7 +1,7 @@
 {
   "name": "jikuai-vscode",
   "displayName": "极快 JiKuai",
-  "description": "极快 JiKuai 中文编程语言的 VS Code 支持：语法高亮 + LSP（实时校验 / 补全 / hover）。",
+  "description": "极快 JiKuai 中文编程语言的 VS Code 支持：语法高亮 + LSP（实时校验 / 补全 / hover）+ 断点调试（DAP）。",
   "version": "0.6.0",
   "publisher": "jikuai",
   "license": "MIT",
@@ -9,7 +9,8 @@
     "vscode": "^1.75.0"
   },
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Debuggers"
   ],
   "keywords": [
     "jikuai",
@@ -18,7 +19,8 @@
     "中文编程"
   ],
   "activationEvents": [
-    "onLanguage:jikuai"
+    "onLanguage:jikuai",
+    "onDebugResolve:jikuai"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -50,7 +52,7 @@
         "极快.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "用于启动极快 LSP Server 的 Python 解释器路径（会执行 `<pythonPath> -m jikuai_lsp`）。"
+          "description": "用于启动极快 LSP / DAP 的 Python 解释器路径（会执行 `<pythonPath> -m jikuai_lsp` 与 `<pythonPath> -m jikuai_dap`）。"
         },
         "极快.lsp.enabled": {
           "type": "boolean",
@@ -58,7 +60,73 @@
           "description": "是否启用极快 LSP（实时校验 / 补全 / hover）。关闭后仅保留语法高亮。"
         }
       }
-    }
+    },
+    "breakpoints": [
+      {
+        "language": "jikuai"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "jikuai",
+        "label": "极快 JiKuai",
+        "languages": [
+          "jikuai"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "要调试的 .jk 文件路径。",
+                "default": "${file}"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "调试进程的工作目录。",
+                "default": "${workspaceFolder}"
+              },
+              "pythonPath": {
+                "type": "string",
+                "description": "覆盖 `极快.pythonPath` 配置。留空则用扩展设置里的值。"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "启动时立即在第一条语句停住。",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "jikuai",
+            "request": "launch",
+            "name": "调试当前 .jk 文件",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "极快：调试当前 .jk 文件",
+            "description": "以极快 DAP 适配器启动当前打开的 .jk 文件。",
+            "body": {
+              "type": "jikuai",
+              "request": "launch",
+              "name": "调试当前 .jk 文件",
+              "program": "^\"\\${file}\"",
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "stopOnEntry": false
+            }
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./",

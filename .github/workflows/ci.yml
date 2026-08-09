@@ -1,0 +1,84 @@
+# 极快 JiKuai · 持续集成（CI）
+#
+# 触发：push / pull_request 到 main。
+#
+# 关键目标（T1 CI 加固）：
+#   1. 在 Python 3.10 / 3.11 / 3.12 矩阵上跑全部 pytest 用例。
+#   2. **确保 AOT 端到端二进制测试真正运行、而非跳过**。
+#      这些用例通过 shutil.which('gcc'|'clang'|'cc'|'cl') 探测 C 编译器：
+#        - tests/test_v0_8_0_aot_controlflow.py 的 8 条 @requires_cc 参数化用例
+#          （pytest.mark.skipif(not _have_c_compiler())）
+#        - tests/test_v0_7_0_aot.py::TestBinaryCompile（fixture 调用
+#          detect_c_compiler()，无编译器则 pytest.skip）
+#      本地开发机（Windows）通常无 gcc，故这 9 条会 skip；ubuntu-latest
+#      预装 gcc，我们再显式安装以兜底，令这 9 条从 skip 转为 run。
+#
+# GitCode 兼容性说明：
+#   本仓库同时托管在 GitHub 与 GitCode（gitcode.com/skywalk163/jikuai）。
+#   GitCode 的流水线不消费本 .github/workflows/ci.yml，需要在 GitCode 控制台
+#   单独配置。等价的 GitCode 流水线步骤为：
+#       - 选择带 gcc 的 Python 镜像（或在 before_script 里 apt-get install gcc）
+#       - python -m pip install -e .[dev]
+#       - gcc --version   # 确认编译器在位
+#       - python -m pytest -v
+#   命令与下方 Linux job 完全一致，仅 YAML 结构因平台而异。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-linux:
+    name: Test (Python ${{ matrix.python-version }}, ubuntu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # ubuntu-latest 已预装 gcc；显式安装做防御，确保 AOT e2e 用例不 skip。
+      - name: Ensure C compiler (gcc) is present
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc
+          gcc --version
+
+      - name: Install package (editable) with dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      # 断言 gcc 对 Python 可见——AOT 用例正是用 shutil.which 探测。
+      - name: Verify gcc visible to Python
+        run: |
+          python -c "import shutil, sys; cc = shutil.which('gcc'); print('gcc ->', cc); sys.exit(0 if cc else 1)"
+
+      - name: Run full test suite
+        run: python -m pytest -v
+
+      # 守卫：AOT 端到端二进制用例在有 gcc 的环境必须真正运行、零 skip。
+      # 若这里出现 skip，说明编译器探测或环境有问题，直接让 CI 失败。
+      - name: Guard - AOT e2e tests must run (not skip)
+        run: |
+          python -m pytest -v -rs \
+            tests/test_v0_7_0_aot.py \
+            tests/test_v0_8_0_aot_controlflow.py \
+            | tee aot_run.log
+          if grep -q "skipped" aot_run.log; then
+            echo "::error::AOT 端到端用例出现 skip——gcc 环境下不应跳过。"
+            exit 1
+          fi
+          echo "AOT 端到端用例全部运行，无跳过。"

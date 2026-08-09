@@ -294,7 +294,46 @@ class PyModule:
         return f"<蟒模块:{self._name}>"
 
 
-def py_import(name, top_level=False):
+#: `蟒:` 桥的脚本同目录 `.py` 缓存：abspath -> module（ADR-23）
+_SIDECAR_CACHE = {}
+
+
+def _load_sidecar(name, base_dir):
+    """ADR-23：加载与当前 `.jk` 脚本**同目录**的 `<name>.py`。
+
+    动机：`.jk` 模块加载器把脚本所在目录纳入搜索路径，`蟒:` 桥却只走
+    `importlib.import_module`，导致「helper `.py` 放脚本旁边」这种最常见的
+    互操作写法不成立。这里补齐这条对称性。
+
+    安全取舍（ADR-21 延伸）：
+    - **不改 `sys.path`**：用 `spec_from_file_location` 隔离加载，避免把脚本
+      目录永久注入解释器的搜索路径、进而影响后续所有 `import`。
+    - **只找同目录、不递归、不带包语义**：含 `.` 的点分名一律跳过本地加载，
+      不允许用 `蟒:a.b` 拼出目录穿越。
+    - 信任边界与 `.jk` 脚本自身**同级**：能放 `.jk` 到该目录的人本来就能执行
+      任意极快代码，因此不额外放大攻击面。`DENY_LIST` 对成员访问依旧生效。
+    - 找不到返回 None，由调用方回落到原有的中文 ImportError 诊断。
+    """
+    if not base_dir or '.' in name:
+        return None
+    py_path = os.path.join(base_dir, name + '.py')
+    if not os.path.isfile(py_path):
+        return None
+    key = os.path.abspath(py_path)
+    if key in _SIDECAR_CACHE:
+        return _SIDECAR_CACHE[key]
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f'jikuai_sidecar_{name}', key)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _SIDECAR_CACHE[key] = module
+    return module
+
+
+def py_import(name, top_level=False, current_file=None):
     """`导入 蟒:name。` 的运行时实现。返回 `PyModule`。
 
     Args:
@@ -302,6 +341,8 @@ def py_import(name, top_level=False):
         top_level: 若为 True，返回顶层模块的 PyModule（对齐 Python
             `import x.y` 的绑定语义：`x` 在 caller 作用域可见）。
             evaluator 侧的 `_eval_Import` 根据是否有 `作为 别名` 决定。
+        current_file: 发起导入的 `.jk` 文件绝对路径（可为 None）。
+            ADR-23：标准导入失败时，用它的所在目录找同名 `.py` 兜底。
 
     AC-96：导入失败抛中文 `ErrorInfo` 诊断，不透出 Python `ImportError` 原文。
     """
@@ -320,6 +361,12 @@ def py_import(name, top_level=False):
     except BaseException as exc:               # noqa: BLE001
         # 含 ImportError / ModuleNotFoundError，也含模块 import 期抛的任意异常
         if isinstance(exc, ImportError):
+            # ADR-23：标准导入找不到 → 退回脚本同目录的 <name>.py
+            base_dir = (os.path.dirname(os.path.abspath(current_file))
+                        if current_file else None)
+            sidecar = _load_sidecar(name, base_dir)
+            if sidecar is not None:
+                return PyModule(sidecar, name)
             msg = f"找不到 Python 模块：{name}"
         else:
             msg = (f"导入 Python 模块 {name} 时出错："

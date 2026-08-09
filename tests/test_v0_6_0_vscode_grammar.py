@@ -61,7 +61,7 @@ def test_package_version_matches_main_package(pkg):
 
 def test_package_engines_and_activation(pkg):
     assert pkg['engines']['vscode'] == '^1.75.0'
-    assert pkg['activationEvents'] == ['onLanguage:jikuai']
+    assert 'onLanguage:jikuai' in pkg['activationEvents']
     assert pkg['main'] == './out/extension.js'
 
 def test_package_scripts_and_deps(pkg):

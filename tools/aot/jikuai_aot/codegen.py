@@ -35,20 +35,28 @@ C 源码里直接写 UTF-8 字节转义（反斜杠 x 加两位十六进制）�
 from __future__ import annotations
 
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Dict, List, Set
+from typing import Dict, List, Optional
 
 from jikuai.ast_nodes import (
     Assign,
     BoolLit,
+    Break,
     Call,
+    Continue,
     Define,
+    FuncCall,
+    FuncDef,
     Ident,
+    If,
     MoneyLit,
     NilLit,
     Node,
     NumberLit,
     Program,
+    Repeat,
+    Return,
     StringLit,
+    While,
 )
 
 from .subset_gate import SUPPORTED_VERBS
@@ -482,70 +490,287 @@ static void jk_init_console(void)
 # 生成器
 # ---------------------------------------------------------------------------
 
+class _FuncInfo:
+    """一个顶层用户函数的编译信息（T2a）。
+
+    字段
+        name        极快函数名（可含中文）
+        c_name      映射后的 C 函数名（jk_fnN）
+        params      极快形参名列表
+        c_params    形参对应的 C 标识符列表（jk_paN），与 params 同序
+        scope       函数作用域：极快名 → C 标识符（形参 + 函数局部变量）
+        locals      [(C 标识符, 极快名)]，供在函数体开头统一声明
+        body        函数体语句列表
+        node        原 FuncDef 节点（报错定位用）
+    """
+
+    def __init__(self, name: str, c_name: str, params: List[str],
+                 body: List[Node], node: Node) -> None:
+        self.name = name
+        self.c_name = c_name
+        self.params = list(params)
+        self.c_params: List[str] = []
+        self.scope: Dict[str, str] = {}
+        self.locals: List[tuple] = []
+        self.body = body
+        self.node = node
+
+    def signature(self) -> str:
+        """C 声明头。零参函数写 `(void)`，避免旧式「未指定参数」声明。"""
+        if not self.c_params:
+            return "static JKValue {}(void)".format(self.c_name)
+        return "static JKValue {}({})".format(
+            self.c_name, ", ".join("JKValue {}".format(p) for p in self.c_params)
+        )
+
+
 class CCodegen:
     """把受支持子集的 AST 翻译为 C 源码。
 
-    变量模型：AOT 子集没有控制流也没有函数，顶层就是一条直线语句序列，
-    所以「所有变量都是 main() 的局部变量」这个最朴素的模型就够用。先扫一遍
-    收集全部名字统一声明，再按语句序逐条赋值——这样重复「定义」同名变量不会
-    撞 C 的重复声明。未定义就读取（前向引用）在直线代码里可以静态判死，因此
-    codegen 直接抛 CodegenError，而不是生成读未初始化内存的 C。
+    变量模型
+    --------
+    极快的**顶层**变量编译为 C 的**文件作用域** `static JKValue`：先扫全部
+    顶层语句（含嵌套块）收集每个被 `定义`/赋值 的名字，在 prelude 之后统一
+    声明，再按语句序逐条赋值。
+
+    T2a 之前它们是 `main()` 的局部变量；有了用户函数就必须提到文件作用域
+    —— 函数体要能读写全局（见下面「函数与全局」）。静态存储期变量零初始化，
+    而 `JK_NIL` 的 tag 恰好是 0、`v.i` 也是 0，所以零初始化**等价**
+    `jk_nil()`，不需要额外的初始化代码。
+
+    这样做有四个好处：
+      1. 重复 `定义` 同名变量不会撞 C 的重复声明；
+      2. 循环体里赋的值在循环外仍可见 —— 与解释器的作用域语义一致
+         （极快的 `如果`/`当`/`重复` 块**不**引入新作用域）；
+      3. 每个槽位都预初始化为 nil，读到「还没走到那条赋值」的变量时
+         行为是确定的（nil），不会读未初始化内存；
+      4. 顶层函数可以直接按名字读写它们。
+
+    函数与全局（T2a）
+    ----------------
+    顶层 `函数 名 接收 形参：...` 编译为 `static JKValue jk_fnN(JKValue ...)`。
+    所有函数**先前向声明再发射函数体**，因此互递归（甲 调 乙、乙 调 甲）可用。
+
+    函数体内一个名字的解析顺序（与解释器 `Environment` 的查找链一致）：
+
+      1. 形参 → C 形参；
+      2. 该函数内被 `定义`/赋值 且**不是**全局的名字 → C 函数局部变量；
+      3. 全局名 → 文件作用域 static 变量。
+
+    第 3 条同时决定了**写**语义：解释器的 `定义`/`赋值` 都先走
+    `Environment.update`（沿作用域链向上找），找到全局就**改全局**，只有
+    整条链都没有才在本层新建。AOT 照抄这个语义 —— 函数里 `定义 全局名 = X`
+    改的是全局，不是新建局部。
+
+    不支持闭包：嵌套 `FuncDef` 与 `Lambda` 由 subset_gate 拦在门外
+    （JK-E7001）；codegen 侧也留了兜底 CodegenError。
+
+    定值分析（M9-3 放宽）
+    --------------------
+    加入控制流后，「某变量是否已赋值」不再能靠直线扫描判死：
+    `如果 ... 那么：定义 赵甲 = 1。。` 之后读 `赵甲` 在静态上既可能
+    已赋值也可能没有。因此把检查从「**必然**已赋值」放宽为
+    「**全程序某处**被赋值」——真正的拼写错误（名字压根没出现在任何
+    赋值左侧）仍会被抓住，而合法的条件赋值不再误报。
     """
 
     def __init__(self) -> None:
-        self._slots: Dict[str, str] = {}     # 极快变量名 → C 标识符
-        self._defined: Set[str] = set()      # 已赋过值的名字（定值分析）
+        self._globals: Dict[str, str] = {}    # 顶层变量名 → C 标识符
+        self._funcs: Dict[str, _FuncInfo] = {}   # 函数名 → 编译信息
+        self._func_order: List[_FuncInfo] = []   # 保持源码书写顺序
+        self._main_body: List[Node] = []     # 顶层非函数定义语句
+        self._scope = None                   # 当前函数作用域；None = main 体内
         self._lines: List[str] = []
+        self._indent = 1                     # 当前缩进层级（1 = 函数体内）
+        self._loop_depth = 0                 # 循环嵌套深度（校验 跳出/跳过）
+        self._tmp_seq = 0                    # 临时变量序号
 
     # ---- 入口 ----
 
     def generate(self, program: Program) -> str:
-        self._slots.clear()
-        self._defined.clear()
+        self._globals = {}
+        self._funcs = {}
+        self._func_order = []
+        self._main_body = []
+        self._scope = None
         self._lines = []
+        self._indent = 1
+        self._loop_depth = 0
+        self._tmp_seq = 0
 
-        self._collect_slots(program)
+        self._collect_program(program)
 
-        decls = []
-        for name in sorted(self._slots, key=lambda n: self._slots[n]):
-            decls.append(
-                "    JKValue {} = jk_nil();   /* {} */".format(self._slots[name], name)
+        parts = [_C_RUNTIME]
+
+        if self._globals:
+            parts.append(
+                "/* ---------- 顶层变量 ----------\n"
+                " * 文件作用域 static：零初始化即 tag=JK_NIL、v.i=0，等价 jk_nil()。\n"
+                " * 提到文件作用域是为了让顶层函数能直接读写（AOT 无闭包）。\n"
+                " */\n"
             )
+            for name, slot in self._globals.items():
+                parts.append("static JKValue {};   /* {} */\n".format(slot, name))
+            parts.append("\n")
 
-        for stmt in program.body:
-            self._emit_stmt(stmt)
+        if self._func_order:
+            parts.append(
+                "/* ---------- 用户函数前向声明 ----------\n"
+                " * 先声明再定义，互递归与「先调用后定义」都能过编译。\n"
+                " */\n"
+            )
+            for info in self._func_order:
+                parts.append("{};   /* {} */\n".format(info.signature(), info.name))
+            parts.append("\n")
+            for info in self._func_order:
+                parts.append(self._emit_function(info))
 
-        parts = [_C_RUNTIME, "int main(void)\n{\n    jk_init_console();\n"]
-        if decls:
-            parts.append("\n".join(decls) + "\n\n")
+        self._lines = []
+        self._indent = 1
+        self._loop_depth = 0
+        self._scope = None
+        self._emit_body(self._main_body)
+
+        parts.append("int main(void)\n{\n    jk_init_console();\n")
         parts.append("\n".join(self._lines))
         parts.append("\n    return 0;\n}\n")
         return "".join(parts)
 
+    # ---- 预扫：顶层函数、全局槽位、函数作用域 ----
+
+    def _collect_program(self, program: Program) -> None:
+        """把顶层语句分成「函数定义」与「main 体」，再分配各级槽位。
+
+        顺序不可调换：**先**收全局，**后**分配函数局部 —— 函数里给全局名
+        赋值改的是全局，只有非全局名才需要新建局部（见类文档「函数与全局」）。
+        """
+        for stmt in program.body:
+            if isinstance(stmt, FuncDef):
+                self._register_func(stmt)
+            else:
+                self._main_body.append(stmt)
+
+        self._collect_slots(self._main_body)
+
+        # 函数名与顶层变量名撞车：静态绑定说不清「这个名字现在是函数还是变量」
+        clash = sorted(set(self._funcs) & set(self._globals))
+        if clash:
+            raise CodegenError(
+                "名字 {} 既是顶层函数名又是顶层变量名，AOT 无法静态绑定"
+                .format("、".join(clash))
+            )
+
+        for info in self._func_order:
+            self._collect_func_scope(info)
+
+    def _register_func(self, node: FuncDef) -> None:
+        if node.name in self._funcs:
+            raise CodegenError(
+                "重复定义的函数：{}（解释器是后定义覆盖前者，AOT 静态绑定无法表达，"
+                "请改名）".format(node.name)
+            )
+        info = _FuncInfo(
+            name=node.name,
+            c_name="jk_fn{}".format(len(self._func_order) + 1),
+            params=node.params,
+            body=node.body,
+            node=node,
+        )
+        self._funcs[node.name] = info
+        self._func_order.append(info)
+
+    def _collect_func_scope(self, info: _FuncInfo) -> None:
+        """给一个函数的形参与局部变量分配 C 标识符。
+
+        形参优先（解释器的 call_env 里就有它们，`update` 先命中本层）；
+        其余被赋值的名字若是全局就复用全局槽位（不进 scope，由 `_slot`
+        兜到 `_globals`），否则新建函数局部。
+        """
+        for index, param in enumerate(info.params):
+            c_name = "jk_pa{}_{}".format(info.c_name[5:], index + 1)
+            info.c_params.append(c_name)
+            # 同名形参（`接收 甲 甲`）：后者覆盖前者，与解释器 set 的行为一致
+            info.scope[param] = c_name
+
+        assigned: List[str] = []
+        _scan_assigned_names(info.body, assigned)
+        for name in assigned:
+            if name in info.scope or name in self._globals:
+                continue
+            c_name = "jk_lv{}_{}".format(info.c_name[5:], len(info.locals) + 1)
+            info.scope[name] = c_name
+            info.locals.append((c_name, name))
+
     # ---- 变量槽位 ----
 
-    def _collect_slots(self, program: Program) -> None:
-        """预扫顶层语句，给每个被定义/赋值的名字分配一个 C 标识符。
+    def _collect_slots(self, body: List[Node]) -> None:
+        """递归预扫顶层语句列表，给每个被定义/赋值的名字分配一个 C 标识符。
 
         极快标识符可以是中文，不能直接当 C 标识符，因此统一映射为 jk_varN，
         并在声明处用注释保留原名，方便读生成的 C。
+
+        必须**递归进嵌套块**：`当 ...：定义 赵甲 = 1。。` 里的 `赵甲`
+        也要拿到槽位，否则 codegen 到那一行时会报「未分配槽位」。
         """
-        for stmt in program.body:
-            name = None
-            if isinstance(stmt, Define):
-                name = stmt.name
-            elif isinstance(stmt, Assign) and isinstance(stmt.target, Ident):
-                name = stmt.target.name
-            if name is not None and name not in self._slots:
-                self._slots[name] = "jk_var{}".format(len(self._slots) + 1)
+        names: List[str] = []
+        _scan_assigned_names(body, names)
+        for name in names:
+            if name not in self._globals:
+                self._globals[name] = "jk_var{}".format(len(self._globals) + 1)
+
+    # ---- 函数体 ----
+
+    def _emit_function(self, info: _FuncInfo) -> str:
+        """发射一个顶层函数的完整定义（签名 + 花括号 + 体）。"""
+        self._lines = []
+        self._indent = 1
+        self._loop_depth = 0
+        self._scope = info.scope
+
+        for c_name, jk_name in info.locals:
+            self._line("JKValue {} = jk_nil();   /* {} */".format(c_name, jk_name))
+        if info.locals:
+            self._lines.append("")
+
+        self._emit_body(info.body)
+        # 兜底 return：函数体走完没碰到 `返回` 时给 空，与解释器
+        # `_call_function` 末尾 `return None` 一致。同时保证 C 的所有
+        # 控制流路径都有返回值。
+        self._line("return jk_nil();   /* 隐式返回 空 */")
+
+        body = "\n".join(self._lines)
+        self._lines = []
+        self._scope = None
+        return "{}   /* {} */\n{{\n{}\n}}\n\n".format(
+            info.signature(), info.name, body)
 
     # ---- 语句 ----
+
+    def _line(self, text: str) -> None:
+        """按当前缩进层级追加一行 C 代码。"""
+        self._lines.append("    " * self._indent + text)
+
+    def _next_tmp(self, prefix: str) -> str:
+        self._tmp_seq += 1
+        return "{}{}".format(prefix, self._tmp_seq)
+
+    def _emit_body(self, body: List[Node]) -> None:
+        for stmt in body:
+            self._emit_stmt(stmt)
+
+    def _emit_block(self, body: List[Node]) -> None:
+        """在花括号里发射一个语句块（缩进 +1）。空体补 `/* 空 */` 保持合法 C。"""
+        self._indent += 1
+        if body:
+            self._emit_body(body)
+        else:
+            self._line("/* 空块 */")
+        self._indent -= 1
 
     def _emit_stmt(self, node: Node) -> None:
         if isinstance(node, Define):
             expr = self._expr(node.value)
-            self._defined.add(node.name)
-            self._lines.append("    {} = {};".format(self._slot(node.name), expr))
+            self._line("{} = {};".format(self._slot(node.name), expr))
             return
 
         if isinstance(node, Assign):
@@ -555,8 +780,48 @@ class CCodegen:
                     "赋值目标必须是变量名，收到 {}".format(type(target).__name__)
                 )
             expr = self._expr(node.value)
-            self._defined.add(target.name)
-            self._lines.append("    {} = {};".format(self._slot(target.name), expr))
+            self._line("{} = {};".format(self._slot(target.name), expr))
+            return
+
+        if isinstance(node, If):
+            self._emit_if(node)
+            return
+
+        if isinstance(node, While):
+            self._emit_while(node)
+            return
+
+        if isinstance(node, Repeat):
+            self._emit_repeat(node)
+            return
+
+        if isinstance(node, Break):
+            if self._loop_depth == 0:
+                raise CodegenError("「跳出」只能出现在循环体内")
+            self._line("break;")
+            return
+
+        if isinstance(node, Continue):
+            if self._loop_depth == 0:
+                raise CodegenError("「跳过」只能出现在循环体内")
+            self._line("continue;")
+            return
+
+        if isinstance(node, Return):
+            self._emit_return(node)
+            return
+
+        if isinstance(node, FuncDef):
+            # 顶层的 FuncDef 已在 _collect_program 中提取；如果走到这里
+            # 说明它出现在函数体/块体里（嵌套），subset_gate 应该已经拦住了，
+            # 但 codegen 也留兜底。
+            raise CodegenError(
+                "AOT 不支持嵌套函数定义：{}（请把它移到顶层）".format(node.name)
+            )
+
+        if isinstance(node, FuncCall):
+            # 顶层裸函数调用当语句（丢弃返回值）
+            self._line("(void)({});".format(self._expr(node)))
             return
 
         if isinstance(node, Call) and node.verb == "打印":
@@ -565,23 +830,82 @@ class CCodegen:
 
         if isinstance(node, Call):
             # 顶层裸表达式：求值后丢弃（保留可能的副作用，如除零停机）
-            self._lines.append("    (void)({});".format(self._expr(node)))
+            self._line("(void)({});".format(self._expr(node)))
             return
 
-        raise CodegenError("AOT 不支持的顶层语句：{}".format(type(node).__name__))
+        raise CodegenError("AOT 不支持的语句：{}".format(type(node).__name__))
+
+    def _emit_return(self, node: Return) -> None:
+        """发射 `返回` 语句。与解释器一致：无值时返回 空（nil）。"""
+        if self._scope is None:
+            raise CodegenError("「返回」只能出现在函数体内")
+        if node.value is not None:
+            self._line("return {};".format(self._expr(node.value)))
+        else:
+            self._line("return jk_nil();")
+
+
+    def _emit_if(self, node: If) -> None:
+        """`如果 / 否则如果 / 否则` → C 的 if / else if / else 链。
+
+        条件统一过 `jk_truthy()`，与解释器的 Python 真值语义对齐
+        （空 / 假 / 0 / 0.0 / "" 为假）。
+        """
+        self._line("if (jk_truthy({})) {{".format(self._expr(node.cond)))
+        self._emit_block(node.then_branch)
+
+        for cond, body in (node.elif_branches or []):
+            self._line("}} else if (jk_truthy({})) {{".format(self._expr(cond)))
+            self._emit_block(body)
+
+        if node.else_branch is not None:
+            self._line("} else {")
+            self._emit_block(node.else_branch)
+
+        self._line("}")
+
+    def _emit_while(self, node: While) -> None:
+        """`当 条件：...` → C 的 while。条件每轮重新求值。"""
+        self._line("while (jk_truthy({})) {{".format(self._expr(node.cond)))
+        self._loop_depth += 1
+        self._emit_block(node.body)
+        self._loop_depth -= 1
+        self._line("}")
+
+    def _emit_repeat(self, node: Repeat) -> None:
+        """`重复 N 次：...` → 计数 for。
+
+        次数**只在进入前求值一次**（与解释器 `range(n)` 一致），
+        因此用一个临时 long long 存住，循环体里改动源表达式里的变量
+        不会影响剩余轮数。
+        """
+        count_var = self._next_tmp("jk_cnt")
+        idx_var = self._next_tmp("jk_i")
+        self._line("{{ long long {} = jk_as_int({});".format(
+            count_var, self._expr(node.count)))
+        self._indent += 1
+        self._line("for (long long {i} = 0; {i} < {n}; {i}++) {{".format(
+            i=idx_var, n=count_var))
+        self._loop_depth += 1
+        self._emit_block(node.body)
+        self._loop_depth -= 1
+        self._line("}")
+        self._indent -= 1
+        self._line("}")
 
     def _emit_print(self, node: Call) -> None:
         """打印是变参：多参数用空格分隔，末尾换行（与解释器 print(*args) 一致）。"""
         if not node.args:
-            self._lines.append("    jk_print(0, NULL);")
+            self._line("jk_print(0, NULL);")
             return
         args = [self._expr(a) for a in node.args]
-        tmp = "jk_args{}".format(len(self._lines) + 1)
-        self._lines.append(
-            "    {{ JKValue {}[] = {{ {} }}; jk_print({}, {}); }}".format(
+        tmp = self._next_tmp("jk_args")
+        self._line(
+            "{{ JKValue {}[] = {{ {} }}; jk_print({}, {}); }}".format(
                 tmp, ", ".join(args), len(args), tmp
             )
         )
+
 
     # ---- 表达式 ----
 
@@ -607,17 +931,63 @@ class CCodegen:
             return "jk_nil()"
 
         if isinstance(node, Ident):
-            if node.name not in self._defined:
-                raise CodegenError(
-                    "未定义的名称：{}（AOT 不支持前向引用，请先用「定义」赋值）"
-                    .format(node.name)
-                )
-            return self._slot(node.name)
+            # 名字解析：函数作用域（形参 + 局部）优先，其次全局槽位。
+            # 拼错的名字（既不在作用域也从未出现在任何赋值左侧）会被抓住。
+            # 槽位都预初始化为 jk_nil()，所以「条件分支里才赋值」的变量
+            # 提前读到的是 nil，行为确定，不会读未初始化内存。
+            return self._read_name(node.name)
+
+        if isinstance(node, FuncCall):
+            return self._func_call(node)
 
         if isinstance(node, Call):
             return self._call(node)
 
         raise CodegenError("AOT 不支持的表达式：{}".format(type(node).__name__))
+
+    def _func_call(self, node: FuncCall) -> str:
+        """用户函数调用：`名字(实参...)` → `jk_fnN(实参...)`。
+
+        只支持按名直接调用顶层函数（`node.func` 必须是 `Ident`），与
+        subset_gate「间接函数调用」拒绝规则一致。实参数量按解释器语义处理：
+        少给的形参在解释器里是 `None`（→ 这里补 `jk_nil()`），多给的丢弃。
+        """
+        callee = node.func
+        if not isinstance(callee, Ident):
+            raise CodegenError(
+                "AOT 只支持按名直接调用顶层函数，收到 {}"
+                .format(type(callee).__name__)
+            )
+        info = self._funcs.get(callee.name)
+        if info is None:
+            raise CodegenError(
+                "调用了未定义的函数：{}（AOT 只识别顶层 `函数` 定义）"
+                .format(callee.name)
+            )
+        args = [self._expr(a) for a in node.args]
+        # 形参多于实参：补 nil，对齐解释器 `args[i] if i < len(args) else None`
+        while len(args) < len(info.c_params):
+            args.append("jk_nil()")
+        # 实参多于形参：截断丢弃多余的
+        args = args[:len(info.c_params)]
+        return "{}({})".format(info.c_name, ", ".join(args))
+
+    def _read_name(self, name: str) -> str:
+        """读取一个名字对应的 C 表达式（右值）。"""
+        if self._scope is not None and name in self._scope:
+            return self._scope[name]
+        if name in self._globals:
+            return self._globals[name]
+        if name in self._funcs:
+            raise CodegenError(
+                "函数 {0} 不能当作值使用：AOT 没有函数值与闭包，只支持 "
+                "`{0}(实参...)` 这种直接调用".format(name)
+            )
+        raise CodegenError(
+            "未定义的名称：{}（该名字在当前作用域与全局里都未被「定义」或赋值）"
+            .format(name)
+        )
+
 
     def _call(self, node: Call) -> str:
         verb = node.verb
@@ -648,7 +1018,10 @@ class CCodegen:
     # ---- 工具 ----
 
     def _slot(self, name: str) -> str:
-        slot = self._slots.get(name)
+        """写入槽位：按函数作用域 → 全局的优先级找到对应的 C 标识符。"""
+        if self._scope is not None and name in self._scope:
+            return self._scope[name]
+        slot = self._globals.get(name)
         if slot is None:
             raise CodegenError("内部错误：变量 {} 未分配槽位".format(name))
         return slot
@@ -727,3 +1100,43 @@ def generate_c(program: Program) -> str:
     调用方**必须**先跑 subset_gate.check 并确认返回 True。
     """
     return CCodegen().generate(program)
+
+
+# ---------------------------------------------------------------------------
+# 静态扫描：抽出「被赋值」的名字（Define / Assign 目标）
+# ---------------------------------------------------------------------------
+
+def _scan_assigned_names(body: List[Node], out: List[str]) -> None:
+    """把 body 及其嵌套块里所有出现在赋值左侧的名字**按首次出现顺序**追加到 out。
+
+    与主包 `evaluator.Environment.update` 的作用域链语义配合：AOT 侧只需要
+    知道「这个名字曾经在这里被写过」就足够；具体它写的是全局还是新建局部，
+    由调用方（`_collect_slots` / `_collect_func_scope`）根据上下文决定。
+
+    覆盖：Define / Assign（Ident 目标）以及 If / While / Repeat 的嵌套体。
+    有意**不**跨 FuncDef 边界：AOT 无闭包，函数体里赋的名字不外泄。
+    """
+    seen = set(out)
+    def _add(name: str) -> None:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+
+    def _walk(nodes: List[Node]) -> None:
+        for stmt in nodes:
+            if isinstance(stmt, Define):
+                _add(stmt.name)
+            elif isinstance(stmt, Assign) and isinstance(stmt.target, Ident):
+                _add(stmt.target.name)
+
+            if isinstance(stmt, If):
+                _walk(stmt.then_branch)
+                for _cond, sub_body in (stmt.elif_branches or []):
+                    _walk(sub_body)
+                if stmt.else_branch:
+                    _walk(stmt.else_branch)
+            elif isinstance(stmt, (While, Repeat)):
+                _walk(stmt.body)
+            # FuncDef 边界故意不下钻：其内部赋值只影响函数自身作用域。
+
+    _walk(body)

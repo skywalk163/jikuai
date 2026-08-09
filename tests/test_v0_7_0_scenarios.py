@@ -25,8 +25,8 @@ _ROOT = os.path.normpath(os.path.join(_HERE, '..'))
 _SRC = os.path.join(_ROOT, 'src')
 _SCENARIOS_DIR = os.path.join(_ROOT, 'examples', 'scenarios')
 
-# 本支线新增的三个场景目录（G13 只测这三个，不动旧的 3 个平铺 .jk）
-_NEW_SCENARIOS = ['财务报表', '农历日程', '文本批处理']
+# 场景目录（G13 起测这些，不动旧的 3 个平铺 .jk）
+_NEW_SCENARIOS = ['财务报表', '农历日程', '文本批处理', '推理演示']
 
 # AC-M6-03-02：M4/M5 新增标准库模块白名单
 _M4_M5_MODULES = {'简繁', '排版', '正则', '成语', '分词'}
@@ -50,6 +50,8 @@ def _run_jk(main_jk):
     env = os.environ.copy()
     env['PYTHONPATH'] = _SRC
     env['PYTHONIOENCODING'] = 'utf-8'
+    # 推理演示 场景带 .env + AI 桥：强制离线，保证快照确定性、不联网、不耗 token。
+    env['REASONIX_OFFLINE'] = '1'
     proc = subprocess.run(
         [sys.executable, '-X', 'utf8', '-m', 'jikuai', main_jk],
         capture_output=True, env=env, cwd=_ROOT,

@@ -1,5 +1,259 @@
 # 极快 JiKuai · 变更日志
 
+## 未发布（2026-08-08）· M9 批次
+
+**M9 批次**：一次性推进先前登记的其余四项改进方向。M8 包管理的收尾产出。
+
+测试：755 → **1209 passed, 9 skipped**（新增 454 条：AOT 控制流子集扩容
++ 分词/关键字 fuzz + VSCode DAP 契约 + OOP 私有/反射）。原有用例零回归。
+
+### M9-1 · 分词 fuzz 测试
+
+- `tests/test_v0_8_0_lexer_fuzz.py`（413 例）：
+  - 200 对随机关键字/动词/副词两两拼接（含四组：紧邻、语句上下文、
+    三元组、字符串上下文），验证 `tokenize` 不抛非预期异常。
+  - 100 组「百家姓 + 关键字前缀」组合，覆盖用户误把关键字当变量的场景。
+  - 100 条随机合成的合法极快语句（5 种模板 × 随机 id/verb/num），做压力测试。
+  - 13 条手工收集的已知边界 case（含 CHANGELOG 里登记过的
+    「标识符夹带动词字」「中英混排」「注释后紧接关键字」等）。
+- 全部通过，未暴露新的 crash 路径。这是长尾问题的**防护网**：
+  以后任何触及 lexer 的改动都要先过 fuzz 层。
+
+### M9-2 · VSCode 调试集成
+
+前情：`dap/` 目录下 DAP 适配器 MVP 早已就绪（16 例契约测试通过），
+但 VS Code 扩展没有 debug provider，用户按 F5 会报「找不到调试器」。
+
+- **`editors/vscode/package.json`**：
+  - 新增 `contributes.debuggers`（类型 `jikuai`），声明 `configurationAttributes`
+    / `initialConfigurations` / `configurationSnippets`。
+  - 新增 `contributes.breakpoints` for `jikuai`——没有这条 VS Code 不允许
+    在 `.jk` 文件行首下断点。
+  - `activationEvents` 追加 `onDebugResolve:jikuai`。
+  - `categories` 追加 `Debuggers`。
+- **`editors/vscode/src/extension.ts`**：
+  - `JiKuaiDebugAdapterFactory`：把 launch 请求转成
+    `python -m jikuai_dap` 子进程（`shell=false` + argv 数组）。
+  - `JiKuaiDebugConfigurationProvider`：F5 无 launch.json 时补出默认配置，
+    避免弹「未找到配置」。
+  - launch 的 `pythonPath` 可覆盖扩展全局设置；cwd 兜底顺序为
+    launch.cwd → 工作区根 → program 所在目录。
+- **测试 `tests/test_v0_8_0_vscode_debug.py`**（13 例）：
+  契约级校验（不启动真实 VS Code）。检查 `package.json` 的 debugger
+  贡献结构 + `extension.ts` 关键 API 调用 + DAP 包物理布局。
+  验证「命令用数组传参、无 `shell:true`」——从源头堵住命令注入。
+
+### M9-3 · AOT 子集扩容：控制流
+
+在实验性 AOT（`tools/aot`）里放开控制流子集，把 24 个动词从「顺序执行」
+拓展成「顺序 + 条件 + 循环」。这是 AOT 用户能自然写的最小完备程序集。
+
+- **`tools/aot/jikuai_aot/subset_gate.py`**：
+  - `If` / `While` / `Repeat` / `Break` / `Continue` 移出 `UNSUPPORTED_NODE_TYPES`。
+  - `describe_subset()` 相应更新，`docs/AOT.md` 一致性核对不破。
+  - `Return` 单独保留在不支持集（AOT 尚不支持用户函数，`返回`
+    脱离函数上下文没意义）。`For` 仍不支持（需可迭代对象运行时）。
+- **`tools/aot/jikuai_aot/codegen.py`**：
+  - `CCodegen` 加入 `_indent` / `_loop_depth` / `_tmp_seq` 状态。
+  - `_emit_if` / `_emit_while` / `_emit_repeat` / `Break` / `Continue` 全套实现。
+  - `如果` 链翻译为 `if (jk_truthy(...))` / `else if` / `else`，
+    条件统一过 `jk_truthy()` 保证 Python 真值语义。
+  - `重复 N 次` 用「计数只求值一次 + `for` 循环」，源表达式里的变量
+    改动不影响剩余轮数（对齐解释器 `range(n)` 语义）。
+  - `_collect_slots` 递归进嵌套块——循环体内 `定义` 的变量也拿槽位；
+    定值分析从「必然赋值」放宽为「全程序某处赋值」，因为控制流让
+    静态判死不可行，但真拼错的名字（从未出现在任何赋值左侧）仍报错。
+  - `跳出`/`跳过` 出现在循环外时 codegen 报错兜底。
+- **测试 `tests/test_v0_8_0_aot_controlflow.py`**：门禁接受 + codegen 结构
+  + **有 C 编译器时**编译成原生二进制并与解释器输出**逐字节比对**
+  （8 个端到端用例：if/elif、while 求和、嵌套循环、break/continue、
+  RMB 累加）。这是唯一能证明「AOT 与解释器语义一致」的做法。
+- 原 `test_v0_7_0_aot.py` 里「if/while/repeat 应被门禁拒绝」的三条负例
+  相应更新为「for/return 仍被拒绝」。
+
+### M9-4 · OOP 进阶：私有成员 + 反射
+
+选择**运行时 + 命名约定**实现，不引入新关键字（否则要扩 lexer 的
+最长匹配表，风险大）。
+
+- **私有成员**（`src/jikuai/evaluator.py`）：
+  - `_member_lookup` 新增判定：`attr` 以「私」开头时，接收者语法上
+    必须是 `自身`（即 `Ident('自身')`），否则抛「私有成员不可从外部访问」。
+  - 看的是**语法**不是运行时对象身份——原因写在 `_is_self_receiver`
+    的 docstring 里：把实例存进字段再绕回来访问就能破防的漏洞。
+  - `.私余额 = 100` / `自身.私方法()` 类内可用；类外访问一律拒绝。
+- **反射**（`src/jikuai/keywords.py` + `evaluator.py`）：
+  - `是否是` — 元数 2，`(实例, 类名字符串) → 真/假`，沿继承链判定。
+    子类实例对父类名返回真（`isinstance` 语义）。非实例一律返回假，不报错。
+  - `类名` — 元数 1，`实例 → 类名字符串`。非实例抛类型错误
+    （返回空串会让调用方误以为存在空名类）。
+- **测试 `tests/test_v0_8_0_oop_advanced.py`**（13 例）：
+  账户/服务两个类作为夹具，覆盖私有字段/方法在类内可用、在类外被拒；
+  反射的 isinstance 语义、非实例路径、按类型分流的实用模式；
+  同时回归确认多态派发（最派生优先）没被破坏。
+
+### M9-5 · 完整语法参考手册
+
+- **`docs/语法参考.md`**（400+ 行）：按语法结构组织的规范性参考，
+  13 章覆盖词法、字面量、表达式、语句、函数、面向对象、异常、模块、
+  管道副词、内建动词表、中国特色能力、Python 互操作、已知边界。
+- 与教程的分工：教程做循序渐进的入门（可执行、CI 验证），
+  参考手册回答「某个语法怎么写、边界在哪」。
+- 反映本轮所有变更：M8 包管理、M9-3 控制流子集、M9-4 私有+反射。
+- 内建动词表按元数分组，权威表指回 `keywords.py` 的 `VERB_ARITY`。
+- 已知边界一节从 CHANGELOG 与代码里如实汇总（含 AOT 子集清单）。
+
+
+## 未发布（2026-08-08）
+
+**M8 · 包管理工具**。补齐生态分发的最后一块基础设施：此前极快模块
+只能靠手工拷贝或 `JIKUAI_PATH` 环境变量共享，没有清单、没有版本约束、
+没有可重现的安装。设计参考 pip / npm / Cargo 的公共交集，
+文件格式与命令全部中文化。
+
+测试：726 → **755 passed, 1 skipped**，原有用例零回归。
+
+### 新增
+
+- **`jk 包` 子命令族**（`src/jikuai/pkg/`，7 个模块，核心包仍零运行时依赖）：
+  - `初始化`(init) / `添加`(add) / `移除`(remove) / `装`(install) /
+    `列表`(list) / `运行`(run)，各带英文别名。
+  - `src/jikuai/pkg/semver.py`：三段式语义化版本 + 约束匹配。
+    支持 `^` `~` `>=` `<=` `>` `<` `==` `*`，逗号表逻辑与。
+    **预发布版本不被范围约束隐式命中**（对齐 npm / Cargo），
+    `^1.0.0` 与 `*` 都不会装到 `2.0.0-rc1`，要装必须显式写出预发布号。
+  - `src/jikuai/pkg/manifest.py`：清单 `包.json` 读写与校验。
+    必填字段 `名称` / `版本`；包名白名单为中文+字母数字+`_`+`-`（1..64 字），
+    拒绝点与路径分隔符（包名会拼进安装目录路径）；
+    与内置标准库同名（`分词`/`排版`/…）的包名一律拒绝，防遮蔽。
+    向上逐级查找清单，子目录里执行命令也能定位项目根。
+  - `src/jikuai/pkg/lockfile.py`：锁文件 `包.锁`。条目按包名排序、
+    **不写时间戳等易变字段**，同输入产出字节相同的文件，
+    不制造无意义 git diff。`锁版本` 不匹配时拒读而非猜测语义。
+  - `src/jikuai/pkg/sources.py`：`路径` / `仓库`(git) / `注册表` 三种来源。
+    git 走 `shell=False` + 显式 argv + `--` 分隔符；
+    校验和只哈希 `.jk`/`.py`/`.json` 源文件，跳过 `.git/` 等易变内容。
+  - `src/jikuai/pkg/resolver.py`：广度优先遍历依赖图，
+    **扁平单副本 + 首次遇到即锁定**，冲突在解析期报错而不是偷偷装两份
+    （`node_modules` 式嵌套副本在极快的模块名解析模型下根本无法生效）。
+    循环依赖给出完整链路。
+  - `src/jikuai/pkg/installer.py`：物化到 `极快_包/`。
+    先拷进 `.tmp-<名称>` 再 `os.replace`，中断不留半个包目录；
+    Windows 上旧目录先挪 `.old-<名称>` 规避「非空目录无法替换」；
+    `装` 会裁掉不再被依赖的包（对齐 `npm ci` 而非 `npm install`）。
+- **`module_loader` 接入 `极快_包/`**：`_search_paths` 新增项目根的
+  `极快_包/`，优先级在脚本同目录之后、`stdlib/` 之前；
+  另加 `_resolve_package_entry()` 把包名解析到 `极快_包/<包名>/<入口>`
+  （入口取自该包 `包.json`，缺省 `main.jk`，禁止靠 `..` 逃出包目录）。
+  包目录形态排在扁平单文件之后，**升级到包管理不改变既有脚本行为**；
+  没有 `包.json` 时整条包管理路径跳过，纯脚本用户零影响。
+  项目根查找结果按起始目录缓存，避免每次 `导入` 都爬文件系统。
+- **文档 `docs/包管理.md`**：命令表、清单格式、版本约束语义、
+  模块解析优先级、解析策略取舍、安全边界、尚未实现清单。
+- **测试 `tests/test_v0_8_0_pkg.py`**：29 例，全部离线（只用路径依赖，
+  不碰网络与 git）。覆盖 semver 边界（`^0.x` 收紧、预发布不隐式命中）、
+  清单校验负例、锁文件版本拒读、传递依赖安装、循环检测、裁剪、
+  锁文件字节稳定性、CLI 各子命令返回码、以及子进程里
+  `导入 甲` 真的从 `极快_包/甲/main.jk` 加载成功。
+- **`.gitignore` 追加 `极快_包/`**：依赖目录可由 `包.锁` 完整还原，不入库。
+
+### 已知边界（本次未做，仅记录）
+
+- **中央注册表未上线**：纯版本约束依赖（`"丙": "^1.0.0"`）会报明确的
+  「注册表尚未上线」错误，而非静默降级。中央仓库落地前用户必须显式
+  声明 `路径` 或 `仓库` 来源——这比装出一副能工作的样子更诚实。
+- `jk 包 发布` 待注册表先行；git 依赖只锁到标签，未锁 commit；
+  无跨项目全局缓存。
+- `jk 包 运行` 走 shell 执行（信任模型同 `npm run`）：
+  不要运行来源不明的第三方清单里的脚本。
+
+## 未发布 · 先前批次（2026-08-08）
+
+
+
+**由「Reasonix 推理引擎 demo」实践驱动的语言补齐**。参考段言（DuanLang）
+`demo/reasonix` 复刻一个等价 demo 时暴露出 4 处能力缺口，逐个补齐。
+
+测试：693 → **710 passed, 1 skipped**，原有用例零回归。
+
+### 新增
+
+- **字典字面量语法 `{"键": 值, "键2": 值2}`**（此前 `字典` 只能靠
+  `蟒:json.loads` 或 `提取身份证信息` 等内建动词间接产出）：
+  - `src/jikuai/ast_nodes.py`：新增 `DictLit` 节点，`items` 为
+    `(键表达式, 值表达式)` 列表，保持源码书写顺序。
+  - `src/jikuai/parser.py`：`_parse_dict_literal()`；`_parse_primary` 接入
+    `TokenType.LBRACE` 分支。键/值都是**表达式**（不含逗号管道），
+    条目间允许逗号和/或换行分隔，末尾逗号可省略，`{}` 为空字典。
+    全角 `「」` 与半角 `{}` 等价（沿用 `keywords.PUNCTUATION` 已有映射）。
+  - `src/jikuai/evaluator.py`：`_eval_DictLit()`。
+  - 访问沿用既有两条路径：`.键`（`_member_lookup` 的 dict 分支）与
+    `字典["键"]`（`Index`）；`遍历` 字典迭代键。
+- **内建动词 `去空白`（元数 1）**：等价 Python `str.strip()`。
+  此前极快只有 `替换` / `子串`，处理「用户输入首尾空格」需手写循环。
+  见 `keywords.VERB_ARITY` 与 `evaluator._setup_builtins`。
+- **场景示例 `examples/scenarios/推理演示/`**：Reasonix 4 阶段
+  Chain-of-Thought 推理引擎（理解问题 → 信息提取 → 逻辑推理 → 验证答案）。
+  4 个中文文件名模块（`工具.jk` / `思考链.jk` / `提示词.jk` / `引擎.jk`）
+  + `main.jk`，纯离线固定输入，输出作稳定快照。
+- **测试 `tests/test_v0_7_0_dict_literal.py`**：字典字面量 8 例
+  （空/单键/多键/嵌套/全角括号/末尾逗号/键序/`去空白`）。
+- **ADR-22 · 类的构造器与方法体改用词法作用域**：`JiKuaiClass` 新增
+  `def_env`（在 `_eval_ClassDef` 捕获类定义处环境）；`_invoke_method`
+  与 `_eval_NewInstance` 以它为父环境，而非调用者的作用域。
+  - 新增 `_method_scope(klass, method_name, fallback)`：沿继承链找到**定义**
+    该方法的类，用它的 `def_env`——继承来的方法拿父类所在模块的作用域。
+    解析顺序与 `JiKuaiInstance._find_method` 一致（最派生优先）。
+  - 效果：跨模块使用对象时，方法体能看到**定义它的模块**里 `导入` / `定义`
+    的名字。此前只能看到调用者作用域，逼得跨模块编排必须外提到顶层函数。
+  - `examples/scenarios/推理演示/引擎.jk` 随之回归自然的 OO 写法：
+    `方法 推理` / `方法 处理问题` 直接调用本模块 `导入` 的
+    `创建思考链` / `生成分析阶段` / `格式化阶段` / `格式化答案`。
+  - 构造器参数仍在**调用者**作用域求值（对齐 Python 的求值时机），
+    只有构造器**体**走 `def_env`。
+- **ADR-23a · `蟒:` 桥支持脚本同目录 `.py` 兜底**：`pybridge._load_sidecar`
+  + `py_import(..., current_file=...)`。标准 `importlib.import_module` 抛
+  `ImportError` 时，回退到发起导入的那个 `.jk` 文件同目录的 `<name>.py`。
+  - 补齐与 `.jk` 模块加载器的对称性（后者早已把脚本目录纳入搜索路径），
+    段言那种「helper `.py` 放脚本旁边直接导入」的写法现在成立。
+  - 安全取舍：用 `spec_from_file_location` 隔离加载，**不改 `sys.path`**；
+    含 `.` 的点分名一律跳过本地兜底，不允许拼出目录穿越；信任边界与
+    `.jk` 脚本自身同级；`DENY_LIST` 对成员访问依旧生效。
+  - 以「发起导入的 `.jk`」为基准（`ModuleLoader.load` 会把
+    `ev._current_file` 切到模块自身路径），而非入口脚本。
+- **测试 `tests/test_v0_7_0_scope_bridge_dictkey.py`**：ADR-22/23 共 16 例
+  （跨模块方法/构造器/继承链作用域、反向的"看不到调用者局部"约束、
+  同目录兜底命中与不命中、不污染 `sys.path`、点分名跳过、字典键类型）。
+
+### 修复
+
+- **`Index` 对字典按键取值**：`_eval_Index` 原先无条件 `obj[int(idx)]`，
+  使 `字典["键"]` 抛 `ValueError`。现按 `isinstance(obj, dict)` 分流，
+  字典不强转键、序列仍走整数下标。
+- **多行列表字面量被插入 `空`**：`_parse_list_literal` 未跳过 `NEWLINE`，
+  跨行书写的 `[...]` 会把换行当成元素解析成 `NilLit`。现与字典字面量
+  一致地 `_skip_newlines()`。
+- **动词吞参越过 `}`**：`_parse_verb_call` / `_parse_adverb` 的参数终止
+  token 集合缺 `RBRACE`，使 `{"键": 拼接 "a" "b"}` 里的变参动词吃掉右花括号。
+  三处终止集合统一补入 `TokenType.RBRACE`。
+- **ADR-23b · 字典键不可哈希时给中文诊断**：`_eval_DictLit` 构造前用
+  `hash(key)` 试探，失败则抛携带键所在行列的 `ErrorCategory.TYPE`
+  诊断（"字典的键必须是不可变类型（字符串/数字/布尔/空）"），
+  不再透出 Python 的 `unhashable type: 'list'` 原文。
+
+### 已知边界（本次未改，仅记录）
+
+- **标识符不接受中英混排**：`自身.AI可用` 会被切成属性 `AI` + 残余
+  `可用`，报「无属性/方法：AI」。命名请纯中文或纯英文。
+- **标识符不能夹带内建动词字**：`赵只在主程序里` 会在 `只`（副词）处断开，
+  `助手.相加` 会在 `加`（动词）处断开。命名时避开
+  `加/减/乘/除/等/大/小/长度/只/皆/归/求和/最终/…`。
+- **`新建 类(...)` 后不能直接接 `.成员`**：`_parse_new_expr` 不走
+  `_parse_postfix`，`打印 (新建 甲(1)).方法` 会把 `.` 解析成 `空`。
+  先用 `定义` 接住实例再取成员。
+- **`蟒:` 桥仍是黑名单而非沙箱**：ADR-21 的既有声明不变。同目录兜底
+  没有放松这一点，但也没有收紧——不要用它执行不受信任的 `.py`。
+
 ## v0.6.0（2026-08-08）
 
 M5 里程碑：**LSP 语言服务正式实现 + 三个中文特色标准库模块 + 安全边界声明**。

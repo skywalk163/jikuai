@@ -2,7 +2,8 @@
 """极快语言 - 模块加载器 (M2-1)。
 
 职责：
-- 按优先级搜索 .jk 模块：当前文件目录 → stdlib/ → JIKUAI_PATH（环境变量）
+- 按优先级搜索 .jk 模块：当前文件目录 → 极快_包/（M8 包管理） →
+  stdlib/ → JIKUAI_PATH（环境变量）
 - 在独立的模块级 Environment 中执行 .jk 文件
 - 只有 `导出` 的名字对外可见
 - 相同绝对路径的模块只加载执行一次（缓存）
@@ -12,6 +13,19 @@
 
 import os
 from typing import List, Optional
+
+
+#: 已安装依赖目录名。与 `jikuai.pkg.installer.PACKAGES_DIR` 保持一致；
+#: 这里用字面量而不是 import，避免核心加载路径依赖包管理子包。
+PACKAGES_DIR = '极快_包'
+
+#: 包清单文件名，与 `jikuai.pkg.manifest.MANIFEST_NAME` 一致。
+PKG_MANIFEST = '包.json'
+
+#: 项目根查找结果缓存：起始目录 -> 项目根（或 None）。
+#: 每次 `导入` 都向上走文件系统开销可观，而项目根在一次运行内不会变。
+_PROJECT_ROOT_CACHE = {}
+
 
 
 #: 混合模块（`X.jk` + 同名 `X.py`）的 Python 实现缓存：abspath -> module
@@ -117,6 +131,12 @@ class ModuleLoader:
         paths = []
         if current_file:
             paths.append(os.path.dirname(os.path.abspath(current_file)))
+        # M8 包管理：把 `导入 甲` 解析到项目根的 极快_包/甲.jk。
+        # 优先级排在脚本同目录之后、stdlib 之前——本地脚本可覆盖依赖，
+        # 而依赖不能遮蔽内置标准库（stdlib 兜底在最后）。
+        pkg_dir = self._packages_dir(current_file)
+        if pkg_dir:
+            paths.append(pkg_dir)
         here = os.path.dirname(os.path.abspath(__file__))
         stdlib_dir = os.path.normpath(os.path.join(here, '..', '..', 'stdlib'))
         paths.append(stdlib_dir)
@@ -126,6 +146,36 @@ class ModuleLoader:
                 if p:
                     paths.append(p)
         return paths
+
+    def _packages_dir(self, current_file):
+        """从当前文件所在目录向上找 `包.json`，返回其同级 `极快_包/`。
+
+        没有清单或没有依赖目录时返回 None——包管理是可选的，纯脚本
+        用户不装依赖也不该受影响。项目根按 (起点) 缓存，避免每次
+        `导入` 都爬一遍文件系统。
+        """
+        start = (os.path.dirname(os.path.abspath(current_file))
+                 if current_file else os.getcwd())
+        root = _PROJECT_ROOT_CACHE.get(start, ...)
+        if root is ...:
+            root = self._find_project_root(start)
+            _PROJECT_ROOT_CACHE[start] = root
+        if root is None:
+            return None
+        pkg_dir = os.path.join(root, PACKAGES_DIR)
+        return pkg_dir if os.path.isdir(pkg_dir) else None
+
+    @staticmethod
+    def _find_project_root(start):
+        """向上逐级找含 `包.json` 的目录，返回其路径；找不到返回 None。"""
+        here = os.path.abspath(start)
+        while True:
+            if os.path.isfile(os.path.join(here, PKG_MANIFEST)):
+                return here
+            parent = os.path.dirname(here)
+            if parent == here:
+                return None
+            here = parent
 
     def resolve(self, module_name, current_file=None):
         """将模块名解析为绝对路径。找不到则抛错。"""
@@ -140,7 +190,45 @@ class ModuleLoader:
             path = os.path.join(d, module_name + '.jk')
             if os.path.isfile(path):
                 return os.path.abspath(path)
+
+        # M8：已安装的包是**目录**（极快_包/甲/），入口由它自己的
+        # 包.json「入口」字段决定（缺省 main.jk）。放在扁平文件查找之后，
+        # 保证同名单文件模块仍然优先——升级到包管理不会改变既有行为。
+        pkg_entry = self._resolve_package_entry(module_name, current_file)
+        if pkg_entry:
+            return pkg_entry
+
         raise JiKuaiError(f"[{codes.JK_E5001}] 找不到模块：{module_name}")
+
+    def _resolve_package_entry(self, module_name, current_file):
+        """把包名解析为 `极快_包/<包名>/<入口>` 的绝对路径。
+
+        入口取自该包的 `包.json`；清单缺失或不可读时退回 `main.jk`——
+        依赖目录被手工改坏不该让整个 `导入` 报出 JSON 解析错误，
+        照常按约定入口试一次，真找不到再报「找不到模块」。
+        """
+        pkg_dir = self._packages_dir(current_file)
+        if not pkg_dir:
+            return None
+        root = os.path.join(pkg_dir, module_name)
+        if not os.path.isdir(root):
+            return None
+
+        entry = 'main.jk'
+        manifest_path = os.path.join(root, PKG_MANIFEST)
+        if os.path.isfile(manifest_path):
+            try:
+                import json
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    entry = json.load(f).get('入口') or entry
+            except (OSError, ValueError, AttributeError):
+                pass
+        # 入口只允许是包内相对路径，禁止靠 `..` 逃出包目录
+        candidate = os.path.normpath(os.path.join(root, entry))
+        if os.path.commonpath([os.path.abspath(root),
+                               os.path.abspath(candidate)]) != os.path.abspath(root):
+            return None
+        return os.path.abspath(candidate) if os.path.isfile(candidate) else None
 
     def load(self, module_name, current_file=None):
         """加载模块并返回 ModuleValue。"""

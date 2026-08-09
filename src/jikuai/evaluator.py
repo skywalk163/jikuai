@@ -71,13 +71,19 @@ class BoundMethod:
     按元数分流产生（≥1 参方法访问返回它），只能被 `_eval_FuncCall` 立即调用。
 
     DP-3：不可赋值、传参、返回（由 `_reject_bound_method` 守护）。
-    """
-    __slots__ = ('instance', 'method_def', 'closure_env')
 
-    def __init__(self, instance, method_def, closure_env):
+    M10-1：新增 `defining_class` —— 该方法**定义所在的类**（不是实例的类）。
+    它是 `父类` 能正确工作的前提：`父类` 必须相对于「当前执行的方法定义在哪个类」
+    取父，而不是相对于 `实例.klass`，否则三层继承里孙类调用父类方法、父类方法内
+    再写 `父类.X` 会又解析回自己，造成无限递归。语义与 Python 的 `__class__` 一致。
+    """
+    __slots__ = ('instance', 'method_def', 'closure_env', 'defining_class')
+
+    def __init__(self, instance, method_def, closure_env, defining_class=None):
         self.instance = instance
         self.method_def = method_def
         self.closure_env = closure_env
+        self.defining_class = defining_class
 
     @property
     def arity(self):
@@ -85,6 +91,31 @@ class BoundMethod:
 
     def __repr__(self):
         return f"<绑定方法:{self.instance.klass.name}.{self.method_def.name}>"
+
+
+#: M10-1：方法调用环境里记录「当前方法定义所在类」的内部键。
+#: 用双下划线包裹的中文名，用户永远写不出来——极快标识符必须以百家姓开头，
+#: 所以这个键不可能与任何用户变量冲突，不需要额外的命名空间隔离机制。
+_DEFINING_CLASS_KEY = '__定义类__'
+
+
+class SuperProxy:
+    """M10-1：`父类` 的运行时代理。
+
+    只承载 (实例, 查找起点类)。`查找起点类` 是「当前方法定义所在类」的父类，
+    方法查找从它开始沿继承链向上，因此 `父类.方法名` 永远跳过当前这一层。
+
+    与 BoundMethod 同样受 DP-3 约束：不可赋值、传参、返回。
+    """
+    __slots__ = ('instance', 'start_class')
+
+    def __init__(self, instance, start_class):
+        self.instance = instance
+        self.start_class = start_class
+
+    def __repr__(self):
+        name = self.start_class.name if self.start_class else '无'
+        return f"<父类:{name}>"
 
 
 class Environment:
@@ -117,7 +148,7 @@ class Environment:
 class JiKuaiClass:
     """运行时类对象。"""
     def __init__(self, name, parent, ctor_params, ctor_body, methods,
-                 ctor_defined=False, declared_fields=None):
+                 ctor_defined=False, declared_fields=None, def_env=None):
         self.name = name
         self.parent = parent
         self.ctor_params = ctor_params
@@ -128,6 +159,9 @@ class JiKuaiClass:
         # ADR-02：静态扫描出的"声明字段"集合（含父类链合并）。
         # 现有 AST 无字段声明语法，故以"曾被 自身.X = ... 赋值过"近似。
         self.declared_fields = set(declared_fields or ())
+        # ADR-22：类定义处的环境（词法作用域）。构造器与方法体以它为父环境求值，
+        # 使方法能看到**定义它的模块**里 导入/定义 的名字，而不是调用者的作用域。
+        self.def_env = def_env
 
 
 class JiKuaiInstance:
@@ -164,6 +198,19 @@ class JiKuaiInstance:
         if name in klass.methods:
             return klass.methods[name]
         return self._find_method(name, klass.parent)
+
+    def find_method_with_owner(self, name, klass):
+        """M10-1：沿继承链找方法，同时返回**定义它的类**。
+
+        返回 (方法定义, 定义所在类)，找不到时 (None, None)。
+        `父类` 的正确性完全依赖这个 owner —— 见 BoundMethod.defining_class 注释。
+        """
+        while klass is not None:
+            if name in klass.methods:
+                return klass.methods[name], klass
+            klass = klass.parent
+        return None, None
+
 
     def __repr__(self):
         return f"<{self.klass.name} 实例>"
@@ -430,6 +477,7 @@ class Evaluator:
             '转字符串': lambda a: str(a),
             '转整数': lambda a: int(a),
             '转小数': lambda a: float(a),
+            '去空白': lambda a: str(a).strip(),
             # I/O
             '打印': self._builtin_print,
             '输入': self._builtin_input,
@@ -450,7 +498,41 @@ class Evaluator:
             '干支纪年': _stdlib_call('历法', '干支纪年'),
             '生肖': _stdlib_call('历法', '生肖'),
             '农历完整日期': _stdlib_call('历法', '农历完整日期'),
+            # 面向对象反射（M9-4）
+            '是否是': self._builtin_is_instance_of,
+            '类名': self._builtin_class_name,
         }
+
+    def _builtin_is_instance_of(self, obj, class_name):
+        """`是否是 实例 "类名"` —— 沿继承链判定实例是否属于某个类。
+
+        多态代码常需要「按具体类型分流」，此前极快只能靠给每个类加一个
+        返回类名的方法来变通。这里直接读继承链，子类实例对父类名也返回真
+        （与 Python `isinstance` 的语义一致）。
+
+        非实例对象一律返回假而不报错：`是否是` 的用途就是**判定**，
+        对任意值提问都应该有答案。
+        """
+        if not isinstance(obj, JiKuaiInstance):
+            return False
+        target = str(class_name)
+        k = obj.klass
+        while k is not None:
+            if k.name == target:
+                return True
+            k = k.parent
+        return False
+
+    def _builtin_class_name(self, obj):
+        """`类名 实例` —— 返回实例所属类的名字（字符串）。
+
+        非实例对象抛类型错误：拿不到类名时返回空字符串会让调用方
+        误以为「有个叫空串的类」，报错更诚实。
+        """
+        if not isinstance(obj, JiKuaiInstance):
+            raise JiKuaiError(f"「类名」需要一个对象实例，收到：{type(obj).__name__}")
+        return obj.klass.name
+
 
     def _builtin_print(self, *args):
         print(*[self._format_value(a) for a in args])
@@ -669,6 +751,7 @@ class Evaluator:
             methods=node.methods,
             ctor_defined=getattr(node, 'ctor_defined', False),
             declared_fields=declared,
+            def_env=env,          # ADR-22：捕获定义处环境，供方法/构造器求值
         )
         self.classes[node.name] = klass
         env.set(node.name, klass)
@@ -713,7 +796,8 @@ class Evaluator:
             top_name = node.module.split('.')[0]
             bind_to_top = (node.alias is None
                            or node.alias == top_name and '.' in node.module)
-            module = py_import(node.module, top_level=bind_to_top)
+            module = py_import(node.module, top_level=bind_to_top,
+                               current_file=self._current_file)
             env.set(node.alias or top_name, module)
             return None
         module = self.module_loader.load(node.module, self._current_file)
@@ -840,7 +924,8 @@ class Evaluator:
             args = self._eval_args(node.args, env)
             if isinstance(target, BoundMethod):
                 return self._invoke_method(target.instance, target.method_def,
-                                           args, target.closure_env)
+                                           args, target.closure_env,
+                                           defining_class=target.defining_class)
             # ADR-10/11: PyCallable 直接调用（括号已在 AST 层确认）
             from .pybridge import PyCallable as _PyCallable
             if isinstance(target, _PyCallable):
@@ -850,7 +935,8 @@ class Evaluator:
         args = self._eval_args(node.args, env)
         if isinstance(func, BoundMethod):
             return self._invoke_method(func.instance, func.method_def,
-                                       args, func.closure_env)
+                                       args, func.closure_env,
+                                       defining_class=func.defining_class)
         # ADR-10/11: PyCallable 通过标识符直接调用（理论上不常见，以防万一）
         from .pybridge import PyCallable as _PyCallable
         if isinstance(func, _PyCallable):
@@ -948,16 +1034,42 @@ class Evaluator:
                 # 避免 `math.sqrt 16` 静默 fallthrough 成两条语句（AC-94）。
                 raise self._py_paren_required_error(obj, node)
             return value
+        if isinstance(obj, SuperProxy):
+            # M10-1：`父类.方法名`。从 start_class（当前方法定义类的父类）起查方法，
+            # 绑定回同一个实例，但把 defining_class 设成命中类，以支持多层 super 链。
+            attr = node.attr
+            if obj.start_class is None:
+                raise JiKuaiError(
+                    "`父类` 无可用父类：当前类没有继承任何父类，"
+                    "或方法定义类已到继承链顶端")
+            method, owner = obj.instance.find_method_with_owner(attr, obj.start_class)
+            if method is None:
+                raise JiKuaiError(
+                    f"父类中无方法：{obj.start_class.name} 及其祖先均未定义 `{attr}`")
+            # 与实例分支不同：这里**不做** auto_invoke。`父类.方法名` 必须写括号，
+            # 否则 0 参方法在「取值」和「调用」两种意图之间无法区分。
+            return BoundMethod(obj.instance, method, env, defining_class=owner)
         if isinstance(obj, JiKuaiInstance):
             attr = node.attr
+            # M9-4 封装：以「私」开头的成员只允许经 `自身.` 访问。
+            # 用命名约定而不是新关键字，避免动词/关键字表扩张影响无空格分词；
+            # 判定看的是**语法上的接收者**（node.obj 是否为 `自身`），
+            # 而不是运行时对象身份——后者无法区分「类内访问自己」与
+            # 「类外恰好拿到同一个实例」。
+            if attr.startswith('私') and not self._is_self_receiver(node.obj):
+                raise JiKuaiError(
+                    f"私有成员不可从外部访问：{obj.klass.name}.{attr}"
+                    f"（以「私」开头的成员只能在类内经 `自身.` 使用）")
             # 字段优先
             if attr in obj.attrs:
                 return obj.attrs[attr]
-            method = obj._find_method(attr, obj.klass)
+
+            method, owner = obj.find_method_with_owner(attr, obj.klass)
             if method is not None:
                 if len(method.params) == 0 and auto_invoke:
-                    return self._invoke_method(obj, method, [], env)   # M-01
-                return BoundMethod(obj, method, env)                   # M-02 / M-03
+                    return self._invoke_method(obj, method, [], env,
+                                               defining_class=owner)   # M-01
+                return BoundMethod(obj, method, env, defining_class=owner)  # M-02 / M-03
             # ADR-02：声明过但未初始化的字段 → 空(nil)；未声明的属性 → 报错
             if obj.is_declared_field(attr):
                 return None
@@ -966,10 +1078,28 @@ class Evaluator:
             return obj.get(node.attr)
         raise JiKuaiError(f"无法访问 {node.attr}")
 
-    def _invoke_method(self, instance, method_def, args, env):
-        """以 instance 为 `自身` 执行方法体，返回 `返回` 的值（无则 None）。"""
-        call_env = Environment(env)
+    def _invoke_method(self, instance, method_def, args, env, defining_class=None):
+        """以 instance 为 `自身` 执行方法体，返回 `返回` 的值（无则 None）。
+
+        ADR-22：方法体的父环境是**方法定义所在类**的 def_env，而非调用者。
+        这使方法能看到定义它的模块里 `导入` / `定义` 的名字；继承来的方法
+        用**父类**的 def_env（父类可能定义在另一个模块）。
+
+        M10-1：把「方法定义所在类」写进 call_env（键 `__定义类__`），供 `父类`
+        求值时定位继承链起点。调用方未显式传 defining_class 时按方法名沿链回查，
+        与 `_method_scope` 的解析顺序一致，保证两者永远指向同一个类。
+        """
+        if defining_class is None:
+            _m, defining_class = instance.find_method_with_owner(
+                method_def.name, instance.klass)
+        scope_parent = (defining_class.def_env if defining_class is not None
+                        and defining_class.def_env else None)
+        if scope_parent is None:
+            scope_parent = self._method_scope(instance.klass,
+                                              method_def.name, env)
+        call_env = Environment(scope_parent)
         call_env.set('自身', instance)
+        call_env.set(_DEFINING_CLASS_KEY, defining_class)
         for i, p in enumerate(method_def.params):
             call_env.set(p, args[i] if i < len(args) else None)
         try:
@@ -977,6 +1107,54 @@ class Evaluator:
         except ReturnSignal as r:
             return r.value
         return None
+
+    def _eval_Super(self, node, env):
+        """M10-1：求值 `父类`，产出 SuperProxy。
+
+        起点 = 「当前执行的方法定义所在类」的父类，而不是 `自身.klass` 的父类。
+        这一点是正确性关键：三层继承 孙←子←父，若按 `自身.klass.parent` 取，
+        子类方法里的 `父类.X` 在孙实例上会解析回子类自己 → 无限递归。
+        """
+        try:
+            instance = env.get('自身')
+        except JiKuaiError:
+            raise JiKuaiError("`父类` 只能在类的方法体内使用")
+        if not isinstance(instance, JiKuaiInstance):
+            raise JiKuaiError("`父类` 只能在类的方法体内使用")
+        try:
+            defining_class = env.get(_DEFINING_CLASS_KEY)
+        except JiKuaiError:
+            defining_class = None
+        base = defining_class if defining_class is not None else instance.klass
+        return SuperProxy(instance, base.parent if base is not None else None)
+
+    def _is_self_receiver(self, node):
+        """判断 MemberAccess 的接收者语法上是不是 `自身`。
+
+        看的是**语法**（AST 节点是否是 `Ident('自身')`），而不是运行时对象身份。
+        原因：类外代码 `赵狗.主人 = 赵狗` 之后 `赵狗.主人.私余额` 也拿到同一
+        实例，如果按对象身份判断就会误放行；而 `自身` 只有在方法体内才会被
+        parser 生成，所以「语法上是 `自身`」等价于「这行代码写在类内」。
+
+        M10-1：`父类` 同理——它也只由 parser 在方法体内生成，所以
+        `父类.私方法()` 属于类内访问，应当放行。
+        """
+        return (isinstance(node, Ident) and node.name == '自身') \
+            or isinstance(node, Super)
+
+    def _method_scope(self, klass, method_name, fallback_env):
+        """ADR-22：沿继承链找到定义 method_name 的类，返回它的 def_env。
+
+        解析顺序与 `JiKuaiInstance._find_method` 一致（最派生优先）。
+        找不到（或该类没有 def_env，如手工构造的类）时退回 fallback_env，
+        保持旧行为，不至于让方法调用直接失去作用域。
+        """
+        k = klass
+        while k is not None:
+            if method_name in k.methods:
+                return k.def_env or fallback_env
+            k = k.parent
+        return fallback_env
 
     def _py_paren_required_error(self, py_module, node):
         """ADR-11：Python 桥函数缺括号的 SYNTAX 诊断（AC-94）。
@@ -996,7 +1174,22 @@ class Evaluator:
         ))
 
     def _reject_bound_method(self, value, node):
-        """DP-3：BoundMethod 不可赋值 / 传参 / 返回。"""
+        """DP-3：BoundMethod 不可赋值 / 传参 / 返回。
+
+        M10-1：SuperProxy 同样受此约束。裸 `父类` 若作为值流转，后续没有任何
+        操作能对它做有意义的事，早报错比让它渗进列表/字典里更好定位。
+        """
+        if isinstance(value, SuperProxy):
+            detail = "`父类` 不能作为值使用，只能写成 `父类.方法名(参数)`"
+            raise JiKuaiError(
+                f"类型错误：{detail}",
+                info=ErrorInfo(
+                    category=ErrorCategory.TYPE,
+                    message=detail,
+                    line=getattr(node, 'line', 0),
+                    col=getattr(node, 'col', 0),
+                    source_line=self._source_line(getattr(node, 'line', 0)),
+                ))
         if isinstance(value, BoundMethod):
             name = f"{value.instance.klass.name}.{value.method_def.name}"
             detail = f"方法不能作为值使用，请直接调用：{name}(参数)"
@@ -1022,10 +1215,35 @@ class Evaluator:
     def _eval_Index(self, node, env):
         obj = self._eval_node(node.obj, env)
         idx = self._eval_node(node.index, env)
+        # 字典按键取值（键不强转 int），序列按整数下标取值
+        if isinstance(obj, dict):
+            return obj[idx]
         return obj[int(idx)]
 
     def _eval_ListLit(self, node, env):
         return [self._eval_node(item, env) for item in node.items]
+
+    def _eval_DictLit(self, node, env):
+        result = {}
+        for k_node, v_node in node.items:
+            key = self._eval_node(k_node, env)
+            # ADR-23：键必须可哈希（str/int/float/bool/None），不可哈希类型给中文诊断
+            try:
+                hash(key)
+            except TypeError:
+                raise JiKuaiError(
+                    f"类型错误：字典的键不可哈希（类型 {type(key).__name__}，值 {key!r}）",
+                    info=ErrorInfo(
+                        category=ErrorCategory.TYPE,
+                        message=f"字典的键必须是不可变类型（字符串/数字/布尔/空），"
+                                f"当前键的类型是 {type(key).__name__}",
+                        line=getattr(k_node, 'line', 0),
+                        col=getattr(k_node, 'col', 0),
+                        source_line=self._source_line(getattr(k_node, 'line', 0)),
+                    ),
+                )
+            result[key] = self._eval_node(v_node, env)
+        return result
 
     def _eval_Lambda(self, node, env):
         return ('func', FuncDef(name='<lambda>', params=node.params, body=node.body), env)
@@ -1053,7 +1271,10 @@ class Evaluator:
         # ADR-02：用 _resolve_ctor 代替直接判 klass.ctor_body
         ctor_class = self._resolve_ctor(klass)
         if ctor_class is not None and ctor_class.ctor_body:
-            ctor_env = Environment(env)
+            # ADR-22：构造器体以**构造器所在类**的 def_env 为父环境（词法作用域）；
+            # 参数在调用者作用域求值（对齐 Python 求值时机），然后注入 ctor_env。
+            parent_env = getattr(ctor_class, 'def_env', None) or env
+            ctor_env = Environment(parent_env)
             ctor_env.set('自身', instance)
             for i, param in enumerate(ctor_class.ctor_params):
                 val = self._eval_node(node.args[i], env) if i < len(node.args) else None

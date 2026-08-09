@@ -13,7 +13,7 @@ from .keywords import (
     ALL_KEYWORDS, KW_DEFINE, KW_ASSIGN, KW_IF, KW_THEN, KW_ELIF, KW_ELSE,
     KW_WHILE, KW_FOR, KW_IN, KW_FROM, KW_TO, KW_REPEAT, KW_TIMES,
     KW_BREAK, KW_CONTINUE, KW_FUNC, KW_PARAM, KW_RETURN,
-    KW_CLASS, KW_EXTENDS, KW_CTOR, KW_METHOD, KW_NEW, KW_SELF,
+    KW_CLASS, KW_EXTENDS, KW_CTOR, KW_METHOD, KW_NEW, KW_SELF, KW_SUPER,
     KW_TRY, KW_CATCH, KW_FINALLY, KW_THROW,
     KW_IMPORT, KW_EXPORT, KW_FILE, KW_AS,
     KW_TRUE, KW_FALSE, KW_NIL, VERB_ARITY, ADVERBS
@@ -568,7 +568,7 @@ class Parser:
             # 可变元数：吞噬直到句号/逗号/行尾/右括号
             while not self._at_end() and self._cur().type not in (
                     TokenType.PERIOD, TokenType.COMMA, TokenType.NEWLINE,
-                    TokenType.RPAREN, TokenType.RBRACKET, TokenType.EOF,
+                    TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACE, TokenType.EOF,
                     TokenType.COLON):
                 if self._cur().type == TokenType.ADVERB:
                     break
@@ -577,7 +577,7 @@ class Parser:
             for _ in range(arity):
                 if self._at_end() or self._cur().type in (
                         TokenType.PERIOD, TokenType.COMMA, TokenType.NEWLINE,
-                        TokenType.RPAREN, TokenType.RBRACKET, TokenType.EOF,
+                        TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACE, TokenType.EOF,
                         TokenType.COLON):
                     break
                 args.append(self._parse_argument())
@@ -622,7 +622,7 @@ class Parser:
             for _ in range(need):
                 if self._at_end() or self._cur().type in (
                         TokenType.PERIOD, TokenType.COMMA, TokenType.NEWLINE,
-                        TokenType.RPAREN, TokenType.RBRACKET, TokenType.EOF,
+                        TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACE, TokenType.EOF,
                         TokenType.COLON):
                     break
                 args.append(self._parse_argument())
@@ -660,6 +660,11 @@ class Parser:
             if tok.value in KW_SELF:
                 self._advance()
                 return self._parse_postfix(Ident(name='自身'))
+            # M10-1：`父类.方法名(参数)`。裸 `父类` 也走 postfix，若后面没有
+            # `.成员` 则最终由 evaluator 报「父类不能作为值使用」。
+            if tok.value in KW_SUPER:
+                self._advance()
+                return self._parse_postfix(self._loc(Super(), tok))
 
         if tok.type == TokenType.IDENT:
             self._advance()
@@ -668,6 +673,10 @@ class Parser:
         # 列表字面量 【1, 2, 3】
         if tok.type == TokenType.LBRACKET:
             return self._parse_list_literal()
+
+        # 字典字面量 「"键": 值」 / {"键": 值}
+        if tok.type == TokenType.LBRACE:
+            return self._parse_dict_literal()
 
         # 括号分组
         if tok.type == TokenType.LPAREN:
@@ -703,11 +712,35 @@ class Parser:
     def _parse_list_literal(self):
         self._advance()  # 消费 [
         items = []
+        self._skip_newlines()
         while not self._at_end() and self._cur().type != TokenType.RBRACKET:
             items.append(self._parse_expression())
             self._match_type(TokenType.COMMA)
+            self._skip_newlines()
         self._expect_type(TokenType.RBRACKET, "列表缺少 ]")
         return ListLit(items=items)
+
+    def _parse_dict_literal(self):
+        """解析字典字面量：`{"键": 值, "键2": 值2}` / `「"键": 值」`。
+
+        - 键与值都是**表达式**（不含逗号管道）：逗号在字典内是条目分隔符，
+          需要管道作为值时请用括号包起来。
+        - 条目之间允许逗号和/或换行分隔，末尾逗号可省略。
+        - `{}` 为空字典。
+        """
+        brace_tok = self._advance()  # 消费 {
+        items = []
+        self._skip_newlines()
+        while not self._at_end() and self._cur().type != TokenType.RBRACE:
+            key = self._parse_expression()
+            self._expect_type(TokenType.COLON, "字典条目缺少键值分隔符 ：")
+            self._skip_newlines()
+            value = self._parse_expression()
+            items.append((key, value))
+            self._match_type(TokenType.COMMA)
+            self._skip_newlines()
+        self._expect_type(TokenType.RBRACE, "字典缺少 }")
+        return self._loc(DictLit(items=items), brace_tok)
 
     def _parse_call_args_paren(self):
         """解析括号内的参数列表。"""

@@ -17,13 +17,18 @@ False —— 驱动器据此拒绝产出任何编译产物（AC-M6-06-03）。
       十几条重复诊断。
     - 白名单语义：`SUPPORTED_VERBS` 之外的任何内建动词都视为不支持。
       宁可漏支持，不可错编译。
+    - 大部分判定只看**节点类型**（`UNSUPPORTED_NODE_TYPES`）；T2a 起另有一小
+      组**上下文相关**判定（`_CONTEXT_FEATURE_NOTES`）：`FuncDef` 写在顶层
+      合法、写在函数体里就是闭包，必须结合位置才判得出来。
 """
 
 from __future__ import annotations
 
 from typing import Iterable, List, Optional, Tuple
 
-from jikuai.ast_nodes import AdverbCall, Assign, Call, Import, Node, Program
+from jikuai.ast_nodes import (
+    AdverbCall, Assign, Call, FuncCall, FuncDef, Import, Node, Program, Return,
+)
 from jikuai.diagnostics.codes import CODE_TABLE, JK_E7001
 from jikuai.diagnostics.model import Diagnostic, Position, Span
 from jikuai.diagnostics.sink import DiagnosticSink
@@ -32,7 +37,7 @@ from jikuai.diagnostics.sink import DiagnosticSink
 # ADR-19 受支持子集定义
 # ---------------------------------------------------------------------------
 
-#: 受支持的内建动词白名单（ADR-19）。
+#: 受支持的内建动词白名单（ADR-19 · M9-3 扩容）。
 #:
 #: 注意：`人民币` 动词**不在**白名单内 —— 受支持的只有人民币**字面量**
 #: （`￥99.90` → MoneyLit）。`人民币 9.9` 会被解析成 `Call(verb="人民币")`，
@@ -53,6 +58,19 @@ SUPPORTED_VERBS: frozenset = frozenset({
 })
 
 #: 不支持的 AST 节点类型名（类名字符串）。命中即 JK-E7001。
+#:
+#: M9-3 把**控制流**移出本集合：`If` / `While` / `Repeat` / `Break` /
+#: `Continue` 现在可以编译。它们只需要 C 的 if/while/break/continue，
+#: 不需要堆对象、调用栈或泛型容器，是子集扩容里性价比最高的一档。
+#:
+#: T2a 把**用户函数**移出本集合：`FuncDef` / `FuncCall` / `Return` 现在可以
+#: 编译成 C 函数（签名统一 `JKValue f(JKValue...)`）。但只有**顶层、无捕获**
+#: 的函数在子集内 —— 嵌套函数定义与闭包仍命中 JK-E7001，判定见
+#: `_collect` 里的上下文规则，不是靠这个集合。
+#:
+#: 仍然不支持的都有明确的运行时依赖：`For`（遍历）要可迭代对象、
+#: `Lambda` 要环境捕获、`ListLit`/`Index` 要堆容器、类与异常要对象模型
+#: 与栈展开。
 UNSUPPORTED_NODE_TYPES: frozenset = frozenset({
     # 类与继承
     "ClassDef", "NewInstance", "MemberAccess",
@@ -62,12 +80,12 @@ UNSUPPORTED_NODE_TYPES: frozenset = frozenset({
     "Pipeline", "AdverbCall",
     # 模块与互操作
     "Import", "Export",
-    # 闭包与用户函数
-    "Lambda", "FuncDef", "FuncCall",
-    # 控制流（第一版子集不含）
-    "If", "While", "For", "Repeat", "Break", "Continue", "Return",
+    # 闭包（需要环境捕获，代价比无捕获函数高一个量级）
+    "Lambda",
+    # 遍历循环（需要可迭代对象运行时）
+    "For",
     # 复合数据（第一版子集不含）
-    "ListLit", "Index",
+    "ListLit", "DictLit", "Index",
 })
 
 #: 节点类型名 → 对外中文特性名。诊断消息必须含这个名字，便于用户定位。
@@ -82,43 +100,46 @@ _NODE_FEATURE_NAMES = {
     "Import": "模块导入",
     "Export": "模块导出",
     "Lambda": "匿名函数",
-    "FuncDef": "函数定义",
-    "FuncCall": "用户函数调用",
-    "If": "条件分支",
-    "While": "当循环",
     "For": "遍历循环",
-    "Repeat": "重复循环",
-    "Break": "跳出",
-    "Continue": "跳过",
-    "Return": "返回",
     "ListLit": "列表字面量",
+    "DictLit": "字典字面量",
     "Index": "索引访问",
 }
 
 #: 各不支持特性的补充说明（写进 Diagnostic.notes，也用于 docs/AOT.md 对齐）。
 _NODE_FEATURE_NOTES = {
-    "ClassDef": "类与继承需要运行时对象模型，第一版 AOT 后端没有堆对象与方法派发。",
-    "NewInstance": "类与继承需要运行时对象模型，第一版 AOT 后端没有堆对象与方法派发。",
-    "MemberAccess": "成员访问依赖对象模型，第一版 AOT 后端未实现。",
-    "Try": "异常需要栈展开机制，第一版 AOT 后端未实现。",
-    "Throw": "异常需要栈展开机制，第一版 AOT 后端未实现。",
+    "ClassDef": "类与继承需要运行时对象模型，AOT 后端没有堆对象与方法派发。",
+    "NewInstance": "类与继承需要运行时对象模型，AOT 后端没有堆对象与方法派发。",
+    "MemberAccess": "成员访问依赖对象模型，AOT 后端未实现。",
+    "Try": "异常需要栈展开机制，AOT 后端未实现。",
+    "Throw": "异常需要栈展开机制，AOT 后端未实现。",
     "Pipeline": "管道是极快的核心范式，但需要值传递与惰性求值支撑，暂不在 AOT 子集内。",
     "AdverbCall": "副词是高阶函数（映射/筛选/归约），需要函数值与列表运行时，暂不在 AOT 子集内。",
     "Import": "模块导入（含 蟒: pybridge）需要 Python 运行时在场，与 AOT 目标冲突。",
     "Export": "模块导出只在模块语境有意义，AOT 只编译单文件顶层程序。",
-    "Lambda": "闭包需要环境捕获，第一版 AOT 后端未实现。",
-    "FuncDef": "用户函数需要调用栈与作用域链，第一版 AOT 后端未实现（下一步优先项）。",
-    "FuncCall": "用户函数需要调用栈与作用域链，第一版 AOT 后端未实现（下一步优先项）。",
-    "If": "控制流不在第一版子集内（下一步优先项，见 docs/AOT.md 下一步建议）。",
-    "While": "控制流不在第一版子集内（下一步优先项，见 docs/AOT.md 下一步建议）。",
-    "For": "控制流不在第一版子集内（下一步优先项，见 docs/AOT.md 下一步建议）。",
-    "Repeat": "控制流不在第一版子集内（下一步优先项，见 docs/AOT.md 下一步建议）。",
-    "Break": "控制流不在第一版子集内。",
-    "Continue": "控制流不在第一版子集内。",
-    "Return": "控制流不在第一版子集内。",
-    "ListLit": "列表需要堆分配与泛型容器运行时，第一版 AOT 后端未实现。",
-    "Index": "索引访问依赖列表/字典运行时，第一版 AOT 后端未实现。",
+    "Lambda": "闭包需要环境捕获（逃逸分析或显式 env 结构体），AOT 后端未实现；"
+              "请改用顶层 `函数` 定义。",
+    "For": "`遍历` 需要可迭代对象运行时；请改用 `当` 循环或 `重复 N 次`。",
+    "ListLit": "列表需要堆分配与泛型容器运行时，AOT 后端未实现。",
+    "DictLit": "字典需要哈希表运行时，AOT 后端未实现。",
+    "Index": "索引访问依赖列表/字典运行时，AOT 后端未实现。",
 }
+
+#: **上下文相关**的不支持特性（T2a）。这些特性靠节点类型判不出来，必须结合
+#: 所处位置：同一个 `FuncDef` 写在顶层合法、写在函数体里就是闭包。
+#:
+#: 键即诊断消息里出现的对外特性名，值为写进 notes 的说明。
+_CONTEXT_FEATURE_NOTES = {
+    "嵌套函数定义": "AOT 第一版只支持**顶层无捕获**函数：嵌套函数会捕获外层局部变量，"
+                    "需要闭包环境（逃逸分析或 env 结构体），后端未实现。",
+    "非顶层函数定义": "AOT 只支持写在程序顶层的 `函数` 定义。写在 `如果`/`当`/`重复` "
+                      "块里的函数定义是条件定义，静态编译期无法确定绑定，暂不支持。",
+    "函数外的「返回」": "`返回` 只在函数体内有意义；顶层的 `返回` 在解释器里也会报"
+                        "「「返回」只能在函数或方法体内使用」。",
+    "间接函数调用": "AOT 没有函数值/函数指针表：只支持 `名字(实参...)` 这种直接按名"
+                    "调用顶层函数的形式。",
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +270,17 @@ def is_supported(program: Program) -> bool:
 
 
 def describe_subset() -> dict:
-    """导出子集描述，供 docs/AOT.md 与测试做「文档 ↔ 代码」一致性核对。"""
+    """导出子集描述，供 docs/AOT.md 与测试做「文档 ↔ 代码」一致性核对。
+
+    `unsupported_contextual_features`（T2a 新增）列出**靠节点类型判不出来**的
+    子集外特性：同一个 `FuncDef` 写在顶层是支持的，写在函数体里就是闭包。
+    """
     return {
         "supported_verbs": sorted(SUPPORTED_VERBS),
         "unsupported_node_types": sorted(UNSUPPORTED_NODE_TYPES),
         "unsupported_feature_names": dict(sorted(_NODE_FEATURE_NAMES.items())),
+        "unsupported_contextual_features": dict(
+            sorted(_CONTEXT_FEATURE_NOTES.items())),
     }
 
 
@@ -261,17 +288,63 @@ def describe_subset() -> dict:
 # 遍历核心
 # ---------------------------------------------------------------------------
 
-def _collect(node: Node):
+def _collect(node: Node, in_function: bool = False,
+             program_top: bool = False):
     """前序深度优先产出 (特性名, 主体名, 说明, 节点) 四元组。
 
     命中不支持节点后**不再下钻**其子树：一个类定义只报一条，而不是把类体里
     每个语句都报一遍。未命中的节点继续递归。
+
+    上下文参数（T2a）
+    ----------------
+    `in_function`   当前是否位于某个 `FuncDef` 体内 —— 决定 `返回` 合法性，
+                    以及再遇到 `FuncDef` 时按「嵌套函数（闭包）」拒绝。
+    `program_top`   当前节点是否为 `Program.body` 的**直接**成员 —— 只有这一
+                    层的 `FuncDef` 在子集内。写在 `如果`/`当`/`重复` 块里的
+                    函数定义是条件定义，静态编译期定不下绑定，一律拒绝。
     """
     type_name = type(node).__name__
 
     if type_name in UNSUPPORTED_NODE_TYPES:
         feature, subject, note = _feature_of_node(node)
         yield (feature, subject, note, node)
+        return
+
+    if isinstance(node, FuncDef):
+        # 顶层无捕获函数在子集内；嵌套 / 条件定义不在。
+        if in_function:
+            feature = "嵌套函数定义"
+        elif not program_top:
+            feature = "非顶层函数定义"
+        else:
+            feature = None
+        if feature is not None:
+            yield (feature, node.name, _CONTEXT_FEATURE_NOTES[feature], node)
+            return
+        # 函数体：进入函数语境，且不再是「顶层」
+        for stmt in node.body:
+            for item in _collect(stmt, in_function=True, program_top=False):
+                yield item
+        return
+
+    if isinstance(node, Return) and not in_function:
+        feature = "函数外的「返回」"
+        yield (feature, "返回", _CONTEXT_FEATURE_NOTES[feature], node)
+        return
+
+    if isinstance(node, FuncCall):
+        # 只支持 `名字(实参...)`：被调方必须是简单标识符。
+        # `对象.方法()` 的 MemberAccess 本身也在 UNSUPPORTED_NODE_TYPES 里，
+        # 但先在这里给出更贴切的消息。
+        callee_type = type(node.func).__name__
+        if callee_type != "Ident":
+            feature = "间接函数调用"
+            yield (feature, callee_type, _CONTEXT_FEATURE_NOTES[feature], node)
+            return
+        for arg in node.args:
+            for item in _collect(arg, in_function=in_function,
+                                 program_top=False):
+                yield item
         return
 
     if isinstance(node, Call):
@@ -300,6 +373,8 @@ def _collect(node: Node):
             )
             return
 
+    child_top = isinstance(node, Program)
     for child in _iter_child_nodes(node):
-        for item in _collect(child):
+        for item in _collect(child, in_function=in_function,
+                             program_top=child_top):
             yield item

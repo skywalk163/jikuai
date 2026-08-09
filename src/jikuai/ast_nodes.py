@@ -79,6 +79,16 @@ class AdverbCall(Node):
 
 
 @dataclass
+class Super(Node):
+    """显式父类引用（M10-1）：`父类`。
+
+    只能作为 `MemberAccess` 的接收者出现（`父类.方法名(参数)`）。
+    自身不是值，不可赋值/传参/返回——由 evaluator 的 SuperProxy 守护。
+    """
+    pass
+
+
+@dataclass
 class MemberAccess(Node):
     """成员访问：obj.attr"""
     obj: Node
@@ -95,6 +105,15 @@ class Index(Node):
 @dataclass
 class ListLit(Node):
     items: List[Node] = field(default_factory=list)
+
+
+@dataclass
+class DictLit(Node):
+    """字典字面量：「"键": 值，"键2": 值2」 / {"键": 值, "键2": 值2}
+
+    items 为 (键表达式, 值表达式) 二元组列表，保持源码书写顺序。
+    """
+    items: List = field(default_factory=list)
 
 
 @dataclass

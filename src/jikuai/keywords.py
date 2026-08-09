@@ -44,6 +44,12 @@ KW_CTOR = {'构造'}
 KW_METHOD = {'方法'}
 KW_NEW = {'新建'}
 KW_SELF = {'自身'}
+# M10-1：显式父类方法调用。`父类.方法名(参数)`。
+# 选双字关键字而不是 `super()` 函数形式，理由：
+#   1. 与 `自身` 对称，都是"方法体内的隐式绑定"，学习成本为零；
+#   2. 双字关键字天然不与百家姓标识符冲突，无空格分词器不需要额外规则；
+#   3. 不引入新的调用语法（`父类` 本身不可调用，只能作为成员访问的接收者）。
+KW_SUPER = {'父类'}
 
 # 异常
 KW_TRY = {'尝试'}
@@ -73,7 +79,7 @@ ALL_KEYWORDS = (
     KW_DEFINE | KW_ASSIGN | KW_IF | KW_THEN | KW_ELIF | KW_ELSE
     | KW_WHILE | KW_FOR | KW_IN | KW_FROM | KW_TO | KW_REPEAT | KW_TIMES
     | KW_BREAK | KW_CONTINUE | KW_FUNC | KW_PARAM | KW_RETURN
-    | KW_CLASS | KW_EXTENDS | KW_CTOR | KW_METHOD | KW_NEW | KW_SELF
+    | KW_CLASS | KW_EXTENDS | KW_CTOR | KW_METHOD | KW_NEW | KW_SELF | KW_SUPER
     | KW_TRY | KW_CATCH | KW_FINALLY | KW_THROW
     | KW_IMPORT | KW_EXPORT | KW_FILE | KW_AS
     | KW_TRUE | KW_FALSE | KW_NIL
@@ -106,7 +112,7 @@ VERB_ARITY = {
     '求和': 1, '最大': 1, '最小': 1, '平均': 1,
     # 字符串
     '拼接': -1, '分割': 2, '替换': 3, '子串': 3, '大写': 1, '小写': 1,
-    '转字符串': 1, '转整数': 1, '转小数': 1,
+    '转字符串': 1, '转整数': 1, '转小数': 1, '去空白': 1,
     # I/O
     '打印': -1, '输入': -1, '读取': 1, '写入': 2,
     # 中国特色
@@ -127,7 +133,11 @@ VERB_ARITY = {
     '干支纪年': 1,     # 年 -> 干支
     '生肖': 1,         # 年 -> 生肖
     '农历完整日期': 3, # (年, 月, 日) -> 完整农历字符串
+    # 面向对象反射（M9-4）
+    '是否是': 2,       # (实例, 类名) -> True/False，沿继承链判定
+    '类名': 1,         # 实例 -> 所属类名字符串
 }
+
 
 ADVERBS = {'皆', '只', '归'}   # 高阶函数副词：map / filter / reduce
 

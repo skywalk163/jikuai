@@ -141,23 +141,18 @@ class TestSubsetGateNegative:
         self._check_rejected("导入 蟒:math。\n", "Python 互操作导入")
 
     def test_funcdef(self):
+        # T2a：顶层函数已进入子集，故负例改用**嵌套函数**（闭包），它仍被拒绝。
         self._check_rejected(
-            "函数 甲 接收 赵n：\n  返回 赵n。\n。\n", "函数定义")
-
-    def test_if(self):
-        self._check_rejected(
-            "定义 x = 5。\n如果 x 大于 1 那么：\n  打印 1。\n。\n", "条件分支")
-
-    def test_while(self):
-        self._check_rejected(
-            "定义 x = 5。\n当 x 小于 1：\n  打印 1。\n。\n", "当循环")
+            "函数 外 接收 赵x：\n  函数 内 接收 赵y：\n    返回 赵y。\n  。\n"
+            "  返回 内(赵x)。\n。\n", "嵌套函数定义")
 
     def test_for(self):
         self._check_rejected(
             "遍历 赵i 于 列 1 2：\n  打印 赵i。\n。\n", "遍历循环")
 
-    def test_repeat(self):
-        self._check_rejected("重复 3 次：\n  打印 1。\n。\n", "重复循环")
+    def test_return_outside_function(self):
+        # `返回` 仍不在子集内（AOT 尚不支持用户函数）
+        self._check_rejected("返回 1。\n", "返回")
 
     def test_try(self):
         self._check_rejected(

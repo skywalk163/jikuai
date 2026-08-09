@@ -1,0 +1,14 @@
+-- 极快 v0.12.0 块生态：工具.唯一码
+-- 原子块（层级 0）——生成 UUID v4 字符串。
+-- 依赖 蟒:uuid + 蟒:builtins（转 str），故 稳定性=experimental。
+--
+-- 导出名 `独码` 词法原子 ✓
+
+导入 蟒:uuid。
+导入 蟒:builtins。
+
+函数 独码：
+  返回 builtins.str(uuid.uuid4())。
+。
+
+导出 独码。

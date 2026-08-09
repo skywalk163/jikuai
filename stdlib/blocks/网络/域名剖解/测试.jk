@@ -1,0 +1,7 @@
+-- 块 `网络.域名剖解` 的单元测试。
+
+从 blocks.网络.域名剖解 导入 拆域。
+
+打印 拆域("api.example.com")。
+打印 拆域("www.baidu.com")。
+打印 拆域("localhost")。

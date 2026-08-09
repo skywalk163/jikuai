@@ -583,6 +583,14 @@ class Lexer:
                 self._read_number()
                 continue
 
+            # D-2：负号字面量 `-5` / `-3.14`。必须放在 PUNCTUATION 之后判定
+            # 是不可能的（`-` 不在 PUNCTUATION 里，此前一路落到"非法字符"），
+            # 所以在数字分支之后、标点分支之前拦一手。
+            if ch == '-' and self._minus_starts_number():
+                self._read_number()
+                continue
+
+
             # 标点符号（中文/ASCII）
             if ch in PUNCTUATION:
                 self.tokens.append(Token(
@@ -692,9 +700,15 @@ class Lexer:
         self.tokens.append(Token(TokenType.MONEY, value, self.line, start_col))
 
     def _read_number(self):
-        """读取数字字面量。"""
+        """读取数字字面量。支持前导负号（D-2）。"""
         start_col = self.col
         num_str = []
+        # D-2：前导负号。调用点已判定过语境（`_minus_starts_number`），
+        # 这里只负责把 `-` 并入字面量文本。
+        if self.pos < len(self.source) and self.source[self.pos] == '-':
+            num_str.append('-')
+            self.pos += 1
+            self.col += 1
         while self.pos < len(self.source) and (self.source[self.pos].isdigit() or self.source[self.pos] == '.'):
             num_str.append(self.source[self.pos])
             self.pos += 1
@@ -702,6 +716,41 @@ class Lexer:
         text = ''.join(num_str)
         value = float(text) if '.' in text else int(text)
         self.tokens.append(Token(TokenType.NUMBER, value, self.line, start_col))
+
+    def _minus_starts_number(self):
+        """D-2：判定当前位置的 `-` 是否引导一个负数字面量。
+
+        极快没有二元减法运算符（减法是动词 `减`/`减去`），因此 `-` 唯一
+        可能的语义就是负号。但为稳妥起见仍加语境判定：
+
+          1. `-` 后必须紧跟数字（否则不是数字字面量，交回"非法字符"路径）。
+          2. 前一个有效 token（跳过 NEWLINE）若是 NUMBER/IDENT/RPAREN，且
+             `-` 与它**紧贴无空白**（如 `x-5`、`)-5`），则不视为负号——留给
+             既有路径处理，避免把"标识符减常量"这类紧贴写法悄悄改义。
+             有空白时（如 `加 3 -5`）`-5` 作为独立负数参数，判为负号。
+
+        `3 减 5`（无 `-` 字符）、`列 负 5`（一元动词 `负`，无 `-` 字符）都不
+        经过本判定，天然不受影响。
+        """
+        nxt = self.source[self.pos + 1] if self.pos + 1 < len(self.source) else ''
+        if not nxt.isdigit():
+            return False
+        # 找前一个非 NEWLINE 的有效 token
+        prev = None
+        for tok in reversed(self.tokens):
+            if tok.type == TokenType.NEWLINE:
+                continue
+            prev = tok
+            break
+        if prev is not None and prev.type in (
+                TokenType.NUMBER, TokenType.IDENT, TokenType.RPAREN):
+            # 只有"紧贴无空白"才认为可能是二元语境，回避处理；
+            # 有空白分隔则明确是独立负数参数。
+            prev_char = self.source[self.pos - 1] if self.pos > 0 else ''
+            if prev_char not in ' \t\r\n':
+                return False
+        return True
+
 
     def _read_ascii_ident(self):
         """读取 ASCII 标识符。"""

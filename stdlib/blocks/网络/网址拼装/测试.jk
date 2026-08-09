@@ -1,0 +1,15 @@
+-- 块 `网络.网址拼装` 的单元测试。纯字符串拼接，不触网络。
+
+从 blocks.网络.网址拼装 导入 组址。
+
+-- 断言 1：有查询串 → 用 ? 连接。期望 https://api.test/v1/users?page=1
+打印 组址("https://api.test" "/v1/users" "page=1")。
+
+-- 断言 2：空查询串 → 不加问号。期望 https://api.test/v1/users
+打印 组址("https://api.test" "/v1/users" "")。
+
+-- 断言 3：多参查询串原样拼接。期望 http://h/p?a=1&b=2
+打印 组址("http://h" "/p" "a=1&b=2")。
+
+-- 断言 4：空路径也可用（仅基址+查询）。期望 http://h?x=1
+打印 组址("http://h" "" "x=1")。

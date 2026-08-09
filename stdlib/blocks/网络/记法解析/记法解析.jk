@@ -1,0 +1,21 @@
+-- 极快 v0.12.0 块生态：网络.记法解析
+-- 原子块（层级 0）——JSON 字符串 → 极快字典/列表/数/串/布尔/空。
+--
+-- 命名约束（ADR-15 §3.7）：`解构` 是原子 IDENT。
+-- 目录名 `记法解析` 也是原子 IDENT（避开了 `JSON` 前缀被 lexer 切碎的问题）。
+--
+-- 实现取舍：
+--   借 `蟒:json.loads`。pybridge 的 `py_to_jk` 会把 Python `dict/list/str/int/
+--   float/bool/None` 递归转成极快对应类型，因此调用方拿到的直接就是极快字典
+--   或列表，可 `.键` / `取值` / `遍历`。
+--
+-- 稳定性：`experimental`（依赖 pybridge）。`json.loads` 不发起网络。
+-- 错误：非法 JSON 会由桥翻译成 `Python 侧异常：JSONDecodeError：...` 抛出。
+
+导入 蟒:json。
+
+函数 解构 接收 赵串：
+  返回 json.loads(赵串)。
+。
+
+导出 解构。

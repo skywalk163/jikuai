@@ -442,11 +442,45 @@ class Parser:
                 return 'python', text[len(prefix):]
         return 'jk', text
 
+    def _read_module_name(self, message):
+        """读取一个模块名，支持点分路径（ADR-15 块生态）。
+
+        lexer 在 `.` 处切出独立的 DOT token，所以 `blocks.数据.读取文件`
+        到达 parser 时是 `IDENT DOT IDENT DOT IDENT`。这里把它们重新拼成
+        一个字符串交给 `module_loader.resolve()`，由后者做目录映射。
+
+        点分路径只是 **解析器行为**，不是新语法：`导入` 关键字、`.` token、
+        标识符规则全都沿用既有定义（ADR-15 §3.3）。
+
+        `蟒:os.path` 这类 Python 桥导入由 lexer 整体成词为单个 IDENT，
+        不会走到这里的 DOT 循环，语义不受影响（ADR-10）。
+
+        返回 `(首个 token, 完整模块名)`——首个 token 供报错定位使用。
+        """
+        # 模块名的每一段可以是任何"词形"token（IDENT/VERB/ADVERB/KEYWORD），
+        # 因为块名可能恰好与内建动词/关键字重名（如 `求和`→VERB，`排序`→VERB）。
+        # lexer 无法预知"导入"后面的上下文，parser 在此松弛接受条件。
+        _MOD_NAME_TYPES = (TokenType.IDENT, TokenType.VERB,
+                           TokenType.ADVERB, TokenType.KEYWORD)
+        cur = self._cur()
+        if cur.type not in _MOD_NAME_TYPES:
+            raise ParseError(message, cur)
+        first = self._advance()
+        parts = [first.value]
+        while self._cur().type == TokenType.DOT:
+            self._advance()                      # 消费 `.`
+            seg = self._cur()
+            if seg.type not in _MOD_NAME_TYPES:
+                raise ParseError("点分模块名后期望路径片段", seg)
+            self._advance()
+            parts.append(seg.value)
+        return first, '.'.join(parts)
+
     def _parse_import(self):
         tok = self._cur()
         self._advance()  # 消费 "导入"
-        mod_tok = self._expect_type(TokenType.IDENT, "导入后期望模块名")
-        kind, module = self._split_python_prefix(mod_tok.value)
+        mod_tok, raw_module = self._read_module_name("导入后期望模块名")
+        kind, module = self._split_python_prefix(raw_module)
         if kind == 'python' and not module:
             raise ParseError("「蟒:」后期望 Python 模块名", mod_tok)
         alias = None
@@ -466,8 +500,8 @@ class Parser:
         """解析 从 模块 导入 名字1 名字2。"""
         tok = self._cur()
         self._advance()  # 消费 "从"
-        mod_tok = self._expect_type(TokenType.IDENT, "从后期望模块名")
-        kind, module = self._split_python_prefix(mod_tok.value)
+        mod_tok, raw_module = self._read_module_name("从后期望模块名")
+        kind, module = self._split_python_prefix(raw_module)
         if kind == 'python':
             # ADR-10：`从 蟒:X 导入 名字` 未纳入本期契约（名字级导入会绕开
             # PyModule 拒绝清单检查点）。显式拒绝，不静默降级。

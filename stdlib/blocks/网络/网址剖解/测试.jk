@@ -1,0 +1,15 @@
+-- 块 `网络.网址剖解` 的单元测试。urllib.parse 是纯字符串处理，不发网络。
+
+从 blocks.网络.网址剖解 导入 剖址。
+
+-- 断言 1：完整 URL。期望 ['https', 'api.test', '/v1/users', 'page=1']
+打印 剖址("https://api.test/v1/users?page=1")。
+
+-- 断言 2：含端口的 host 原样保留。期望 ['http', 'h:8080', '/', '']
+打印 剖址("http://h:8080/")。
+
+-- 断言 3：无路径、无查询。期望 ['https', 'example.com', '', '']
+打印 剖址("https://example.com")。
+
+-- 断言 4：多参数查询串。期望 ['https', 'a.b', '/p', 'x=1&y=2']
+打印 剖址("https://a.b/p?x=1&y=2")。

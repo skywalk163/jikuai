@@ -1,0 +1,23 @@
+-- 块 `网络.请求组装` 的单元测试。
+-- **只验证参数拼装与 URL 构造，绝不发起任何网络请求**（CI 无网络，
+-- 且发外部请求违反最小权限原则）。
+
+从 blocks.网络.请求组装 导入 备请。
+
+-- 断言 1：URL 与 header 一并产出。
+-- 期望 ['https://api.test/v1/x?a=1', ['Accept: */*']]
+打印 备请("https://api.test" "/v1/x" {"a": 1} {"Accept": "*/*"})。
+
+-- 断言 2：只取 URL 分量（多查询参数按键序）。
+-- 期望 https://api.test/v1/x?limit=10&offset=0
+打印 取值 备请("https://api.test" "/v1/x" {"offset": 0, "limit": 10} {}) 0。
+
+-- 断言 3：只取 header 行列表分量（多 header 按键序）。
+-- 期望 ['Accept: application/json', 'X-Token: t1']
+打印 取值 备请("http://h" "/p" {} {"X-Token": "t1", "Accept": "application/json"}) 1。
+
+-- 断言 4：空查询字典 ⇒ URL 不带问号。期望 http://h/p
+打印 取值 备请("http://h" "/p" {} {}) 0。
+
+-- 断言 5：查询值需要百分号编码时正确转义。期望 http://h/p?q=x%20y
+打印 取值 备请("http://h" "/p" {"q": "x y"} {}) 0。

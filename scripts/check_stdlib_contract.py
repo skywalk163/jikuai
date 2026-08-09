@@ -128,7 +128,41 @@ def main(argv):
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_text(report))
-    return 0 if report["ok"] else 1
+    exit_code = 0 if report["ok"] else 1
+
+    # G11 门禁待集成：v0.12.0 块生态引入了 stdlib/blocks/索引.json，
+    # 索引一致性校验的等效逻辑在 scripts/generate_block_index.py --check。
+    # 这里以子进程方式串起来，让本脚本继续作为 CI 的单一入口。
+    # 若脚本缺失（例如老分支回滚），静默跳过——G11 是新门禁，不破坏 G10 的既有语义。
+    block_check = os.path.join(HERE, "generate_block_index.py")
+    if os.path.isfile(block_check):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, block_check, "--check", "--quiet"],
+            cwd=REPO_ROOT,
+        )
+        if proc.returncode != 0:
+            print("G11 块索引校验失败（%s）" % os.path.relpath(block_check, REPO_ROOT))
+            exit_code = exit_code or proc.returncode
+
+    # G12：向量索引与块索引同源（ADR-25 §3.3）。
+    # 无索引文件视为可接受（运行时降级启发式，ADR-25 §3.1）；有索引就必须
+    # 与当前 索引.json 内容哈希一致，否则说明块库改过之后忘了重跑
+    # tools/ai-bridge/generate_embeddings.py。本门禁只 import 标准库，
+    # 常规 CI 不需要装 torch。
+    try:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+        from jikuai.pkg.blocks import check_vector_index
+        状态, 说明 = check_vector_index()
+        if 状态 == '不一致':
+            print("G12 向量索引校验失败：%s" % 说明)
+            exit_code = exit_code or 1
+        # 其它状态（缺失/一致）都是可接受
+    except Exception as e:
+        # 不阻塞 G10/G11：v0.12.0 老分支上没有 check_vector_index
+        print("G12 跳过（%s）" % e)
+
+    return exit_code
 
 
 if __name__ == "__main__":

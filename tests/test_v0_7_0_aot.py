@@ -318,24 +318,34 @@ class TestIsolation:
 
     def test_main_package_does_not_import_aot(self):
         import importlib
-        # 先清理可能已加载的 AOT 模块
-        to_del = [k for k in sys.modules if "jikuai_aot" in k]
-        saved = {}
-        for k in to_del:
-            saved[k] = sys.modules.pop(k)
 
-        # 强制重新导入 jikuai
-        for k in list(sys.modules):
-            if k.startswith("jikuai") and "aot" not in k:
+        # D-6：先给**全部** `jikuai*` 模块拍完整快照。
+        # 旧实现只保存了 `jikuai_aot*`，`jikuai.*` 主包模块被 del 后靠
+        # `import jikuai` 重新加载，于是本测试之后运行的用例会拿到**新的**
+        # 类对象（Evaluator / JiKuaiError 等），与测试模块导入期缓存的旧类
+        # 身份分裂，`isinstance` / `pytest.raises` 随机失效。
+        saved = {k: v for k, v in sys.modules.items() if k.startswith('jikuai')}
+        try:
+            # 先清理可能已加载的 AOT 模块
+            for k in [k for k in sys.modules if "jikuai_aot" in k]:
                 del sys.modules[k]
-        import jikuai
-        importlib.reload(jikuai)
 
-        aot_in_modules = [m for m in sys.modules if "jikuai_aot" in m]
-        assert aot_in_modules == [], "主包意外导入了 jikuai_aot：{}".format(aot_in_modules)
+            # 强制重新导入 jikuai
+            for k in list(sys.modules):
+                if k.startswith("jikuai") and "aot" not in k:
+                    del sys.modules[k]
+            import jikuai
+            importlib.reload(jikuai)
 
-        # 恢复
-        sys.modules.update(saved)
+            aot_in_modules = [m for m in sys.modules if "jikuai_aot" in m]
+            assert aot_in_modules == [], "主包意外导入了 jikuai_aot：{}".format(aot_in_modules)
+        finally:
+            # 恢复到删除前的完整状态：先清掉本次重新加载产生的条目，
+            # 再整体灌回快照，保证类身份与测试开始前一致。
+            for k in list(sys.modules):
+                if k.startswith('jikuai'):
+                    del sys.modules[k]
+            sys.modules.update(saved)
 
 
 # ===========================================================================

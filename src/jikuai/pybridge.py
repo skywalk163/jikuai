@@ -102,6 +102,23 @@ def _denied_error(module_name, attr):
         category=ErrorCategory.RUNTIME, message=msg, line=0, col=0))
 
 
+#: 反射函数集合——形如 `f(obj, "属性名", ...)`，其中「属性名」由运行期
+#: 字符串给出，从而绕开 `evaluator._member_lookup` 的语法层 dunder 闸。
+#: 集合内的函数被 `PyCallable._guard_dunder_reflection` 特殊对待：任一
+#: 实参是 dunder 形态字符串（`__xxx__`）时一律拒绝调用。
+_REFLECTION_FNS = frozenset({'getattr', 'setattr', 'delattr', 'hasattr'})
+
+
+def _dunder_reflection_error(qualname, attr_name):
+    from .errors import ErrorCategory, ErrorInfo
+    from .evaluator import JiKuaiError
+    msg = (f"安全限制：{qualname} 不允许对 dunder 属性 `{attr_name}` "
+           f"做反射操作（`evaluator._member_lookup` 已在语法层拦下 "
+           f"`对象.__xxx__` 写法，反射入口一并封堵字符串旁路）。")
+    return JiKuaiError(f"运行错误：{msg}", info=ErrorInfo(
+        category=ErrorCategory.RUNTIME, message=msg, line=0, col=0))
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 路径脱敏（AC-101：不泄漏堆栈绝对路径）
 # ═══════════════════════════════════════════════════════════════════════
@@ -237,12 +254,33 @@ class PyCallable:
 
     def __call__(self, *jk_args):
         """类型映射（入参）→ 调用 → 异常翻译 → 类型映射（返回值）。"""
+        self._guard_dunder_reflection(jk_args)
         py_args = [jk_to_py(a) for a in jk_args]
         try:
             result = self._fn(*py_args)
         except BaseException as exc:            # noqa: BLE001 —— 必须全捕获后翻译
             raise translate_exception(exc) from None
         return py_to_jk(result)
+
+    def _guard_dunder_reflection(self, jk_args):
+        """反射函数的 dunder 字符串实参一律拒绝。
+
+        `evaluator._member_lookup` 已在**语法层**拦下 `对象.__class__` 这类
+        写法，但 `builtins.getattr(对象 "__class__")` 把属性名藏在**运行期
+        字符串**里，绕过了那道闸。本方法补上这一路：对 `getattr` / `setattr`
+        / `delattr` / `hasattr` 这几个反射入口，若任一实参是 dunder 形态的
+        字符串，直接抛诊断。
+
+        非反射函数不受影响——普通函数收到 `"__x__"` 字符串只是普通数据，
+        没有「按名取属性」的语义，拦它属于误伤。
+        """
+        if self._qualname.rsplit('.', 1)[-1] not in _REFLECTION_FNS:
+            return
+        for a in jk_args:
+            if (isinstance(a, str) and len(a) > 4
+                    and a.startswith('__') and a.endswith('__')):
+                raise _dunder_reflection_error(self._qualname, a)
+
 
     def __repr__(self):
         return f"<Python函数:{self._qualname}>"

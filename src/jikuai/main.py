@@ -99,6 +99,7 @@ def main():
         print("  jk              进入交互式 REPL")
         print("  jk <文件.jk>    执行文件")
         print("  jk 包 <子命令>  包管理（初始化/添加/装/列表/运行）")
+        print("  jk 块 <子命令>  块生态（列表/查找/选/详情/校验/索引）")
         print("  jk -h           显示帮助")
         print("  jk -v           显示版本")
     elif sys.argv[1] in ('-v', '--version', '版本'):
@@ -106,6 +107,9 @@ def main():
     elif sys.argv[1] in ('包', 'pkg', '包管理'):
         from .pkg.cli import run as pkg_run
         sys.exit(pkg_run(sys.argv[2:]))
+    elif sys.argv[1] in ('块', 'blocks', 'block'):
+        from .pkg import blocks_cli
+        sys.exit(blocks_cli.run(sys.argv[2:]))
     else:
         run_file(sys.argv[1])
 

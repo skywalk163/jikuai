@@ -177,15 +177,77 @@ class ModuleLoader:
                 return None
             here = parent
 
+    @staticmethod
+    def _dotpath_to_parts(module_name):
+        """将点分模块名拆为路径片段列表。
+
+        仅当模块名含 `.` 时才视为点分路径；否则返回 None 表示扁平模块名。
+        """
+        if '.' not in module_name:
+            return None
+        return module_name.split('.')
+
+    def _resolve_dotpath(self, parts, current_file):
+        """按三级优先级解析点分路径模块。
+
+        优先级（每个搜索路径下依次尝试）：
+        1. <dir>/a/b/c.jk          —— 扁平文件
+        2. <dir>/a/b/c/c.jk        —— 同名主文件的目录形式
+        3. <dir>/a/b/c/main.jk     —— 约定入口（兜底）
+        """
+        rel_dir = os.path.join(*parts[:-1]) if len(parts) > 1 else ''
+        leaf = parts[-1]
+        for d in self._search_paths(current_file):
+            base = os.path.join(d, rel_dir) if rel_dir else d
+            # 策略 1：扁平文件
+            candidate = os.path.join(base, leaf + '.jk')
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+            # 策略 2：同名主文件（目录形式）
+            candidate = os.path.join(base, leaf, leaf + '.jk')
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+            # 策略 3：main.jk 兜底
+            candidate = os.path.join(base, leaf, 'main.jk')
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def try_resolve(self, module_name, current_file=None):
+        """`resolve()` 的静默变体：找不到 / 非法名字返回 None，不抛错。
+
+        供 v0.13.0 W1「导入声明反哺 lexer 白名单」在 Pass1 之后的静态
+        扫描使用——一个坏的 `导入` 不能让整次分词 fatal，运行时的
+        `evaluator._eval_Import` 仍会调用 `resolve()` 精确报错。
+        """
+        try:
+            return self.resolve(module_name, current_file)
+        except Exception:
+            return None
+
     def resolve(self, module_name, current_file=None):
-        """将模块名解析为绝对路径。找不到则抛错。"""
+        """将模块名解析为绝对路径。找不到则抛错。
+
+        支持两种形式：
+        - 扁平模块名（不含 `.`）：沿用既有逻辑
+        - 点分路径（如 `blocks.数据.读取文件`）：按 ADR-15 块生态规则解析
+        """
         from .evaluator import JiKuaiError
         from .diagnostics import codes
-        # 安全检查：拒绝路径分隔符和 ..
+        # 安全检查：拒绝路径分隔符和 ..（双点）以及以 . 开头的模块名
         if ('/' in module_name or '\\' in module_name
                 or '..' in module_name or module_name.startswith('.')):
             raise JiKuaiError(f"非法模块名（含路径分隔符或 ..）：{module_name}")
 
+        # 点分路径解析（ADR-15 块生态）
+        parts = self._dotpath_to_parts(module_name)
+        if parts is not None:
+            result = self._resolve_dotpath(parts, current_file)
+            if result:
+                return result
+            raise JiKuaiError(f"[{codes.JK_E5001}] 找不到模块：{module_name}")
+
+        # 扁平模块名：既有逻辑不变
         for d in self._search_paths(current_file):
             path = os.path.join(d, module_name + '.jk')
             if os.path.isfile(path):
@@ -233,8 +295,8 @@ class ModuleLoader:
     def load(self, module_name, current_file=None):
         """加载模块并返回 ModuleValue。"""
         from .evaluator import JiKuaiError, Environment
-        from .lexer import tokenize
-        from .parser import parse
+        from .frontend import parse_with_import_whitelist
+
 
         path = self.resolve(module_name, current_file)
 
@@ -249,8 +311,9 @@ class ModuleLoader:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 source = f.read()
-            tokens = tokenize(source)
-            ast = parse(tokens)
+            # v0.13.0 W1：模块体也可能 `导入` 别的块（L2 聚合 L1），同样反哺
+            # 白名单以免把被依赖块的导出名切碎。
+            tokens, ast = parse_with_import_whitelist(source, file=path)
             # 模块级独立环境（无父级：不继承调用方的用户名字）
             module_env = Environment()
             module_exports = set()

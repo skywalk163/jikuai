@@ -13,6 +13,14 @@
 #      本地开发机（Windows）通常无 gcc，故这 9 条会 skip；ubuntu-latest
 #      预装 gcc，我们再显式安装以兜底，令这 9 条从 skip 转为 run。
 #
+#   3. **契约门禁 G10 + G11 + G12**：`scripts/check_stdlib_contract.py` 退出码必须为 0。
+#      G10 = stdlib 导出 vs docs/标准库.md 声明一致；
+#      G11 = stdlib/blocks/索引.json 与 stdlib/blocks/ 扫描结果一致（该脚本
+#      末尾以子进程调用 `generate_block_index.py --check --quiet` 承载）；
+#      G12 = stdlib/blocks/向量索引.元信息.json 的块哈希与 索引.json 同源
+#      （`blocks.check_vector_index()`，纯标准库，不需要装 torch；向量索引
+#      不存在时视为可接受——运行时会降级启发式，见 ADR-25 §3.1）。
+#
 # GitCode 兼容性说明：
 #   本仓库同时托管在 GitHub 与 GitCode（gitcode.com/skywalk163/jikuai）。
 #   GitCode 的流水线不消费本 .github/workflows/ci.yml，需要在 GitCode 控制台
@@ -21,6 +29,7 @@
 #       - python -m pip install -e .[dev]
 #       - gcc --version   # 确认编译器在位
 #       - python -m pytest -v
+#       - python scripts/check_stdlib_contract.py   # G10 + G11
 #   命令与下方 Linux job 完全一致，仅 YAML 结构因平台而异。
 
 name: CI
@@ -68,6 +77,13 @@ jobs:
 
       - name: Run full test suite
         run: python -m pytest -v
+
+      # G10 stdlib 契约一致性 + G11 块索引一致性。
+      # 说明：G11 由 check_stdlib_contract.py 内部承载——该脚本末尾以子进程
+      # 调用 `generate_block_index.py --check --quiet`，索引过期时整体退出码
+      # 非 0。故此处**不**单独追加 `generate_block_index.py --check` 步骤。
+      - name: Contract gates G10 (stdlib) + G11 (block index)
+        run: python scripts/check_stdlib_contract.py
 
       # 守卫：AOT 端到端二进制用例在有 gcc 的环境必须真正运行、零 skip。
       # 若这里出现 skip，说明编译器探测或环境有问题，直接让 CI 失败。

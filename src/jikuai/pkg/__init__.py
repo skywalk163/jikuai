@@ -38,6 +38,14 @@ from .registry import (
     registry_root, load_index, publish, lookup,
     list_packages, search, unpublish,
 )
+from .blocks import (
+    BLOCK_METADATA_NAME, BLOCK_INDEX_NAME, STABILITY_LEVELS,
+    BlockMetadata, BlockError,
+    load_block_metadata,
+    scan_blocks, generate_index,
+    check_export_atomicity, check_module_segment_atomicity,
+    extract_exports, validate_block,
+)
 
 __all__ = [
     # manifest
@@ -56,4 +64,11 @@ __all__ = [
     'RegistryError', 'PublishReport',
     'registry_root', 'load_index', 'publish', 'lookup',
     'list_packages', 'search', 'unpublish',
+    # blocks (v0.12.0 · ADR-15)
+    'BLOCK_METADATA_NAME', 'BLOCK_INDEX_NAME', 'STABILITY_LEVELS',
+    'BlockMetadata', 'BlockError',
+    'load_block_metadata',
+    'scan_blocks', 'generate_index',
+    'check_export_atomicity', 'check_module_segment_atomicity',
+    'extract_exports', 'validate_block',
 ]

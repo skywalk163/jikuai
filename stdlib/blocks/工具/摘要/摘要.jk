@@ -1,0 +1,23 @@
+-- 极快 v0.12.0 块生态：工具.摘要
+-- 原子块（层级 0）——字符串 SHA256 十六进制摘要。
+-- 依赖 蟒:hashlib + 蟒:builtins，故 稳定性=experimental。
+--
+-- 导出名 `指纹` 词法原子 ✓
+--
+-- 语言限制：极快对 Python 桥返回值不支持链式方法调用
+--   （`hashlib.sha256(x).hexdigest()` 在成员访问阶段就报「无法访问 hexdigest」）。
+-- 绕行：把中间对象绑到本地，用 `builtins.getattr(...)` 拿到 bound method
+-- 再括号调用。副作用：多一层字节包装 `builtins.bytes(...)`——极快字符串没有
+-- `.encode()`。
+
+导入 蟒:hashlib。
+导入 蟒:builtins。
+
+函数 指纹 接收 赵文本：
+  定义 赵字节 = builtins.bytes(赵文本, "utf-8")。
+  定义 赵器 = hashlib.sha256(赵字节)。
+  定义 赵法 = builtins.getattr(赵器, "hexdigest")。
+  返回 赵法()。
+。
+
+导出 指纹。

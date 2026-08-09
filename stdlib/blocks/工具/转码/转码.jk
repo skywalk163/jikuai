@@ -1,0 +1,15 @@
+-- 极快 v0.12.0 块生态：工具.转码
+-- 原子块（层级 0）——字符串 Base64 编码。
+-- 依赖 蟒:base64 + 蟒:builtins，故 稳定性=experimental。
+--
+-- 导出名 `密文` 词法原子 ✓
+
+导入 蟒:base64。
+导入 蟒:builtins。
+
+函数 密文 接收 赵文本：
+  定义 赵字节 = builtins.bytes(赵文本, "utf-8")。
+  返回 builtins.str(base64.b64encode(赵字节), "utf-8")。
+。
+
+导出 密文。

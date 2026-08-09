@@ -99,6 +99,9 @@ class BoundMethod:
 #: 所以这个键不可能与任何用户变量冲突，不需要额外的命名空间隔离机制。
 _DEFINING_CLASS_KEY = '__定义类__'
 
+#: D-3：`_member_lookup` 取属性的哨兵，区分「属性值恰好是 None」与「没有该属性」。
+_ATTR_MISSING = object()
+
 
 class SuperProxy:
     """M10-1：`父类` 的运行时代理。
@@ -461,6 +464,10 @@ class Evaluator:
             '反转': lambda a: list(reversed(a)) if isinstance(a, list) else a[::-1],
             '排序': lambda a: sorted(a),
             '去重': lambda a: list(dict.fromkeys(a)),
+            # 字典（D-4）
+            '值集': lambda d: list(d.values()),
+            '对集': lambda d: [[k, v] for k, v in d.items()],
+            '合并': lambda d1, d2: {**d1, **d2},
             '取值': lambda a, b: a[int(b)] if isinstance(a, list) else a.get(b),
             '范围': lambda *args: list(range(*[int(x) for x in args])),
             # 聚合
@@ -482,6 +489,11 @@ class Evaluator:
             # I/O
             '打印': self._builtin_print,
             '输入': self._builtin_input,
+            # D-1：`读取`/`写入` 早已在 VERB_ARITY 声明，但一直没有实现，
+            # 运行期报「未知动词」。这里补齐；用 with 保证句柄及时关闭
+            # （lambda 里裸 open 会留下未关闭的文件对象 + ResourceWarning）。
+            '读取': self._builtin_read_file,
+            '写入': self._builtin_write_file,
             # 中国特色
             '人民币': lambda a: RMB(a),
             '大写金额': lambda a: _rmb_to_chinese_upper(a.amount if isinstance(a, RMB) else a),
@@ -552,6 +564,27 @@ class Evaluator:
     def _builtin_input(self, *args):
         prompt = args[0] if args else ''
         return input(str(prompt))
+
+    def _builtin_read_file(self, path):
+        """`读取 路径` —— 以 UTF-8 整体读入文本文件，返回字符串。
+
+        编码固定 UTF-8：极快源码本身要求 UTF-8，读文本时再让用户操心编码
+        参数只会引入一个几乎永远填 'utf-8' 的第三个位置参数。
+        """
+        with open(str(path), 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def _builtin_write_file(self, path, content):
+        """`写入 路径 内容` —— 以 UTF-8 覆盖写入，**返回写入的内容**。
+
+        返回内容而不是字节数，是为了让 `写入` 能出现在管道中间：
+        `拼接 "a" "b"，写入 "out.txt"，长度` 这类链式写法才成立。
+        """
+        text = content if isinstance(content, str) else self._format_value(content)
+        with open(str(path), 'w', encoding='utf-8') as f:
+            f.write(text)
+        return content
+
 
     def _format_value(self, v):
         if v is None:
@@ -820,7 +853,16 @@ class Evaluator:
                     env.set(name, value)
             return None
         # 导入 模块 [作为 别名]；别名导入后原名不可用
-        env.set(node.alias or node.module, module)
+        # ADR-15：点分路径模块（如 `blocks.数据.求和`）默认绑定到**叶段名**
+        # （`求和`）——含点的名字在极快语法中无法用作合法标识符，绑定完整
+        # 点分名等同于把模块塞进无法引用的槽位。用户可用 `作为 别名` 覆盖。
+        if node.alias:
+            bind_name = node.alias
+        elif '.' in node.module:
+            bind_name = node.module.rsplit('.', 1)[-1]
+        else:
+            bind_name = node.module
+        env.set(bind_name, module)
         return None
 
     def _eval_Export(self, node, env):
@@ -1030,7 +1072,19 @@ class Evaluator:
         auto_invoke=True（裸 `obj.成员`）：0 参方法「访问即调用」（M-01，兼容 oop.jk）。
         auto_invoke=False（`obj.成员(...)` 调用点）：0 参方法也返回 BoundMethod，
         由 `_eval_FuncCall` 统一带参调用，从而让 `赵狗.叫声()` 等价 `赵狗.叫声`（M-04）。
+
+        安全前置：dunder 属性（`__xxx__`）在**所有分支之前**一律拒绝。
+        ADR-21 的拒绝清单是**模块级**的（`os.system` 等），拦不住
+        `builtins.__dict__["eval"]` / `对象.__class__.__bases__` 这类沿 dunder
+        链的逃逸。极快原生对象（ModuleValue 导出名、JiKuaiInstance 成员）都是
+        中文名，永不以 `__` 开头，所以这道闸对极快语义零影响。
         """
+        if node.attr.startswith('__') and node.attr.endswith('__'):
+            raise JiKuaiError(
+                f"安全限制：不允许访问 dunder 属性 `{node.attr}`。"
+                f"双下划线包裹的属性属于 Python 内部实现，"
+                f"经它们可绕过 ADR-21 的模块级拒绝清单")
+
         # M2-1: 模块成员访问（只暴露导出名）
         from .module_loader import ModuleValue
         if isinstance(obj, ModuleValue):
@@ -1087,7 +1141,16 @@ class Evaluator:
             raise JiKuaiError(f"对象 {obj.klass.name} 无属性/方法：{attr}")
         if isinstance(obj, dict):
             return obj.get(node.attr)
-        raise JiKuaiError(f"无法访问 {node.attr}")
+        # D-3 · ADR-21 边界：对普通 Python 对象允许属性访问，返回后由调用方
+        # 决定是否加括号调用；`_member_lookup` 只做取值，不代替调用点判定安全。
+        # 拒绝清单只在 `蟒:模块` 导入/成员访问入口生效（PyModule.member），
+        # 那里针对模块级危险 API；不属于模块直接暴露的属性（如 `sha256(x)`
+        # 返回的 hashlib 对象上的 `hexdigest`）本来就不在清单覆盖范围。
+        _MISSING = _ATTR_MISSING
+        attr_val = getattr(obj, node.attr, _MISSING)
+        if attr_val is _MISSING:
+            raise JiKuaiError(f"对象没有属性 {node.attr}")
+        return attr_val
 
     def _invoke_method(self, instance, method_def, args, env, defining_class=None):
         """以 instance 为 `自身` 执行方法体，返回 `返回` 的值（无则 None）。

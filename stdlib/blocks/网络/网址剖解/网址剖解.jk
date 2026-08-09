@@ -1,0 +1,32 @@
+-- 极快 v0.12.0 块生态：网络.网址剖解
+-- 原子块（层级 0）——把 URL 拆成 [协议, 主机, 路径, 查询串]。
+--
+-- 命名约束（ADR-15 §3.7）：`剖址` 是原子 IDENT。
+-- 未取 `拆址`（原子但语气偏破坏性）；`解析` 含 `析` 无碍但读起来像动作。
+--
+-- 实现取舍：
+--   借 `蟒:urllib.parse.urlsplit`，它对含端口、片段、path/query/fragment 的
+--   RFC 3986 URL 都能正确拆分（若自己写会漏掉大量 corner case）。
+--
+--   pybridge 会把 Python 的 `SplitResult`（namedtuple，是 tuple 子类）转成
+--   极快列表（`pybridge.py_to_jk` 走 `list/tuple → 列表` 分支）：
+--     ['scheme', 'netloc', 'path', 'query', 'fragment']
+--   所以后续用 `取值 赵剖 0..3` 按下标取；不能写 `赵剖.scheme`——那是 Python
+--   对象属性访问，成员查找当前不透传给 opaque tuple。
+--
+-- 稳定性：`experimental`（依赖 pybridge）。`urllib.parse` 不发起网络连接，
+-- 只做字符串处理，本地测试可安全跑通。
+
+导入 蟒:urllib.parse。
+
+函数 剖址 接收 赵网址：
+  定义赵剖=urllib.parse.urlsplit(赵网址)。
+  -- 返回列表已由 py_to_jk 完成；截取前四段（丢弃 fragment）
+  定义赵协议=取值 赵剖 0。
+  定义赵主机=取值 赵剖 1。
+  定义赵路径=取值 赵剖 2。
+  定义赵查询=取值 赵剖 3。
+  返回 列 赵协议 赵主机 赵路径 赵查询。
+。
+
+导出 剖址。

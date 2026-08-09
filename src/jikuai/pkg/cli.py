@@ -29,6 +29,7 @@ from .installer import (
     PACKAGES_DIR, InstallError, install, uninstall, installed_packages,
 )
 from .resolver import ResolveError
+from . import registry
 from . import semver
 
 __all__ = ['main', 'run']
@@ -43,9 +44,17 @@ _USAGE = f"""极快包管理 用法：
   jk 包 装 [--含开发]          按清单安装全部依赖
   jk 包 列表                   列出已安装的包
   jk 包 运行 <脚本名>          执行清单「脚本」里的命令
+  jk 包 发布 [--确认] [--分类 X] [--允许覆盖]
+                               发布当前包到本地注册表。
+                               **默认演练**（只体检不落盘），加 --确认 才真发布
+  jk 包 搜索 [关键词]          搜索本地注册表里的包
+  jk 包 注册表                 显示注册表根目录与统计
   jk 包 帮助                   显示本帮助
 
-英文别名：init / add / remove(rm) / install(i) / list(ls) / run / help
+英文别名：init / add / remove(rm) / install(i) / list(ls) / run /
+          publish / search / registry / help
+
+注册表根目录解析顺序：环境变量 JIKUAI_REGISTRY → ~/.jikuai/注册表
 """
 
 #: 中文命令 -> 规范命令名；英文别名一并归一。
@@ -56,6 +65,9 @@ _ALIASES = {
     '装': 'install', '安装': 'install', 'install': 'install', 'i': 'install',
     '列表': 'list', 'list': 'list', 'ls': 'list',
     '运行': 'run', 'run': 'run',
+    '发布': 'publish', 'publish': 'publish',
+    '搜索': 'search', 'search': 'search',
+    '注册表': 'registry', 'registry': 'registry',
     '帮助': 'help', 'help': 'help', '-h': 'help', '--help': 'help',
 }
 
@@ -258,6 +270,69 @@ def _cmd_run(args: List[str]) -> int:
     return completed.returncode
 
 
+def _cmd_publish(args: List[str]) -> int:
+    confirm = ('--确认' in args or '--confirm' in args)
+    allow_overwrite = ('--允许覆盖' in args or '--overwrite' in args)
+    category = None
+    i = 0
+    while i < len(args):
+        if args[i] in ('--分类', '--category'):
+            i += 1
+            if i >= len(args):
+                return _err('--分类 后面需要跟一个分类名')
+            category = args[i]
+        i += 1
+    try:
+        manifest = load_manifest()
+        report = registry.publish(
+            manifest, category=category,
+            dry_run=not confirm, allow_overwrite=allow_overwrite)
+    except (ManifestError, registry.RegistryError) as e:
+        return _err(str(e))
+    for w in report.warnings:
+        print(f'  ⚠ {w}')
+    if report.dry_run:
+        print(f'[演练] {report.name}@{report.version}（分类：{report.category}）')
+        print(f'  文件数：{report.file_count}  校验和：{report.checksum[:12]}…')
+        print('  演练完成，未落盘。确认无误后加 --确认 正式发布。')
+    else:
+        verb = '已覆盖发布' if report.overwritten else '已发布'
+        print(f'{verb} {report.name}@{report.version}（分类：{report.category}）')
+        print(f'  文件数：{report.file_count}  校验和：{report.checksum[:12]}…')
+        print(f'  快照：{report.target}')
+    return 0
+
+
+def _cmd_search(args: List[str]) -> int:
+    keyword = args[0] if args else ''
+    try:
+        results = registry.search(keyword)
+    except registry.RegistryError as e:
+        return _err(str(e))
+    if not results:
+        where = f'包含 {keyword!r} 的' if keyword else ''
+        print(f'注册表里没有{where}包')
+        return 0
+    print(f'找到 {len(results)} 个包：')
+    for r in results:
+        desc = r['描述'] or '（无描述）'
+        print(f"  {r['名称']}@{r['最新版本']}  [{r['分类']}]  {desc}")
+    return 0
+
+
+def _cmd_registry(_args: List[str]) -> int:
+    try:
+        index = registry.load_index()
+    except registry.RegistryError as e:
+        return _err(str(e))
+    root = registry.registry_root()
+    stats = index.get('统计', {})
+    print(f'注册表根目录：{root}')
+    print(f"  总包数：{stats.get('总包数', 0)}")
+    print(f"  总版本数：{stats.get('总版本数', 0)}")
+    return 0
+
+
 def _print_install_report(report) -> None:
     for name, ver in report.installed:
         print(f'  + {name}@{ver}')
@@ -276,6 +351,9 @@ _DISPATCH = {
     'install': _cmd_install,
     'list': _cmd_list,
     'run': _cmd_run,
+    'publish': _cmd_publish,
+    'search': _cmd_search,
+    'registry': _cmd_registry,
 }
 
 

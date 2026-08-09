@@ -114,15 +114,15 @@ class TestGateAcceptsControlFlow:
         # 遍历需要可迭代对象运行时，仍在子集外
         passed, diags = _gate_ok('遍历 赵i 于 列 1 2：\n  打印 赵i。\n。\n')
         assert not passed
-        assert any('遍历循环' in d.message for d in diags)
+        assert any('范围' in d.message for d in diags)
 
     def test_describe_subset_no_longer_lists_control_flow(self):
         d = describe_subset()
         unsupported = set(d['unsupported_node_types'])
-        for node in ('If', 'While', 'Repeat', 'Break', 'Continue'):
+        for node in ('If', 'While', 'Repeat', 'Break', 'Continue', 'For'):
             assert node not in unsupported, f'{node} 应已移出不支持清单'
         # 仍不支持的（T2a 起 FuncDef 已进子集，闭包 Lambda 顶上来）
-        for node in ('For', 'Lambda', 'ClassDef', 'ListLit'):
+        for node in ('Lambda', 'ClassDef', 'ListLit'):
             assert node in unsupported
 
 

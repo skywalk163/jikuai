@@ -148,7 +148,7 @@ class TestSubsetGateNegative:
 
     def test_for(self):
         self._check_rejected(
-            "遍历 赵i 于 列 1 2：\n  打印 赵i。\n。\n", "遍历循环")
+            "遍历 赵i 于 列 1 2：\n  打印 赵i。\n。\n", "范围")
 
     def test_return_outside_function(self):
         # `返回` 仍不在子集内（AOT 尚不支持用户函数）

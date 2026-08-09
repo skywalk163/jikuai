@@ -33,6 +33,11 @@ from .installer import (
 )
 from .resolver import ResolveError, resolve
 from .sources import SourceError
+from .registry import (
+    RegistryError, PublishReport,
+    registry_root, load_index, publish, lookup,
+    list_packages, search, unpublish,
+)
 
 __all__ = [
     # manifest
@@ -47,4 +52,8 @@ __all__ = [
     'install', 'uninstall', 'installed_packages', 'packages_dir',
     # resolver / sources
     'ResolveError', 'resolve', 'SourceError',
+    # registry (M11-1)
+    'RegistryError', 'PublishReport',
+    'registry_root', 'load_index', 'publish', 'lookup',
+    'list_packages', 'search', 'unpublish',
 ]

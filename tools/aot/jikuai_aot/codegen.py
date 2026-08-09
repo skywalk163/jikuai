@@ -44,10 +44,12 @@ from jikuai.ast_nodes import (
     Call,
     Continue,
     Define,
+    For,
     FuncCall,
     FuncDef,
     Ident,
     If,
+    ListLit,
     MoneyLit,
     NilLit,
     Node,
@@ -59,7 +61,7 @@ from jikuai.ast_nodes import (
     While,
 )
 
-from .subset_gate import SUPPORTED_VERBS
+from .subset_gate import RANGE_ARITY, RANGE_VERB, SUPPORTED_VERBS
 
 
 class CodegenError(Exception):
@@ -580,6 +582,7 @@ class CCodegen:
         self._func_order: List[_FuncInfo] = []   # 保持源码书写顺序
         self._main_body: List[Node] = []     # 顶层非函数定义语句
         self._scope = None                   # 当前函数作用域；None = main 体内
+        self._loop_vars: Dict[str, str] = {}  # T2b：遍历循环变量名 → C 标识符
         self._lines: List[str] = []
         self._indent = 1                     # 当前缩进层级（1 = 函数体内）
         self._loop_depth = 0                 # 循环嵌套深度（校验 跳出/跳过）
@@ -593,6 +596,7 @@ class CCodegen:
         self._func_order = []
         self._main_body = []
         self._scope = None
+        self._loop_vars = {}
         self._lines = []
         self._indent = 1
         self._loop_depth = 0
@@ -791,6 +795,10 @@ class CCodegen:
             self._emit_while(node)
             return
 
+        if isinstance(node, For):
+            self._emit_for(node)
+            return
+
         if isinstance(node, Repeat):
             self._emit_repeat(node)
             return
@@ -893,6 +901,136 @@ class CCodegen:
         self._indent -= 1
         self._line("}")
 
+    def _emit_for(self, node: For) -> None:
+        """T2b：`遍历 变量 于 范围(...)` / `遍历 变量 于 【字面量列表】` → C 循环。
+
+        子集门禁（`subset_gate._collect` 里的 For 分支）保证 `node.iterable` 只可能
+        是 `Call(verb="范围", args=[...])` 或 `ListLit(items=[...])`；其它形态在
+        gate 阶段已被 JK-E7001 挡下。这里直接按两种形态分发，遇到意外形态则兜底
+        抛 CodegenError（不静默产出错语义的代码）。
+
+        循环变量的作用域
+        ----------------
+        解释器每一轮都 `loop_env = Environment(env); loop_env.set(node.var, item)`，
+        循环变量**只在体内可见**，且与外层同名变量互不影响（写只落在子环境）。
+        AOT 侧用 `self._loop_vars` 覆盖表模拟「最内层优先」的名字解析：进入循环前
+        把 `变量名 → C 局部` 记进去（并保存旧值以支持同名嵌套），退出时恢复。
+        C 里对应地把循环变量声明在 for 块内，天然离开作用域。
+
+        范围（Range）
+        ------------
+        起 / 止 / 步 **在进入循环前只求值一次**（复刻 Python `range` 的语义）：
+        循环体里改动源表达式里的变量不会影响剩余轮数。步为 0 是运行期错误
+        （解释器里也是 `ValueError: range() arg 3 must not be zero`），
+        因此发射一条 `jk_fatal` 兜底；步为正用 `ix < end`，为负用 `ix > end`，
+        用一个三元表达式统一表达，避免展开成两份重复代码。
+
+        字面量列表（ListLit）
+        --------------------
+        列表元素在栈上组成 `JKValue arr[N]`，用下标遍历，**不落堆**。空列表零轮 —
+        C 不允许零长度数组初始化，故直接短路成一段注释。列表元素在进入循环前
+        求值一次并存进数组，与解释器同构。
+        """
+        loop_var_name = node.var
+        iterable = node.iterable
+
+        if isinstance(iterable, Call) and getattr(iterable, "verb", "") == RANGE_VERB:
+            args = list(iterable.args)
+            if len(args) not in RANGE_ARITY:
+                # 门禁应已拦下；这里兜底防止 AST 构造器绕过 gate。
+                raise CodegenError(
+                    "范围(...) 参数个数不合法（收到 {} 个，AOT 支持 1~3 个）"
+                    .format(len(args))
+                )
+            if len(args) == 1:
+                start_expr = "jk_int(0LL)"
+                end_expr = self._expr(args[0])
+                step_expr = "jk_int(1LL)"
+            elif len(args) == 2:
+                start_expr = self._expr(args[0])
+                end_expr = self._expr(args[1])
+                step_expr = "jk_int(1LL)"
+            else:  # 3
+                start_expr = self._expr(args[0])
+                end_expr = self._expr(args[1])
+                step_expr = self._expr(args[2])
+
+            start_tmp = self._next_tmp("jk_rs")
+            end_tmp = self._next_tmp("jk_re")
+            step_tmp = self._next_tmp("jk_rp")
+            idx_tmp = self._next_tmp("jk_ri")
+            loop_c = self._next_tmp("jk_lv")
+
+            self._line("{{ long long {} = jk_as_int({});".format(start_tmp, start_expr))
+            self._line("  long long {} = jk_as_int({});".format(end_tmp, end_expr))
+            self._line("  long long {} = jk_as_int({});".format(step_tmp, step_expr))
+            self._line('  if ({} == 0) jk_fatal("{}");'.format(
+                step_tmp, _c_escape("错误：范围的步长不能为零")))
+            self._indent += 1
+            self._line(
+                "for (long long {i} = {s}; "
+                "({p} > 0) ? ({i} < {e}) : ({i} > {e}); "
+                "{i} += {p}) {{".format(
+                    i=idx_tmp, s=start_tmp, e=end_tmp, p=step_tmp,
+                )
+            )
+            self._indent += 1
+            self._line("JKValue {} = jk_int({});   /* {} */".format(
+                loop_c, idx_tmp, loop_var_name))
+            self._indent -= 1
+            prev = self._loop_vars.pop(loop_var_name, None)
+            self._loop_vars[loop_var_name] = loop_c
+            self._loop_depth += 1
+            self._emit_block(node.body)
+            self._loop_depth -= 1
+            if prev is None:
+                self._loop_vars.pop(loop_var_name, None)
+            else:
+                self._loop_vars[loop_var_name] = prev
+            self._line("}")
+            self._indent -= 1
+            self._line("}")
+            return
+
+        if isinstance(iterable, ListLit):
+            items = list(iterable.items)
+            if not items:
+                self._line("/* 空列表遍历：零轮，无需生成循环 */")
+                return
+            arr_tmp = self._next_tmp("jk_farr")
+            idx_tmp = self._next_tmp("jk_fi")
+            loop_c = self._next_tmp("jk_lv")
+            args_c = ", ".join(self._expr(item) for item in items)
+            self._line("{{ JKValue {}[] = {{ {} }};".format(arr_tmp, args_c))
+            self._indent += 1
+            self._line(
+                "for (long long {i} = 0; {i} < {n}; {i}++) {{".format(
+                    i=idx_tmp, n=len(items),
+                )
+            )
+            self._indent += 1
+            self._line("JKValue {} = {}[{}];   /* {} */".format(
+                loop_c, arr_tmp, idx_tmp, loop_var_name))
+            self._indent -= 1
+            prev = self._loop_vars.pop(loop_var_name, None)
+            self._loop_vars[loop_var_name] = loop_c
+            self._loop_depth += 1
+            self._emit_block(node.body)
+            self._loop_depth -= 1
+            if prev is None:
+                self._loop_vars.pop(loop_var_name, None)
+            else:
+                self._loop_vars[loop_var_name] = prev
+            self._line("}")
+            self._indent -= 1
+            self._line("}")
+            return
+
+        raise CodegenError(
+            "AOT 只支持 `遍历 变量 于 范围(...)` 或 `遍历 变量 于 【字面量列表】`；"
+            "收到 iterable={}".format(type(iterable).__name__)
+        )
+
     def _emit_print(self, node: Call) -> None:
         """打印是变参：多参数用空格分隔，末尾换行（与解释器 print(*args) 一致）。"""
         if not node.args:
@@ -974,6 +1112,10 @@ class CCodegen:
 
     def _read_name(self, name: str) -> str:
         """读取一个名字对应的 C 表达式（右值）。"""
+        # T2b：遍历循环变量最内层优先 —— 与解释器 `loop_env = Environment(env);
+        # loop_env.set(node.var, item)` 的「子作用域先命中」语义一致。
+        if name in self._loop_vars:
+            return self._loop_vars[name]
         if self._scope is not None and name in self._scope:
             return self._scope[name]
         if name in self._globals:

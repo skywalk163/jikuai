@@ -694,7 +694,16 @@ class Parser:
         while not self._at_end():
             if self._cur().type == TokenType.DOT:
                 dot_tok = self._advance()
-                attr_tok = self._expect_type(TokenType.IDENT, "成员访问后期望属性名")
+                # ADR-补丁：`.` 之后允许 IDENT / VERB / KEYWORD 作为成员名。
+                # 中文动词/关键字若恰好被用作模块导出名（如 `正则.匹配`），不该被
+                # 语法分析卡住——把它们当作字面名字对待，与 Python `obj.class` 允许
+                # 保留字作为属性名的取舍一致。
+                cur = self._cur()
+                if cur.type in (TokenType.IDENT, TokenType.VERB,
+                                TokenType.KEYWORD, TokenType.ADVERB):
+                    attr_tok = self._advance()
+                else:
+                    attr_tok = self._expect_type(TokenType.IDENT, "成员访问后期望属性名")
                 node = self._loc(MemberAccess(obj=node, attr=attr_tok.value), dot_tok)
             elif self._cur().type == TokenType.LBRACKET:
                 bracket_tok = self._advance()

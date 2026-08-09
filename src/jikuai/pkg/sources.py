@@ -135,9 +135,26 @@ def _fetch_git(dep: Dependency, _base_dir: str) -> FetchedSource:
 
 
 def _fetch_registry(dep: Dependency, _base_dir: str) -> FetchedSource:
-    raise SourceError(
-        f'依赖 {dep.name} 声明了版本约束 {dep.constraint or "*"}，'
-        f'但极快中央注册表尚未上线；请暂时改用「路径」或「仓库」来源')
+    # M11-1：接本地/内网文件系统注册表（registry 模块）。中央 HTTP 注册中心
+    # 待接入 token 鉴权 + 包签名后再开；在那之前 registry.lookup 只认
+    # JIKUAI_REGISTRY / ~/.jikuai/注册表 下的本地索引，装不到就明确报错。
+    from . import registry
+    try:
+        version, snapshot = registry.lookup(dep.name, dep.constraint)
+    except registry.RegistryError as e:
+        raise SourceError(str(e)) from None
+    try:
+        manifest = load_manifest(snapshot)
+    except Exception as e:
+        raise SourceError(
+            f'注册表包 {dep.name}@{version} 的快照缺少可读的 包.json：{e}'
+        ) from None
+    if manifest.name != dep.name:
+        raise SourceError(
+            f'注册表包名不匹配：请求 {dep.name}，'
+            f'但快照清单「名称」是 {manifest.name}')
+    # 快照是注册表的只读副本，绝不能删（ephemeral=False）。
+    return FetchedSource(snapshot, manifest, '注册表', dep.name, ephemeral=False)
 
 
 _FETCHERS = {

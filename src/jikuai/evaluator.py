@@ -7,6 +7,7 @@
 import math
 import operator
 import os
+import re
 import dataclasses
 from decimal import Decimal, ROUND_HALF_UP
 from .ast_nodes import *
@@ -501,6 +502,16 @@ class Evaluator:
             # 面向对象反射（M9-4）
             '是否是': self._builtin_is_instance_of,
             '类名': self._builtin_class_name,
+            # 抽象类 / 接口（T6，命名约定）
+            '是否实现': self._builtin_implements_interface,
+            # 中文正则（T4-1）
+            '匹配': _regex_full_match,
+            '查找': _regex_find_all,
+            '替换正则': _regex_sub,
+            '中文字符': _extract_cjk,
+            # 成语 / 歇后语断言（T4-2）
+            '成语断言': _assert_idiom,
+            '歇后语断言': _assert_xiehouyu,
         }
 
     def _builtin_is_instance_of(self, obj, class_name):
@@ -1267,6 +1278,16 @@ class Evaluator:
         klass = self.classes.get(cls_name)
         if not klass:
             raise JiKuaiError(f"未定义的类：{cls_name}")
+        # T6：抽象类（抽开头）/ 接口（协开头）不可直接实例化 —— JK-E4002
+        if cls_name.startswith('抽') or cls_name.startswith('协'):
+            raise JiKuaiError(
+                f"不可实例化抽象类/接口：{cls_name}（JK-E4002）")
+        # T6：具体类若继承了抽象祖先，须实现全部抽象方法 —— JK-E4003
+        missing = self._collect_unimplemented(klass)
+        if missing:
+            methods_str = '、'.join(sorted(missing))
+            raise JiKuaiError(
+                f"类 {cls_name} 未实现抽象方法：{methods_str}（JK-E4003）")
         instance = JiKuaiInstance(klass)
         # ADR-02：用 _resolve_ctor 代替直接判 klass.ctor_body
         ctor_class = self._resolve_ctor(klass)
@@ -1281,6 +1302,92 @@ class Evaluator:
                 ctor_env.set(param, val)
             self._eval_body(ctor_class.ctor_body, ctor_env)
         return instance
+
+    # --------- T6：抽象类 / 接口辅助方法 ---------
+
+    def _is_abstract_method(self, method_def):
+        """判断一个方法是否为"抽象方法"（按 body 内容约定）。
+
+        抽象方法的 body 满足以下任一条件：
+        1. 空列表 []
+        2. 单条 NilLit（即 `空。`）
+        3. 单条 Throw 且消息包含 "未实现"
+        """
+        body = method_def.body
+        if not body:
+            return True
+        if len(body) == 1:
+            stmt = body[0]
+            if isinstance(stmt, NilLit):
+                return True
+            if isinstance(stmt, Throw):
+                # Throw.value 可能是 StringLit
+                if isinstance(stmt.value, StringLit) and '未实现' in stmt.value.value:
+                    return True
+        return False
+
+    def _collect_unimplemented(self, klass):
+        """沿继承链收集来自 抽/协 祖先的抽象方法，检查 klass 是否全部实现。
+
+        返回未实现方法名的集合。
+        """
+        abstract_methods = set()
+        # 向上遍历祖先链（不含 klass 自身，因为 klass 是具体类）
+        ancestor = klass.parent
+        while ancestor is not None:
+            if ancestor.name.startswith('协'):
+                # 接口：所有方法都是抽象的
+                abstract_methods.update(ancestor.methods.keys())
+            elif ancestor.name.startswith('抽'):
+                # 抽象类：只有抽象方法需要被实现
+                for name, mdef in ancestor.methods.items():
+                    if self._is_abstract_method(mdef):
+                        abstract_methods.add(name)
+            ancestor = ancestor.parent
+
+        # 现在检查 klass 及其非抽象祖先是否提供了实现
+        # 沿继承链查找（从 klass 开始向上），遇到非抽象实现即视为已实现
+        implemented = set()
+        k = klass
+        while k is not None:
+            for name, mdef in k.methods.items():
+                if name in abstract_methods and not self._is_abstract_method(mdef):
+                    implemented.add(name)
+            # 如果到了抽象/接口祖先，停止（不再向上找"实现"）
+            if k.parent and (k.parent.name.startswith('抽') or k.parent.name.startswith('协')):
+                # 但抽象祖先的具体方法也算实现
+                a = k.parent
+                while a is not None:
+                    if a.name.startswith('抽'):
+                        for name, mdef in a.methods.items():
+                            if name in abstract_methods and not self._is_abstract_method(mdef):
+                                implemented.add(name)
+                    a = a.parent
+                break
+            k = k.parent
+
+        return abstract_methods - implemented
+
+    def _builtin_implements_interface(self, obj, interface_name):
+        """`是否实现 实例 "协类名"` —— 结构类型（鸭子类型）判定。
+
+        检查实例所属类是否拥有接口类定义的全部方法名（不检查签名）。
+        非实例对象一律返回假。
+        """
+        if not isinstance(obj, JiKuaiInstance):
+            return False
+        target_name = str(interface_name)
+        iface_class = self.classes.get(target_name)
+        if iface_class is None:
+            return False
+        # 获取接口 / 抽象类定义的方法名
+        required_methods = set(iface_class.methods.keys())
+        # 沿实例的继承链检查是否所有方法名都存在
+        for method_name in required_methods:
+            found, _ = obj.find_method_with_owner(method_name, obj.klass)
+            if found is None:
+                return False
+        return True
 
     # ======================== 辅助 ========================
 
@@ -1354,3 +1461,70 @@ def _stdlib_call(module_name, func_name):
             return list(result)
         return result
     return wrapper
+
+
+# ---------------------------------------------------------------------------
+# 中文正则动词（T4-1）
+#   设计取舍：模式串直接沿用 Python 的 re 语法，不另造一套「中文正则」方言。
+#   正则的元字符（. * + [] 等）本身是国际通用记号，翻译成汉字只会抬高学习
+#   成本。极快的差异化落在三处：动词名是中文、报错信息是中文、以及
+#   `中文字符` 这类母语场景专用动词。
+# ---------------------------------------------------------------------------
+
+# 中日韩统一表意文字基本区：汉字提取与成语判定都以此为界
+_CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
+
+
+def _compile_pattern(pattern):
+    """编译正则模式，把 Python 的 re.error 翻译成中文运行时错误。"""
+    try:
+        return re.compile(str(pattern))
+    except re.error as e:
+        raise JiKuaiError(f"正则表达式不合法：{pattern}（{e.msg}）") from None
+
+
+def _regex_full_match(text, pattern):
+    """`匹配 文本 模式` —— 整串完全匹配则为真。"""
+    return _compile_pattern(pattern).fullmatch(str(text)) is not None
+
+
+def _regex_find_all(text, pattern):
+    """`查找 文本 模式` —— 返回所有匹配片段的列表。"""
+    return _compile_pattern(pattern).findall(str(text))
+
+
+def _regex_sub(text, pattern, replacement):
+    """`替换正则 文本 模式 替换` —— 按正则替换全部匹配。"""
+    compiled = _compile_pattern(pattern)
+    try:
+        return compiled.sub(str(replacement), str(text))
+    except re.error as e:
+        raise JiKuaiError(f"正则替换串不合法：{replacement}（{e.msg}）") from None
+
+
+def _extract_cjk(text):
+    """`中文字符 文本` —— 从混合文本中抽取所有汉字。"""
+    return _CJK_PATTERN.findall(str(text))
+
+
+# ---------------------------------------------------------------------------
+# 成语 / 歇后语断言动词（T4-2）
+# ---------------------------------------------------------------------------
+
+def _to_text(value):
+    """把任意值规整为字符串，nil 视为空串。"""
+    if value is None:
+        return ''
+    return value if isinstance(value, str) else str(value)
+
+
+def _assert_idiom(text):
+    """`成语断言 文本` —— 是否为内置词库中的四字成语。"""
+    from .chinese_idioms import is_idiom
+    return is_idiom(_to_text(text))
+
+
+def _assert_xiehouyu(first, second):
+    """`歇后语断言 前半 后半` —— 两半是否构成内置词库中的歇后语。"""
+    from .chinese_idioms import is_xiehouyu
+    return is_xiehouyu(_to_text(first), _to_text(second))

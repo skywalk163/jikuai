@@ -62,6 +62,8 @@ JK_E3001 = "JK-E3001"   # 动词元数不符
 # ---------------------------------------------------------------------------
 
 JK_E4001 = "JK-E4001"   # 类型不匹配
+JK_E4002 = "JK-E4002"   # 不可实例化抽象类 / 接口（T6，命名约定 抽/协 开头）
+JK_E4003 = "JK-E4003"   # 具体类未实现全部抽象方法（T6）
 
 # ---------------------------------------------------------------------------
 # 模块 / 导入（5xxx）
@@ -128,6 +130,10 @@ CODE_TABLE: Dict[str, CodeInfo] = {
                        "但收到 {actual} 个", "v0.5.0"),
     JK_E4001: CodeInfo(JK_E4001, SEVERITY_ERROR, ErrorCategory.TYPE,
                        "类型不匹配：{detail}", "v0.5.0"),
+    JK_E4002: CodeInfo(JK_E4002, SEVERITY_ERROR, ErrorCategory.TYPE,
+                       "不可实例化抽象类/接口：{cls}", "v0.10.0"),
+    JK_E4003: CodeInfo(JK_E4003, SEVERITY_ERROR, ErrorCategory.TYPE,
+                       "类 {cls} 未实现抽象方法：{methods}", "v0.10.0"),
     JK_E5001: CodeInfo(JK_E5001, SEVERITY_ERROR, ErrorCategory.RUNTIME,
                        "找不到模块：{module}", "v0.5.0"),
     JK_E5002: CodeInfo(JK_E5002, SEVERITY_ERROR, ErrorCategory.RUNTIME,

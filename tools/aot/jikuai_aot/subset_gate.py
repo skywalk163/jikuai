@@ -27,7 +27,8 @@ from __future__ import annotations
 from typing import Iterable, List, Optional, Tuple
 
 from jikuai.ast_nodes import (
-    AdverbCall, Assign, Call, FuncCall, FuncDef, Import, Node, Program, Return,
+    AdverbCall, Assign, Call, For, FuncCall, FuncDef, Import, ListLit, Node,
+    Program, Return,
 )
 from jikuai.diagnostics.codes import CODE_TABLE, JK_E7001
 from jikuai.diagnostics.model import Diagnostic, Position, Span
@@ -68,9 +69,14 @@ SUPPORTED_VERBS: frozenset = frozenset({
 #: 的函数在子集内 —— 嵌套函数定义与闭包仍命中 JK-E7001，判定见
 #: `_collect` 里的上下文规则，不是靠这个集合。
 #:
-#: 仍然不支持的都有明确的运行时依赖：`For`（遍历）要可迭代对象、
-#: `Lambda` 要环境捕获、`ListLit`/`Index` 要堆容器、类与异常要对象模型
-#: 与栈展开。
+#: T2b 把 **`For`（遍历）** 变成**上下文相关**：`遍历 变量 于 范围(...)` 与
+#: `遍历 变量 于 【字面量列表】` 现在可以编译成 C 的计数 for 循环 / 数组遍历；
+#: 但遍历任意可迭代对象（变量、函数返回值等）仍命中 JK-E7001，判定见
+#: `_collect` 里的上下文规则，不再靠这个集合。
+#:
+#: 仍然不支持的都有明确的运行时依赖：`Lambda` 要环境捕获、
+#: `ListLit`/`Index` 要堆容器（`For` 里的字面量列表是就地展开的特例，不落堆）、
+#: 类与异常要对象模型与栈展开。
 UNSUPPORTED_NODE_TYPES: frozenset = frozenset({
     # 类与继承
     "ClassDef", "NewInstance", "MemberAccess",
@@ -82,9 +88,7 @@ UNSUPPORTED_NODE_TYPES: frozenset = frozenset({
     "Import", "Export",
     # 闭包（需要环境捕获，代价比无捕获函数高一个量级）
     "Lambda",
-    # 遍历循环（需要可迭代对象运行时）
-    "For",
-    # 复合数据（第一版子集不含）
+    # 复合数据（第一版子集不含；`For` 里的字面量列表遍历是就地展开的特例）
     "ListLit", "DictLit", "Index",
 })
 
@@ -100,7 +104,6 @@ _NODE_FEATURE_NAMES = {
     "Import": "模块导入",
     "Export": "模块导出",
     "Lambda": "匿名函数",
-    "For": "遍历循环",
     "ListLit": "列表字面量",
     "DictLit": "字典字面量",
     "Index": "索引访问",
@@ -119,14 +122,34 @@ _NODE_FEATURE_NOTES = {
     "Export": "模块导出只在模块语境有意义，AOT 只编译单文件顶层程序。",
     "Lambda": "闭包需要环境捕获（逃逸分析或显式 env 结构体），AOT 后端未实现；"
               "请改用顶层 `函数` 定义。",
-    "For": "`遍历` 需要可迭代对象运行时；请改用 `当` 循环或 `重复 N 次`。",
     "ListLit": "列表需要堆分配与泛型容器运行时，AOT 后端未实现。",
     "DictLit": "字典需要哈希表运行时，AOT 后端未实现。",
     "Index": "索引访问依赖列表/字典运行时，AOT 后端未实现。",
 }
 
-#: **上下文相关**的不支持特性（T2a）。这些特性靠节点类型判不出来，必须结合
-#: 所处位置：同一个 `FuncDef` 写在顶层合法、写在函数体里就是闭包。
+# ---------------------------------------------------------------------------
+# T2b：`遍历`（For）的受支持形态
+# ---------------------------------------------------------------------------
+
+#: 范围动词名。它**不在** `SUPPORTED_VERBS` 里 —— 只有作为 `遍历 ... 于` 的
+#: 可迭代对象时才被特殊接受（由 codegen 降级成 C 的计数 for，不产生列表值）。
+#: 写成 `定义 赵表 = 范围(1, 10)` 仍然命中「内建动词 范围」：那需要真的列表。
+RANGE_VERB: str = "范围"
+
+#: `范围` 的合法参数个数，与 Python range 同构：止 / 起,止 / 起,止,步。
+RANGE_ARITY: frozenset = frozenset({1, 2, 3})
+
+#: 遍历不受支持形态的对外特性名。把可用写法直接写进消息，用户不必翻文档。
+FOR_ITERABLE_FEATURE: str = (
+    "AOT 仅支持 `遍历 变量 于 范围(...)` 或字面量列表遍历"
+)
+
+#: `范围` 参数个数不合法。
+FOR_RANGE_ARITY_FEATURE: str = "范围(...) 的参数个数（AOT 支持 1~3 个参数）"
+
+#: **上下文相关**的不支持特性（T2a / T2b）。这些特性靠节点类型判不出来，必须
+#: 结合所处位置或形态：同一个 `FuncDef` 写在顶层合法、写在函数体里就是闭包；
+#: 同一个 `For` 遍历 `范围(...)` 合法、遍历变量就要可迭代对象运行时。
 #:
 #: 键即诊断消息里出现的对外特性名，值为写进 notes 的说明。
 _CONTEXT_FEATURE_NOTES = {
@@ -138,6 +161,14 @@ _CONTEXT_FEATURE_NOTES = {
                         "「「返回」只能在函数或方法体内使用」。",
     "间接函数调用": "AOT 没有函数值/函数指针表：只支持 `名字(实参...)` 这种直接按名"
                     "调用顶层函数的形式。",
+    FOR_ITERABLE_FEATURE:
+        "遍历任意可迭代对象需要迭代器协议与堆容器运行时。范围遍历降级成 C 的"
+        "计数 for、字面量列表遍历降级成栈上数组 + 下标 for，两者都不落堆，"
+        "所以在子集内；遍历变量、函数返回值等则不在。",
+    FOR_RANGE_ARITY_FEATURE:
+        "`范围` 与 Python 的 range 同构：1 个参数是 `范围(止)`，2 个是 "
+        "`范围(起, 止)`，3 个是 `范围(起, 止, 步)`。0 个或超过 3 个参数"
+        "在解释器里也是错误。",
 }
 
 
@@ -330,6 +361,33 @@ def _collect(node: Node, in_function: bool = False,
     if isinstance(node, Return) and not in_function:
         feature = "函数外的「返回」"
         yield (feature, "返回", _CONTEXT_FEATURE_NOTES[feature], node)
+        return
+
+    if isinstance(node, For):
+        # T2b：只接受两种**静态可展开**的遍历源，其余一律拒绝。
+        # 必须在这里自己递归 —— 交给下面的通用下钻会误判：`范围` 不在动词白名单
+        # 里、`ListLit` 还在 UNSUPPORTED_NODE_TYPES 里，而它们作为遍历源是合法
+        # 特例（codegen 会就地展开成计数 for / 栈上数组），不能按普通表达式判。
+        iterable = node.iterable
+        children: List[Node] = []
+        if isinstance(iterable, Call) and getattr(iterable, "verb", "") == RANGE_VERB:
+            if len(iterable.args) not in RANGE_ARITY:
+                yield (FOR_RANGE_ARITY_FEATURE, RANGE_VERB,
+                       _CONTEXT_FEATURE_NOTES[FOR_RANGE_ARITY_FEATURE], iterable)
+                return
+            children = list(iterable.args)
+        elif isinstance(iterable, ListLit):
+            children = list(iterable.items)
+        else:
+            yield (FOR_ITERABLE_FEATURE, type(iterable).__name__,
+                   _CONTEXT_FEATURE_NOTES[FOR_ITERABLE_FEATURE], node)
+            return
+        # 起/止/步 与列表元素本身仍要逐个过门禁：它们可以是变量、算术表达式、
+        # 函数调用，但不能是子集外特性。循环体同理。
+        for child in children + list(node.body):
+            for item in _collect(child, in_function=in_function,
+                                 program_top=False):
+                yield item
         return
 
     if isinstance(node, FuncCall):

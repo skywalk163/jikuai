@@ -91,3 +91,9 @@ temp/
 # 依赖安装目录：可由 `jk 包 装` + 包.锁 完整还原，不入库。
 # 包.json 与 包.锁 应提交进版本库。
 极快_包/
+
+# ===== 性能基准（T8）=====
+# `python benches/run_bench.py --json xxx.json` 的产出：本地跑得机器相关，
+# 不入库。基准源码 benches/programs/ 与 run_bench.py 提交。
+benches/*.json
+bench-*.json

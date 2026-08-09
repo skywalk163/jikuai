@@ -36,7 +36,9 @@ from jikuai_aot.subset_gate import (
     describe_subset,
 )
 from jikuai_aot.codegen import generate_c, CodegenError
-from jikuai_aot.driver import build, BuildOptions, detect_c_compiler
+from jikuai_aot.driver import (
+    build, BuildOptions, detect_c_compiler, EXIT_SUBSET,
+)
 
 
 # ===========================================================================
@@ -170,27 +172,55 @@ class TestSubsetGateNegative:
 # ===========================================================================
 
 class TestDriverNoOutput:
-    """子集外源码经 driver → 退出码非 0 且不产出任何输出文件。"""
+    """子集外源码经 driver → 退出码非 0 且不产出任何输出文件。
+
+    断言强度说明（CI 首跑教训）：这里必须断言**具体**的 `EXIT_SUBSET` +
+    `JK-E7001`，不能只写 `exit_code != 0`。原来只判非 0 时，无 C 编译器的开发机
+    会走到 `EXIT_TOOLCHAIN`（3）也满足断言——于是 `test_if_no_output` 在
+    `如果` 早已进入 AOT 子集之后，仍在 Windows 上"通过"了好几个批次，直到
+    ubuntu CI 装上 gcc 才暴露。判具体码 = 让用例与编译器是否在位解耦。
+    """
+
+    def _assert_rejected_by_gate(self, r, out):
+        assert r.exit_code == EXIT_SUBSET, (
+            f'期望被子集门禁拒绝（EXIT_SUBSET={EXIT_SUBSET}），'
+            f'实得 exit_code={r.exit_code}：{r.message}')
+        assert any(d.code == JK_E7001 for d in r.diagnostics), (
+            f'应含 JK-E7001 诊断，实得 {[d.code for d in r.diagnostics]}')
+        assert not out.exists(), '门禁不通过却产出了文件'
 
     def test_class_no_output(self, tmp_path):
         src = tmp_path / "bad.jk"
         src.write_text('类 甲：\n  方法 M：\n    返回 1。\n  。\n。\n', encoding="utf-8")
         out = tmp_path / "out.exe"
         r = build(BuildOptions(source_file=str(src), output_path=str(out)))
-        assert r.exit_code != 0
-        assert not out.exists()
+        self._assert_rejected_by_gate(r, out)
         # 目录里除源文件外不应有任何文件
         extra = [f.name for f in tmp_path.iterdir() if f.name != "bad.jk"]
         assert extra == [], "意外产物：{}".format(extra)
 
-    def test_if_no_output(self, tmp_path):
+    def test_try_no_output(self, tmp_path):
+        # M9-3 起 `如果`/`当`/`重复` 已进入 AOT 子集，不能再拿它们当「子集外」
+        # 负例——有 gcc 的环境会真编译成功。改用异常捕获 `尝试`/`捕获`：
+        # 它需要栈展开，仍明确不在子集内。
         src = tmp_path / "bad2.jk"
-        src.write_text("定义 x=5。\n如果 x 大于 1 那么：\n  打印 1。\n。\n",
+        src.write_text("尝试：\n  打印 1。\n捕获 赵e：\n  打印 2。\n。\n",
                        encoding="utf-8")
         out = tmp_path / "prog.exe"
         r = build(BuildOptions(source_file=str(src), output_path=str(out)))
-        assert r.exit_code != 0
-        assert not out.exists()
+        self._assert_rejected_by_gate(r, out)
+
+    def test_supported_control_flow_is_not_rejected(self, tmp_path):
+        """正向锚点：`如果` 自 M9-3 起就该被接受。
+
+        有了这一条，将来若有人再把控制流误挡回门禁外，会立刻红——而不是
+        像上面那样，靠一条名字写着 `if_no_output` 的过期用例悄悄掩盖。
+        本用例只查门禁判定，不依赖 C 编译器。
+        """
+        from jikuai_aot import subset_gate as _gate
+        result = compile_source("定义 x=5。\n如果 x 大于 1 那么：\n  打印 1。\n。\n")
+        assert _gate.is_supported(result.ast), \
+            f'控制流应在子集内，实得拒绝原因：{_gate.unsupported_reasons(result.ast)}'
 
     def test_missing_file(self, tmp_path):
         r = build(BuildOptions(source_file=str(tmp_path / "nope.jk")))

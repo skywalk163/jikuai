@@ -1,6 +1,66 @@
 # 极快 JiKuai · 变更日志
 
-## v0.16.0（2026-08-10）· 发布卫生归零 + 链式召回真度量 + L3 场景块 + LSP 二阶
+## v0.17.0（2026-08-11）· LSP 跨文件符号表 + 粘合器槽名消解 + Web 原地更新
+
+> WBS 见 `docs/v0.17.0-WBS.md`；复盘见 `docs/v0.17-复盘.md`。
+> 全量回归 **2037 passed / 34 skipped**；契约门禁 **G10-G15 + G13+ 七门全绿**（`scripts/check_stdlib_contract.py` exit 0）。块库 **108（无新增，L3 仍为 3）**。
+
+### Breaking Change（先看这段）
+
+1. **候选 schema 新增必需字段 `导出名`**（W37）。`CANDIDATE_REQUIRED` 从 `名称/领域/层级/描述/分数/路径` 增加 `导出名`。修的是 v0.16.0 真缺陷：块目录名（`名称`）与导出名允许不同（`个税` 块导出 `缴税`），旧命令面板生成的 `从 blocks.财务.个税 导入 个税。` 是**错的**。消费者（三通道 + VS Code 扩展）需同步取 `导出名`；`make_candidate` 的 `导出名` 是必需位置参数，无默认值不兜底
+2. **LSP capabilities 新增四键**：`workspace.workspaceFolders.supported`（W38）、`referencesProvider`（W40）、`renameProvider: {prepareProvider: true}`（W41）。依赖 `freeze_signature()` 冻结值的客户端需同步期望
+3. **Web 新增 `PUT /api/方案/<id>` 端点**（W46）。请求体必须带 `期望版本`（乐观锁），缺则 400，版本不符回 409。旧五端点 + W31 四写端点行为未变；`GET /api/方案/<id>` 响应新增派生字段 `版本`（不改存档格式）
+4. **ADR-28 §3.2 稳定性传递规则放开到全量强度**（W44）。`check_stability_propagation` 从「stable L3 → experimental L2/L3」扩到「stable 聚合块（L2+）→ 任意非 stable 依赖」。存量三块 `税单`/`姓名拆分`/`地址剖解` 已提为 stable；第三方 stable L2 块若依赖 experimental 依赖，升级后门禁会红
+
+**迁移建议**：先跑 `python scripts/check_stdlib_contract.py` 看七门哪条红；候选消费者补 `导出名`；LSP 客户端更新 capabilities 期望；版本号只动 `_version.py`。
+
+### 候选 schema 补齐（W37 · 准入前置）
+
+- `service/schema.py`：`CANDIDATE_REQUIRED` 加 `导出名`；`make_candidate` 加必需位置参数（缺值构造点即报错）；新增 `export_table()` 从 `索引.json.导出` 取值，多导出时确定性择一（同名优先、否则排序取首，与 `blocks_cli._推导出名` 同 tie-break）
+- 三边同步（W20 硬门槛，通道内零字面量）：`blocks_cli` 的 `选 --json`、LSP `极快.选块`、Web `POST /api/选` + 候选卡片
+- `editors/vscode/src/extension.ts`：`buildImportStatement` 删掉「缺失时用 `名称` 兜底」——字段变必需后兜底就是掩盖 bug
+- 索引过期时降级收归 `candidate_from_hit` 单点（v0.16.0 把兜底写在 `extension.ts` 客户端且无条件生效，是缺陷本身）
+
+### LSP 跨文件符号表全量（W38-W41）
+
+- **ADR-29 跨文件符号表**：六决策点定稿（索引粒度不含局部变量 / 范围含 workspaceFolders + blocks_root + 已打开文档 / 启动后异步全量 + didChange 增量 / 反向引用图失效 / 符号数上限降级告警 / 复用 module_loader 的 dotpath 解析）
+- `service/symbol_index.py`（新，放 service 层供三通道复用）：`Symbol`/`Reference` 数据类；位置一律存 1-based 码点，到 LSP 边界才 `codepoint_to_utf16` 换算；`build_file_symbols` 与 `documentSymbol`(W32) 共用「哪些节点算符号」判定；`SymbolIndex` RLock 下读写、反向引用图、超限降级
+- `textDocument/references`（W40）：跨文件，按 `context.includeDeclaration` 处理，`(uri,line,char)` 稳定排序
+- `textDocument/rename` + `prepareRename`（W41）：跨文件 `WorkspaceEdit`；**两类硬拒绝**——非原子新名（过 `check_export_atomicity`：首字百家姓 + 单 IDENT）、块导出名（改它要连 `块.json` + G13 全局唯一，超出 LSP 职责）；拒绝路径都有可读中文提示
+- `workspace/workspaceFolders`（W38）：`initialize` 解析记录 + `didChangeWorkspaceFolders` 增量增删
+- **codeAction 未做**：W41 的可降级项，无新证据说明必要性，推 v0.18.0
+
+### 粘合器同型槽歧义消解（W42-W43）
+
+- **W42 逐槽归因**（`tools/ai-bridge/bench_glue_l3.py` + `评测集-L3.json`）：3 个 L3 块 20 槽做 A/B/C/D 归因。结果 **A 类（同型不同义）14 占失配 100%**，B/C/D 各 0。证伪「扩类型词表能解」——生年/今年 即使细分子类型仍同为「年」冲突。故选**路线 2（需求语义辅助）**
+- **W43 ADR-30 槽绑定歧义消解**：`glue.py` 新增 `strip_surname`/`match_slot_name`（三级递进：精确 1.0 / 后缀 0.8 / 包含 0.6，同级多命中即歧义留空）；`TypeGraph.plan` 改造——**同型槽不复用同一变量**（修 W42 暴露的静默硬塞缺陷）+ 多候选先字面匹配再落回最近产出
+- **实测**：`bench_glue_l3.py --验证` 场景甲（共享按槽名命名）**20/20 = 100%**（W30 基线 35%）；场景乙（无字面线索）同变量硬塞 **0 次**。`bench_glue.py` 原 30 条**零回归**（命中 100% / 荒谬 0% / 拒绝 100% / 边界 100%）
+- **如实标注**：场景甲 100% 是字面匹配上限（前提共享常量按槽名命名），非平均值
+
+### 存量稳定性追溯（W44）
+
+- ADR-28 §3.2 规则放开到全量强度（依赖方 L2+、被依赖方任意层级）；依赖方仍只查 L2+（叶子间不互绑，要收另立 ADR）
+- 存量三处违规（`工资条`→`税单`、`用户档案`→`姓名拆分`/`地址剖解`）逐个裁决为**把三个被依赖块提为 stable**，而非降 L2——依据是 `稳定性` 承诺接口兼容（元组元数与形状已定型）而非解析准确率
+- 索引 + 向量索引元信息重生成（`HF_HUB_OFFLINE=1`）；门禁实测 0 违规
+- **L3 未扩容**：W44 原计划新增 3-5 个 L3 块到 ≥6，本轮未做（写正确的 .jk 聚合块需按 ADR-28 §3.6 逐块设计入参形状，单轮时间不够），推 v0.18.0。当前 L3 粘合率数字建立在 3 块 20 槽上，样本偏小已如实标注
+
+### 检索/粘合数字重测（W45）
+
+- 四套 bench 双集全跑（`bench_retrieval` 主+留出、`bench_retrieval_chain` 主+留出、`bench_glue`、`bench_glue_l3`）。稳定性元数据改动后重跑，**单块神经继续跑赢 TF-IDF 4 pp（留出 R@3）、链式 TF-IDF 继续大幅跑赢神经（留出 88.2% vs 35.3%）**——v0.16 的证伪结论在 W44 改动后仍成立
+- memory `检索调优路线.md` 补 v0.17.0 W45 段基线
+
+### Web 方案原地更新（W46）
+
+- `PUT /api/方案/<id>`（`方案_更新`）：覆盖式更新既有存档。乐观锁用 `sha256(存档字节)[:16]` 做版本标记（**不用秒级时间戳**——同秒两次更新会误判无冲突而静默丢失更新）
+- 安全基线不变：id 白名单 + abspath 双重校验完全走 `_方案文件路径`；PUT **不创建新存档**（id 不存在回 404）；穿越攻击用例照跑
+- **多标签实时同步：不做**（W31/W46 两轮评估一致）——loopback-only 本地工具，同机双标签编辑同一方案极罕见，409 乐观锁已兜数据安全
+- `tests/test_web_server.py` 70 passed（原 58 + 新 12：版本标记 / 更新成功 / 409 冲突 / 缺期望版本 400 / 不存在 404 / 6 条穿越攻击 / 坏 schema 400）
+
+### 发布卫生
+
+- 版本号单一真源 `_version.py` → `0.17.0`；G15 逼同步 CHANGELOG 首条 + `editors/vscode/package.json`
+
+
 
 > WBS 见 `docs/v0.16.0-WBS.md`；复盘见 `docs/v0.16-复盘.md`。
 > 全量回归 **1912 passed / 34 skipped**；契约门禁 **G10 + G11 + G12 + G13 + G13+ + G14 + G15 七门全绿**（`scripts/check_stdlib_contract.py` exit 0）。块库 **105 → 108**。

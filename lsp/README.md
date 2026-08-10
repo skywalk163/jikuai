@@ -1,4 +1,4 @@
-# jikuai-lsp — 极快语言 Language Server（v0.16.0）
+# jikuai-lsp — 极快语言 Language Server（v0.17.0）
 
 极快（JiKuai）语言的 **Language Server Protocol** 实现，独立发行包。
 自实现最小 JSON-RPC over stdio（`transport.py`），**零第三方运行时依赖**。
@@ -53,6 +53,10 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 | `textDocument/definition` | `导入` / `从 … 导入` 语句里的点分块路径 → 块目录 URI；不命中返回 `null` |
 | `textDocument/documentSymbol` | 单文件 AST 遍历，提取函数（`函数`）/类（`类`）/导入（`导入`）三类顶层符号，含 `range` 与 `selectionRange`（W32） |
 | `textDocument/signatureHelp` | 光标位于内建动词调用范围内 → 返回签名与 `activeParameter`；复用 `completion.verb_arity_text` 元数查询；触发字符空格（W32） |
+| `textDocument/references` | 跨文件引用查找，走 `service/symbol_index.py` 的反向引用图；按 `uri` + 行号稳定排序；按 LSP 规范处理 `context.includeDeclaration`（v0.17.0 W40） |
+| `textDocument/prepareRename` | 光标不在可改名符号上直接返回 `null`（明确反馈，不静默无操作）（v0.17.0 W41） |
+| `textDocument/rename` | 返回跨文件 `WorkspaceEdit`。新名先过 `check_export_atomicity`（首字百家姓 + 单 IDENT），非原子名拒；块导出名一律拒（见「已知缺口」）（v0.17.0 W41） |
+| `workspace/workspaceFolders` | `initialize` 解析并记录多根（v0.17.0 W38，ADR-29） |
 | `workspace/executeCommand` | 命令 `极快.选块`：`{需求, top?}` → `{需求, 候选[]}`，与 `jk 块 选 --json` 同构 |
 
 ### 位置口径
@@ -104,7 +108,7 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 | 启动时全量扫工作区 | 未做。当前只在 `didOpen` / `didChange` 时增量索引；未打开的文件里的引用查不到。工作区大文件多时，用户逐个打开就会补齐。留待做后台异步全量扫 |
 | `foldingRange` | 未实现 |
 | 增量诊断 | `didChange` 走增量同步，但诊断仍是整篇重编译 |
-| 多根 workspace | `definition` 只查 `blocks_root()` 与文档自身目录，不解析 `workspaceFolders` |
+| 多根 workspace | `initialize` 已解析 `workspaceFolders`（v0.17.0 W38），但 `definition` 的块路径解析仍只查 `blocks_root()` 与文档自身目录 |
 | pull-based 诊断 | `diagnosticProvider: false`。诊断只走服务端 push |
 | 补全空前缀 | LSP 口径下空前缀返回 `[]`（不列全表），与 REPL 的 Tab 行为**故意不同** |
 
@@ -122,6 +126,9 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 | v0.15.0 W14 | 新增 `definitionProvider`；`textDocumentSync.change` 1 → 2 |
 | v0.15.0 W15 | 新增 `executeCommandProvider`（`极快.选块`） |
 | v0.16.0 W32 | 新增 `documentSymbolProvider`、`signatureHelpProvider`（触发字符空格） |
+| v0.17.0 W38 | 新增 `workspace.workspaceFolders.supported = True`（ADR-29） |
+| v0.17.0 W40 | 新增 `referencesProvider` |
+| v0.17.0 W41 | 新增 `renameProvider: {prepareProvider: true}` |
 
 ## 技术栈选型
 

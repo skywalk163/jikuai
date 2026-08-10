@@ -283,11 +283,12 @@ jk 块 跑 方案.json --json        # 执行，出 {源码, 执行结果:{stdou
 **LSP** —— 编辑器语言服务（stdio JSON-RPC，零第三方依赖）：
 ```powershell
 $env:PYTHONPATH = "src;lsp"       # 或先 pip install -e . 与 lsp/
-python -m jikuai_lsp               # completion/hover/definition/极快.选块
+python -m jikuai_lsp               # completion/hover/definition/documentSymbol/
+                                   # signatureHelp/references/rename/极快.选块
 # VS Code 扩展安装指引见 docs/LSP-使用.md
 ```
 
-**Web** —— 本地只读单页（标准库 `http.server`，不引框架）：
+**Web** —— 本地单页（标准库 `http.server`，不引框架；含方案存档与原地更新）：
 ```bash
 python tools/web/server.py         # 默认 http://127.0.0.1:5000/
 # 浏览器打开上述地址：需求框 → 候选卡片 → 代码+运行结果

@@ -54,6 +54,8 @@ _ADVERBS = None
 _ast_FuncDef = None
 _ast_ClassDef = None
 _ast_Import = None
+_symbol_index_mod = None
+_check_export_atomicity = None
 
 
 def _ensure_jikuai():
@@ -71,17 +73,19 @@ def _ensure_jikuai():
     global _ModuleLoader, _blocks_root, _ai_retrieval, _schema
     global _compile_source, _VERB_ARITY, _ADVERBS
     global _ast_FuncDef, _ast_ClassDef, _ast_Import
+    global _symbol_index_mod, _check_export_atomicity
     if _jikuai_imported:
         return
     from jikuai.service import SessionHost, TextDocumentStore
     from jikuai.service.position import utf16_to_codepoint, codepoint_to_utf16
     from jikuai.service import schema
+    from jikuai.service import symbol_index
     from jikuai.diagnostics.adapters import to_lsp_diagnostic
     from jikuai.completion import (
         complete_lsp, verb_documentation, keyword_documentation,
         verb_arity_text)
     from jikuai.module_loader import ModuleLoader
-    from jikuai.pkg.blocks import blocks_root
+    from jikuai.pkg.blocks import blocks_root, check_export_atomicity
     from jikuai.ai import retrieval as ai_retrieval
     from jikuai.frontend import compile_source
     from jikuai.keywords import VERB_ARITY, ADVERBS
@@ -105,6 +109,8 @@ def _ensure_jikuai():
     _ast_FuncDef = FuncDef
     _ast_ClassDef = ClassDef
     _ast_Import = Import
+    _symbol_index_mod = symbol_index
+    _check_export_atomicity = check_export_atomicity
     _jikuai_imported = True
 
 
@@ -309,6 +315,8 @@ class LspServer:
         # W38 ADR-29：initialize 收到的 workspaceFolders uri 列表（多根）。
         # 无根（客户端直接打开单文件）时为空列表——不是 None，省掉调用方判空。
         self._workspace_folders: List[str] = []
+        # W40 ADR-29：跨文件符号索引。惰性创建（首次 didOpen / references 时）。
+        self._symbol_index = None
         self._logger = logging.getLogger("jikuai_lsp")
 
     def _get_host(self):
@@ -326,6 +334,32 @@ class LspServer:
             # 传 None 是安全的。真正的 load() 才需要 evaluator。
             self._module_loader = _ModuleLoader(evaluator=None)
         return self._module_loader
+
+    def _get_symbol_index(self):
+        """惰性创建 `SymbolIndex`（W40）。索引由 didOpen/didChange 增量维护。
+
+        本轮不做启动时全量扫工作区（ADR-29 决策点 3 要求异步全量 + 增量更新；
+        全量扫由 didOpen 之后的 initialized 通知**首次触发**——纯后台线程，
+        绝不阻塞 initialize）。若客户端不发 initialized 或工作区太大，仍然
+        可用（只不过未打开的文件里的引用查不到——references 会随文件打开而
+        逐渐补齐）。这是有意的降级路径而非缺陷。
+        """
+        if self._symbol_index is None:
+            _ensure_jikuai()
+            self._symbol_index = _symbol_index_mod.SymbolIndex()
+        return self._symbol_index
+
+    def _index_document(self, uri: str) -> None:
+        """把一份文档的当前内容灌进符号索引。didOpen / didChange 触发。
+
+        编译失败时 `build_file_symbols` 会返回空——不抛，不会打挂请求处理。
+        """
+        if not uri:
+            return
+        idx = self._get_symbol_index()
+        host = self._get_host()
+        text = host.store.get(uri) or ''
+        idx.add_file(uri, text)
 
     # ───── 主循环 ─────
 
@@ -371,6 +405,12 @@ class LspServer:
             self._handle_definition(msg_id, msg.get("params", {}))
         elif method == "textDocument/documentSymbol":
             self._handle_document_symbol(msg_id, msg.get("params", {}))
+        elif method == "textDocument/references":
+            self._handle_references(msg_id, msg.get("params", {}))
+        elif method == "textDocument/prepareRename":
+            self._handle_prepare_rename(msg_id, msg.get("params", {}))
+        elif method == "textDocument/rename":
+            self._handle_rename(msg_id, msg.get("params", {}))
         elif method == "textDocument/signatureHelp":
             self._handle_signature_help(msg_id, msg.get("params", {}))
         elif method == "workspace/executeCommand":
@@ -435,6 +475,7 @@ class LspServer:
         host = self._get_host()
         host.store.did_open(uri, td.get("text", ""), td.get("version", 0))
         host.invalidate(uri)
+        self._index_document(uri)      # W40：符号索引增量维护
         self._publish_diagnostics(uri)
 
     def _handle_did_change(self, params: Dict) -> None:
@@ -452,6 +493,7 @@ class LspServer:
             uri, td.get("version", 0), params.get("contentChanges", []),
             sync_kind=TEXT_DOCUMENT_SYNC_INCREMENTAL)
         host.invalidate(uri)
+        self._index_document(uri)      # W40：符号索引增量维护
         self._publish_diagnostics(uri)
 
     def _handle_did_close(self, params: Dict) -> None:
@@ -876,6 +918,276 @@ class LspServer:
             return
         候选 = [_schema.candidate_from_hit(h) for h in hits]
         self._send_response(msg_id, _schema.make_select_envelope(需求, 候选))
+
+    # ───── References（W40 · ADR-29） ─────
+
+    def _handle_references(self, msg_id: Any, params: Dict) -> None:
+        """`textDocument/references`：查光标处符号的跨文件引用。
+
+        为什么先上只读能力（WBS W40 的取舍）：references 出错只是少列/多列，
+        rename 出错会**改坏用户代码**。先把只读的跑通，再动写的。
+
+        排序：按 (uri, 行, 列) 稳定升序——既便于测试逐字比对，也符合用户
+        「按文件、按行往下看」的预期。
+
+        `context.includeDeclaration`（LSP 规范）：为真则把**定义位置**也并进
+        结果。默认按规范当真处理（客户端不传时 VS Code 的行为就是要包含）。
+
+        索引未就绪：返回**已索引到的部分**而不是空或错误。理由——ADR-29 决策
+        点 3 定的是「不阻塞」，宁可给部分结果也不让用户干等；`ready` 标记留给
+        将来做「正在索引」提示，本轮不弹消息免得刷屏。
+        """
+        _ensure_jikuai()
+        host = self._get_host()
+        uri = params.get("textDocument", {}).get("uri", "")
+        位置 = params.get("position") or {}
+        行0 = 位置.get("line", 0)
+        列utf16 = 位置.get("character", 0)
+        lines = host.store.lines_of(uri) or []
+        if not lines or 行0 < 0 or 行0 >= len(lines):
+            self._send_response(msg_id, [])
+            return
+        行文本 = lines[行0]
+        列cp = _utf16_to_codepoint(行文本, 列utf16)
+        名字 = _token_at(行文本, 列cp)
+        if not 名字:
+            # 光标不在任何 token 上（空白/标点）——回空列表而不是 null，
+            # 空列表在客户端就是「没有引用」，语义比 null 明确。
+            self._send_response(msg_id, [])
+            return
+
+        idx = self._get_symbol_index()
+        # 当前文档可能还没进过索引（例如客户端先 references 后 didOpen），
+        # 这里补一次；add_file 幂等，重复灌不会让条目翻倍。
+        self._index_document(uri)
+
+        条目 = []
+        for r in idx.references_to(名字):
+            条目.append((r.uri, r.line, r.col))
+        包含定义 = (params.get("context") or {}).get("includeDeclaration", True)
+        if 包含定义:
+            for d in idx.definitions_of(名字):
+                条目.append((d.uri, d.line, d.col))
+
+        # 去重 + 稳定排序。同一位置可能既被记为定义又被记为引用
+        # （例如 `赋值 X = …` 顶层赋值），去重免得客户端列出两条一样的。
+        结果 = []
+        for u, 行1, 列1 in sorted(set(条目)):
+            loc = self._make_location(u, 行1, 列1, 名字)
+            if loc is not None:
+                结果.append(loc)
+        self._send_response(msg_id, 结果)
+
+    def _make_location(self, uri: str, line_cp: int, col_cp: int,
+                       name: str) -> Optional[Dict]:
+        """把 1-based 码点位置 + 符号名 变成 LSP `Location`（0-based UTF-16）。
+
+        口径换算只在这一个边界发生（ADR-29）：索引里存码点，出协议才换 UTF-16。
+
+        range 覆盖整个标识符：起点 = 符号起始列，终点 = 起点 + 符号的**UTF-16
+        宽度**（不是码点长度——含 emoji/生僻字的名字两者不等）。
+        拿不到该文件的行文本时返回 None（文件已从 store 消失），由调用方丢弃。
+        """
+        host = self._get_host()
+        lines = host.store.lines_of(uri)
+        if not lines:
+            # 索引里有但 store 里没有：磁盘上的文件（未打开）。
+            # 没有行文本就无法做 UTF-16 换算；退化为「按码点当 UTF-16 用」，
+            # 对纯 BMP 文本（极快源码的绝大多数）完全正确，含 BMP 外字符时
+            # 列号可能偏小。比丢掉这条引用好。
+            起 = max(0, col_cp - 1)
+            return {
+                "uri": uri,
+                "range": {
+                    "start": {"line": max(0, line_cp - 1), "character": 起},
+                    "end": {"line": max(0, line_cp - 1),
+                            "character": 起 + len(name)},
+                },
+            }
+        行0 = line_cp - 1
+        if 行0 < 0 or 行0 >= len(lines):
+            return None
+        行文本 = lines[行0]
+        起utf16 = _codepoint_to_utf16(行文本, col_cp)
+        止utf16 = _codepoint_to_utf16(行文本, col_cp + len(name))
+        if 止utf16 <= 起utf16:
+            止utf16 = 起utf16 + len(name)
+        return {
+            "uri": uri,
+            "range": {
+                "start": {"line": 行0, "character": 起utf16},
+                "end": {"line": 行0, "character": 止utf16},
+            },
+        }
+
+    # ───── Rename（W41 · 安全性优先于覆盖率） ─────
+
+    def _symbol_at(self, uri: str, params: Dict):
+        """取光标处的符号名与所在行文本。返回 `(名字, 行0, 列cp, 行文本)`。
+
+        取不到（文档未打开 / 行越界 / 光标在空白或标点上）时名字为空串。
+        `_handle_references` / `_handle_prepare_rename` / `_handle_rename`
+        三处共用，免得三份各写一遍位置解析。
+        """
+        host = self._get_host()
+        位置 = params.get("position") or {}
+        行0 = 位置.get("line", 0)
+        列utf16 = 位置.get("character", 0)
+        lines = host.store.lines_of(uri) or []
+        if not lines or not isinstance(行0, int) or 行0 < 0 or 行0 >= len(lines):
+            return ('', -1, -1, '')
+        行文本 = lines[行0]
+        列cp = _utf16_to_codepoint(行文本, 列utf16)
+        return (_token_at(行文本, 列cp), 行0, 列cp, 行文本)
+
+    def _block_export_names(self):
+        """所有块的导出名集合，用于拒绝对块导出名改名。
+
+        取自 `索引.json`（`schema.export_table()` 的值域）。读失败返回空集合
+        ——**注意方向**：读不到索引时集合为空 = 不拒绝，而不是全部拒绝。
+        这是有意的：索引缺失是环境问题（G12 门禁的事），不该让 rename 整体瘫掉。
+        """
+        try:
+            return set(_schema.export_table().values())
+        except Exception as e:                       # pragma: no cover
+            self._logger.debug("读块导出名失败：%s", e)
+            return set()
+
+    def _handle_prepare_rename(self, msg_id: Any, params: Dict) -> None:
+        """`textDocument/prepareRename`：光标处能否改名、改哪一段。
+
+        光标不在可改名符号上就**直接回 null**（LSP 规范允许），客户端会提示
+        「此处无法重命名」——给用户明确反馈，而不是让 rename 走到一半才失败、
+        或者静默无操作让人以为是自己点错了。
+
+        本轮判定「可改名」的条件（保守）：
+        1. 光标落在一个 token 上
+        2. 该 token 在符号索引里有定义（纯内置动词/关键字不在索引里，自动排除）
+        3. 该 token 不是块导出名（改它要连 `块.json` 与 G13 全局唯一一起动，
+           超出 LSP 层职责——见 `_handle_rename` 的拒绝理由）
+        """
+        _ensure_jikuai()
+        uri = params.get("textDocument", {}).get("uri", "")
+        名字, 行0, 列cp, 行文本 = self._symbol_at(uri, params)
+        if not 名字:
+            self._send_response(msg_id, None)
+            return
+        self._index_document(uri)
+        idx = self._get_symbol_index()
+        if not idx.definitions_of(名字):
+            self._send_response(msg_id, None)
+            return
+        if 名字 in self._block_export_names():
+            self._send_response(msg_id, None)
+            return
+        # 定位光标所在这一处 token 的确切范围（不是索引里的定义处）
+        起cp = 行文本.rfind(名字, 0, 列cp + len(名字))
+        if 起cp < 0:
+            self._send_response(msg_id, None)
+            return
+        起utf16 = _codepoint_to_utf16(行文本, 起cp + 1)
+        止utf16 = _codepoint_to_utf16(行文本, 起cp + 1 + len(名字))
+        self._send_response(msg_id, {
+            "range": {
+                "start": {"line": 行0, "character": 起utf16},
+                "end": {"line": 行0, "character": 止utf16},
+            },
+            "placeholder": 名字,
+        })
+
+    def _handle_rename(self, msg_id: Any, params: Dict) -> None:
+        """`textDocument/rename`：跨文件改名，返回 `WorkspaceEdit`。
+
+        **安全性优先于覆盖率**——宁可拒绝改名，也不能改坏代码。两类硬拒绝：
+
+        1. **新名非词法原子**：极快的词法约束比一般语言强。新名必须过
+           `blocks.check_export_atomicity`（整体切成单个 IDENT）。改成
+           `块求和` 这种会被分词器切成 `块(IDENT)+求和(VERB)` 两片，调用方
+           全部分词切碎——这是《贡献指南》六坑里坑 #3 的同源问题。
+        2. **块导出名**：改它会牵动该块的 `块.json`（`导出` 字段）与 G13
+           全局唯一门禁，还要同步所有 `从 … 导入 X` 的下游。做全了才安全，
+           做不全就是半吊子。本轮明确拒绝并说明理由。
+
+        拒绝一律走 JSON-RPC 错误 + **可读中文提示**（客户端会弹出来），
+        不静默返回空编辑——空编辑在 VS Code 里表现为「什么都没发生」，
+        用户无从判断是拒绝了还是坏了。
+        """
+        _ensure_jikuai()
+        uri = params.get("textDocument", {}).get("uri", "")
+        新名 = params.get("newName")
+        if not isinstance(新名, str) or not 新名.strip():
+            self._send_error(msg_id, _ERR_INVALID_PARAMS,
+                             "新名不能为空。")
+            return
+        新名 = 新名.strip()
+
+        名字, _行0, _列cp, _行文本 = self._symbol_at(uri, params)
+        if not 名字:
+            self._send_error(msg_id, _ERR_INVALID_PARAMS,
+                             "光标处不是可改名的符号。")
+            return
+        if 新名 == 名字:
+            self._send_error(msg_id, _ERR_INVALID_PARAMS,
+                             "新名与原名相同（「%s」），无需改名。" % 名字)
+            return
+
+        # 拒绝 1：新名必须词法原子
+        原子, 切片 = _check_export_atomicity(新名)
+        if not 原子:
+            片 = '+'.join('%s(%s)' % (文本, 词形) for 词形, 文本 in 切片) or 新名
+            self._send_error(
+                msg_id, _ERR_INVALID_PARAMS,
+                "新名「%s」不是词法原子，会被分词器切成 %s——"
+                "调用方会全部切碎。请换一个整体是单个标识符的名字"
+                "（例如以百家姓起头的 `赵…`）。" % (新名, 片))
+            return
+
+        # 拒绝 2：块导出名不在本轮范围
+        导出名集 = self._block_export_names()
+        if 名字 in 导出名集:
+            self._send_error(
+                msg_id, _ERR_INVALID_PARAMS,
+                "「%s」是块的导出名，改名会牵动该块的 `块.json` 与 G13 "
+                "全局唯一门禁，本版本不支持——请手工改块目录下的 `.jk` 与 "
+                "`块.json` 后重跑 `scripts/generate_block_index.py`。" % 名字)
+            return
+        if 新名 in 导出名集:
+            self._send_error(
+                msg_id, _ERR_INVALID_PARAMS,
+                "新名「%s」已被某个块用作导出名，改成它会与块导出撞名。" % 新名)
+            return
+
+        self._index_document(uri)
+        idx = self._get_symbol_index()
+        定义 = idx.definitions_of(名字)
+        if not 定义:
+            self._send_error(msg_id, _ERR_INVALID_PARAMS,
+                             "符号「%s」没有可见的定义，不改。" % 名字)
+            return
+
+        # 汇总所有要改的位置：定义 + 引用，去重后按 uri 分组
+        位置集 = {(d.uri, d.line, d.col) for d in 定义}
+        位置集 |= {(r.uri, r.line, r.col) for r in idx.references_to(名字)}
+        changes: Dict[str, List[Dict]] = {}
+        for u, 行1, 列1 in sorted(位置集):
+            loc = self._make_location(u, 行1, 列1, 名字)
+            if loc is None:
+                continue
+            changes.setdefault(u, []).append({
+                "range": loc["range"],
+                "newText": 新名,
+            })
+        if not changes:
+            self._send_error(msg_id, _ERR_INVALID_PARAMS,
+                             "没有找到「%s」的任何可改位置。" % 名字)
+            return
+        # 同一文件内的编辑按位置降序：客户端逐条应用时后面的编辑不会因为
+        # 前面改动导致列号偏移。（多数客户端会自己排，但契约里写死更稳。）
+        for u in changes:
+            changes[u].sort(
+                key=lambda e: (-e["range"]["start"]["line"],
+                               -e["range"]["start"]["character"]))
+        self._send_response(msg_id, {"changes": changes})
 
     # ───── JSON-RPC 发送 ─────
 

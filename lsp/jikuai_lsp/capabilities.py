@@ -57,6 +57,8 @@ SIGNATURE_HELP_TRIGGER_CHARACTERS: List[str] = [' ']
 #:   v0.15.0 W15：新增 executeCommandProvider（命令 `极快.选块`）
 #:   v0.16.0 W32：新增 documentSymbolProvider + signatureHelpProvider
 #:   v0.17.0 W38：新增 workspace.workspaceFolders（ADR-29 跨文件符号表前置）
+#:   v0.17.0 W40：新增 referencesProvider（跨文件引用查找）
+#:   v0.17.0 W41：新增 renameProvider（prepareProvider，跨文件改名）
 SERVER_CAPABILITIES: Dict[str, Any] = {
     'textDocumentSync': {
         'openClose': True,
@@ -72,6 +74,15 @@ SERVER_CAPABILITIES: Dict[str, Any] = {
     # W14：跳转到定义。只支持 `导入`/`从 … 导入` 语句里的点分块路径 → 块目录，
     # 用户符号跳转依赖 workspace 索引，留到后续版本。
     'definitionProvider': True,
+    # W40：跨文件引用查找（`textDocument/references`），底座见
+    # `service.symbol_index.SymbolIndex`（ADR-29）。
+    'referencesProvider': True,
+    # W41：重命名。prepareProvider 让客户端先问「此处能否改名、改哪段」，
+    # 光标不在可改名符号上时服务端回 null，给用户明确反馈而非静默无操作。
+    # 安全性优先于覆盖率：非原子新名、块导出名两类会被 `_handle_rename` 拒绝。
+    'renameProvider': {
+        'prepareProvider': True,
+    },
     # W32：文档符号。单文件 AST 遍历，提取函数/类/导入三类符号。
     'documentSymbolProvider': True,
     # W32：签名帮助。复用 completion.py 的动词元数查询。

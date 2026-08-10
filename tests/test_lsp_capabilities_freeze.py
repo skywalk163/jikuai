@@ -52,6 +52,10 @@ EXPECTED_FREEZE = {
     },
     'hoverProvider': True,
     'positionEncoding': 'utf-16',
+    'referencesProvider': True,
+    'renameProvider': {
+        'prepareProvider': True,
+    },
     'signatureHelpProvider': {
         'triggerCharacters': [' '],
     },

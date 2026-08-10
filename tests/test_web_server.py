@@ -153,6 +153,24 @@ def test_选_返回协议候选(服务):
     assert {c['名称'] for c in data['候选']} & {'求和'}
 
 
+def test_选_候选带导出名且与索引一致(服务):
+    """W37：Web 通道的候选必须带 `导出名`，且值来自 `索引.json` 的 `导出`。
+
+    专挑目录名≠导出名的真实块（`个税` 导出 `缴税`）来验——目录名=导出名的块
+    即使兜底成 `名称` 也看不出错，只有这类块能暴露 v0.16.0 的缺陷。
+    """
+    from jikuai.service import schema
+    表 = schema.export_table()
+    状态, data = _JSON(服务, 'POST', '/api/选', {'需求': '个人所得税', 'top': 8})
+    assert 状态 == 200
+    for c in data['候选']:
+        assert c['导出名'], c
+        assert c['导出名'] == 表.get(c['名称'], c['名称']), c
+    命中 = {c['名称']: c['导出名'] for c in data['候选']}
+    assert 命中.get('个税') == '缴税', '目录名≠导出名的块必须回真实导出名：%r' % (命中,)
+
+
+
 def test_选_需求为空被拒(服务):
     状态, data = _JSON(服务, 'POST', '/api/选', {'需求': '   '})
     assert 状态 == 400

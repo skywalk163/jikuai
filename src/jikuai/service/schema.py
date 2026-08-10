@@ -36,7 +36,7 @@ __all__ = [
     'make_candidate', 'make_step', 'make_plan', 'make_result',
     'make_select_envelope', 'make_run_envelope',
     'make_saved_plan', 'make_saved_plan_summary', 'make_saved_plan_list',
-    'candidate_from_hit', 'level_table', 'diagnostics_from_error',
+    'candidate_from_hit', 'level_table', 'export_table', 'diagnostics_from_error',
     'validate_candidate', 'validate_plan', 'validate_result',
     'validate_select_envelope', 'validate_run_envelope',
     'ensure_candidate', 'ensure_plan', 'ensure_result',
@@ -50,8 +50,14 @@ class SchemaError(ValueError):
 
 # ---- 字段清单（三通道唯一真源）---------------------------------------
 
-#: `候选` 必需字段。`层级` 来自 `索引.json`，不是启发式猜的，见 `level_table`。
-CANDIDATE_REQUIRED = ('名称', '领域', '层级', '描述', '分数', '路径')
+#: `候选` 必需字段。`层级`/`导出名` 来自 `索引.json`，不是启发式猜的，见
+#: `level_table` / `export_table`。
+#:
+#: **v0.17.0 Breaking Change**：新增 `导出名`（W37）。历史缺陷：目录名 `名称`
+#: 与调用用的 `导出名` 允许不同（`个税` 块导出 `缴税`），但候选只带 `名称`，
+#: 命令面板/CLI 就块插入的 `从 blocks.<域>.<块> 导入 <名称>。` 在两者不一致的
+#: 块上是**错的**。补齐后 `buildImportStatement` 一律用 `导出名`，兜底分支删除。
+CANDIDATE_REQUIRED = ('名称', '领域', '层级', '导出名', '描述', '分数', '路径')
 #: `候选` 可选字段。`命名空间` 为 W22 第三方块预留（内置块为空串）。
 CANDIDATE_OPTIONAL = ('命名空间',)
 
@@ -114,14 +120,20 @@ SAVED_PLAN_LIST_ENVELOPE = ('方案列表',)
 
 # ---- 构造器 -----------------------------------------------------------
 
-def make_candidate(名称: str, 领域: str, 层级: int, 描述: str,
+def make_candidate(名称: str, 领域: str, 层级: int, 导出名: str, 描述: str,
                    分数: float, 路径: str = '',
                    命名空间: Optional[str] = None) -> Dict[str, Any]:
-    """构造一条 `候选`。`分数` 统一保留 4 位小数——三通道数字要能逐字比对。"""
+    """构造一条 `候选`。`分数` 统一保留 4 位小数——三通道数字要能逐字比对。
+
+    `导出名` 是**必需**位置参数（v0.17.0 W37）：调用方必须显式给出，
+    没有默认值也不拿 `名称` 兜底。理由——兜底会在目录名≠导出名的块上静默
+    产出错误的 `导入` 语句，正是 W37 要修的缺陷；缺值就该在构造点炸。
+    """
     候选 = {
         '名称': 名称,
         '领域': 领域,
         '层级': int(层级),
+        '导出名': 导出名,
         '描述': 描述,
         '分数': round(float(分数), 4),
         '路径': 路径,
@@ -261,6 +273,24 @@ def make_saved_plan_list(条目: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 # ---- Hit → 候选 -------------------------------------------------------
 
 _LEVELS: Optional[Dict[str, int]] = None
+_EXPORTS: Optional[Dict[str, str]] = None
+
+
+def _load_index(index_path: Optional[str]):
+    """读 `索引.json` 的 `块` 数组。读不到/坏了返回空列表。
+
+    索引缺失或损坏不在这里炸：那是 G12 门禁的职责，不该把一条 `选` 请求打挂。
+    """
+    if index_path is None:
+        from ..pkg.blocks import blocks_root
+        index_path = os.path.join(blocks_root(), '索引.json')
+    try:
+        with open(index_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    条目表 = data.get('块')
+    return 条目表 if isinstance(条目表, list) else []
 
 
 def level_table(index_path: Optional[str] = None) -> Dict[str, int]:
@@ -271,18 +301,10 @@ def level_table(index_path: Optional[str] = None) -> Dict[str, int]:
     """
     global _LEVELS
     默认索引 = index_path is None
-    if 默认索引:
-        if _LEVELS is not None:
-            return _LEVELS
-        from ..pkg.blocks import blocks_root
-        index_path = os.path.join(blocks_root(), '索引.json')
+    if 默认索引 and _LEVELS is not None:
+        return _LEVELS
     table: Dict[str, int] = {}
-    try:
-        with open(index_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        data = {}
-    for 条目 in (data.get('块') or []):
+    for 条目 in _load_index(index_path):
         名称 = 条目.get('名称')
         if isinstance(名称, str):
             try:
@@ -294,16 +316,59 @@ def level_table(index_path: Optional[str] = None) -> Dict[str, int]:
     return table
 
 
-def candidate_from_hit(hit: Any, 层级: Optional[int] = None) -> Dict[str, Any]:
+def export_table(index_path: Optional[str] = None) -> Dict[str, str]:
+    """块名 → **主 `导出名`** 映射，读自 `索引.json` 的 `导出` 字段（v0.17.0 W37）。
+
+    为什么必须有这张表：块的目录名（`名称`，`导入` 用）与调用名（`导出名`）
+    允许不同——`个税` 块导出 `缴税`。候选只带 `名称` 时，命令面板拼出的
+    `从 blocks.财务.个税 导入 个税。` 是错的（正确是 `导入 缴税`）。
+
+    取值**不做启发式推断**，一律来自索引，与 W20 给 `层级` 定的规矩同源。
+    一个块声明多个 `导出` 时的**确定性择一**（不是猜）：与块同名的优先，
+    否则取排序首位——和 `blocks_cli._推导出名` 同一套 tie-break，
+    保证 CLI 人读路径与 JSON 协议路径选出同一个名字。
+
+    索引里查不到该块（索引过期）时本表不含它，由 `candidate_from_hit`
+    统一处理降级——见那里的说明。
+    """
+    global _EXPORTS
+    默认索引 = index_path is None
+    if 默认索引 and _EXPORTS is not None:
+        return _EXPORTS
+    table: Dict[str, str] = {}
+    for 条目 in _load_index(index_path):
+        名称 = 条目.get('名称')
+        导出 = 条目.get('导出')
+        if not isinstance(名称, str) or not isinstance(导出, list):
+            continue
+        names = sorted(n for n in 导出 if isinstance(n, str) and n)
+        if not names:
+            continue
+        table[名称] = 名称 if 名称 in names else names[0]
+    if 默认索引:
+        _EXPORTS = table
+    return table
+
+
+def candidate_from_hit(hit: Any, 层级: Optional[int] = None,
+                       导出名: Optional[str] = None) -> Dict[str, Any]:
     """把 `ai.retrieval.Hit` 转成协议 `候选`。
 
     `层级` 不传则查 `level_table()`；查不到落 0（块不在索引里说明索引过期，
     这是 G12 门禁的事，不该在这里把整条请求打挂）。
+
+    `导出名` 不传则查 `export_table()`；查不到退回 `hit.name`。这个降级
+    **只有一处、就在这里**，且只在索引过期时才可能触发（索引里的块必带非空
+    `导出`——`blocks._validate` 与 G13 全局唯一都在管）。v0.16.0 的错误做法
+    是把同样的兜底写在 `extension.ts` 的客户端侧且**无条件生效**，于是目录名
+    ≠导出名的块被静默拼错；W37 把兜底收归真源并绑定到「索引过期」这一个成因。
     """
     if 层级 is None:
         层级 = level_table().get(hit.name, 0)
+    if 导出名 is None:
+        导出名 = export_table().get(hit.name) or hit.name
     return make_candidate(
-        名称=hit.name, 领域=hit.domain, 层级=层级,
+        名称=hit.name, 领域=hit.domain, 层级=层级, 导出名=导出名,
         描述=hit.description, 分数=hit.score,
         路径=getattr(hit, 'path', '') or '',
     )
@@ -337,8 +402,10 @@ def validate_candidate(obj: Any, 位置: str = '候选') -> List[str]:
     errs = _check_keys(obj, CANDIDATE_REQUIRED, CANDIDATE_OPTIONAL, 位置)
     if not isinstance(obj, dict):
         return errs
-    for 名 in ('名称', '领域', '描述', '路径', '命名空间'):
+    for 名 in ('名称', '领域', '导出名', '描述', '路径', '命名空间'):
         _check_str(obj, 名, 位置, errs)
+    if '导出名' in obj and isinstance(obj['导出名'], str) and not obj['导出名']:
+        errs.append('%s.导出名 不能是空串（插入的 `导入` 语句会缺调用名）' % 位置)
     if '层级' in obj and (isinstance(obj['层级'], bool)
                          or not isinstance(obj['层级'], int)):
         errs.append('%s.层级 必须是整数' % 位置)

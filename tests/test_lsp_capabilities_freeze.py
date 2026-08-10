@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-#: v0.16.0（W13+W14+W15+W32）冻结签名的**完整**期望值。改这里等于改对外契约。
+#: v0.17.0（W38）冻结签名的**完整**期望值。改这里等于改对外契约。
 EXPECTED_FREEZE = {
     'completionProvider': {
         'resolveProvider': False,
@@ -58,6 +58,12 @@ EXPECTED_FREEZE = {
     'textDocumentSync': {
         'change': 2,
         'openClose': True,
+    },
+    'workspace': {
+        'workspaceFolders': {
+            'changeNotifications': True,
+            'supported': True,
+        },
     },
 }
 

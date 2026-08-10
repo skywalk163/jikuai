@@ -168,7 +168,7 @@ _, _F候选 = schema.SELECT_ENVELOPE_REQUIRED
 _F步骤 = schema.PLAN_REQUIRED[0]
 _F块, _F领域, _F导出名 = schema.STEP_REQUIRED
 _F参数, _F说明 = schema.STEP_OPTIONAL
-_F名称, _, _, _F描述, _, _ = schema.CANDIDATE_REQUIRED
+_F名称, _, _, _F候选导出名, _F描述, _, _ = schema.CANDIDATE_REQUIRED
 _Fstdout, _Fstderr, _F返回值, _F耗时毫秒 = schema.RESULT_REQUIRED
 _F错误, _F诊断 = schema.RESULT_OPTIONAL
 

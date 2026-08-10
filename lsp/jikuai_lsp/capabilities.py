@@ -56,6 +56,7 @@ SIGNATURE_HELP_TRIGGER_CHARACTERS: List[str] = [' ']
 #:                （Incremental sync，配合 TextDocumentStore._apply_change）
 #:   v0.15.0 W15：新增 executeCommandProvider（命令 `极快.选块`）
 #:   v0.16.0 W32：新增 documentSymbolProvider + signatureHelpProvider
+#:   v0.17.0 W38：新增 workspace.workspaceFolders（ADR-29 跨文件符号表前置）
 SERVER_CAPABILITIES: Dict[str, Any] = {
     'textDocumentSync': {
         'openClose': True,
@@ -84,6 +85,16 @@ SERVER_CAPABILITIES: Dict[str, Any] = {
     },
     'diagnosticProvider': False,
     'positionEncoding': 'utf-16',
+    # W38 ADR-29：声明支持 workspaceFolders。客户端会在 initialize params 里
+    # 带 workspaceFolders 数组，服务端据此确定跨文件索引的扫描范围。
+    # changeNotifications=True 让客户端在用户增删根目录时发
+    # workspace/didChangeWorkspaceFolders 通知。
+    'workspace': {
+        'workspaceFolders': {
+            'supported': True,
+            'changeNotifications': True,
+        },
+    },
 }
 
 

@@ -96,6 +96,31 @@ class TestSelectBlock:
         assert result is not None
         assert len(result['候选']) <= 5
 
+    def test_select_block_carries_export_name(self, lsp):
+        """W37：LSP 通道候选必须带 `导出名`，且对目录名≠导出名的块回真实导出名。
+
+        `个税` 块（领域 财务）导出 `缴税`。v0.16.0 客户端拼 `导入 <名称>` 时
+        对这类块是错的；协议补齐后 LSP 必须**直接给出**正确的 `导出名`，
+        无需客户端兜底。
+        """
+        from jikuai.service.schema import export_table
+        resp = request_execute_command(
+            lsp, '极快.选块',
+            arguments=[{'需求': '个人所得税', 'top': 8}],
+            msg_id=403,
+        )
+        assert resp is not None
+        result = resp.get('result')
+        assert result is not None
+        表 = export_table()
+        命中 = {}
+        for c in result['候选']:
+            assert c.get('导出名'), f"候选缺 `导出名`：{c!r}"
+            assert c['导出名'] == 表.get(c['名称'], c['名称']), c
+            命中[c['名称']] = c['导出名']
+        assert 命中.get('个税') == '缴税', f'目录名≠导出名的块必须回真实导出名：{命中!r}'
+
+
 
 class TestSelectBlockErrors:
     """参数校验与错误响应。"""

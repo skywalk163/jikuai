@@ -319,16 +319,39 @@ def test_cli_select_口语需求命中(capsys):
 
 
 def test_cli_select_json输出(capsys):
-    """`--json` 出结构化候选，含 名称/领域/层级/描述/分数/路径 六字段（W20 收敛）。"""
+    """`--json` 出结构化候选，含 名称/领域/层级/导出名/描述/分数/路径 七字段
+    （W20 立契约，W37 补齐 `导出名` 使 Breaking Change 收敛完毕）。"""
     rc = blocks_cli.run(['选', '求和', '--top', '2', '--json'])
     out = capsys.readouterr().out
     assert rc == 0
     data = json.loads(out)
     assert data['需求'] == '求和'
     assert data['候选']
-    # 新契约：候选必须含 `层级`（W20 breaking change）
-    assert set(data['候选'][0]) >= {'名称', '领域', '层级', '描述', '分数', '路径'}
+    # 新契约：候选必须含 `层级` + `导出名`（W20/W37 breaking change）
+    assert set(data['候选'][0]) >= {'名称', '领域', '层级', '导出名',
+                                    '描述', '分数', '路径'}
     assert isinstance(data['候选'][0]['层级'], int)
+    assert isinstance(data['候选'][0]['导出名'], str) and data['候选'][0]['导出名']
+
+
+def test_cli_select_json回真实导出名_目录名不同(capsys):
+    """W37 端到端：`选 --json` 对目录名≠导出名的块回 `索引.json.导出` 值。
+
+    `个税` 块导出 `缴税`——v0.16.0 会漏这一字段，客户端只能拼 `导入 个税` 兜底
+    出错。本测试守候 `导出名` == `缴税`，且 grep 层不会退化。
+    """
+    from jikuai.service import schema
+    rc = blocks_cli.run(['选', '个人所得税', '--top', '8', '--json'])
+    信封 = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert schema.validate_select_envelope(信封) == [], 信封
+    表 = schema.export_table()
+    命中 = {}
+    for c in 信封['候选']:
+        assert c['导出名'] == 表.get(c['名称'], c['名称']), c
+        命中[c['名称']] = c['导出名']
+    assert 命中.get('个税') == '缴税', 命中
+
 
 
 def test_cli_select_缺需求返1(capsys):

@@ -306,6 +306,9 @@ class LspServer:
         self._initialized = False
         self._shutdown_requested = False
         self._running = True
+        # W38 ADR-29：initialize 收到的 workspaceFolders uri 列表（多根）。
+        # 无根（客户端直接打开单文件）时为空列表——不是 None，省掉调用方判空。
+        self._workspace_folders: List[str] = []
         self._logger = logging.getLogger("jikuai_lsp")
 
     def _get_host(self):
@@ -372,6 +375,8 @@ class LspServer:
             self._handle_signature_help(msg_id, msg.get("params", {}))
         elif method == "workspace/executeCommand":
             self._handle_execute_command(msg_id, msg.get("params", {}))
+        elif method == "workspace/didChangeWorkspaceFolders":
+            self._handle_did_change_workspace_folders(msg.get("params", {}))
         elif msg_id is not None:
             self._send_error(msg_id, _ERR_METHOD_NOT_FOUND,
                              f"方法未实现：{method}")
@@ -380,7 +385,16 @@ class LspServer:
     # ───── 生命周期 ─────
 
     def _handle_initialize(self, msg_id: Any, params: Dict) -> None:
-        """返回 capabilities + serverInfo。serverInfo 版本源自 capabilities 模块。"""
+        """返回 capabilities + serverInfo。serverInfo 版本源自 capabilities 模块。
+
+        W38：解析 params.workspaceFolders，记录到 self._workspace_folders。
+        后续 W39 的符号索引构建时会根据这些根目录递归扫描 .jk 文件。
+        """
+        # LSP 3.16+: workspaceFolders 在 InitializeParams 里（可能为 null）
+        folders = params.get("workspaceFolders") or []
+        self._workspace_folders = [
+            f.get("uri", "") for f in folders if isinstance(f, dict)
+        ]
         self._send_response(msg_id, {
             "capabilities": server_capabilities(),
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
@@ -389,6 +403,29 @@ class LspServer:
     def _handle_shutdown(self, msg_id: Any) -> None:
         self._shutdown_requested = True
         self._send_response(msg_id, None)
+
+    def _handle_did_change_workspace_folders(self, params: Dict) -> None:
+        """W38：增量增删 workspaceFolders（ADR-29 决策点 4「失效策略」）。
+
+        规范里 `event.added` / `event.removed` 都是 WorkspaceFolder 数组。
+        用增量增删而非整表替换：客户端只告诉你差量，重扫全部根没有必要，
+        而且 W39 起索引按根挂条目，整表替换会把没动过的根白重建一遍。
+
+        移除按 uri 相等匹配。顺序保持「先删后加」——同一个 uri 先 removed
+        再 added（客户端重挂同一根目录）时结果是「在」，符合直觉。
+        """
+        event = params.get("event") or {}
+        removed = {f.get("uri") for f in (event.get("removed") or [])
+                   if isinstance(f, dict)}
+        if removed:
+            self._workspace_folders = [
+                u for u in self._workspace_folders if u not in removed]
+        for f in (event.get("added") or []):
+            if not isinstance(f, dict):
+                continue
+            uri = f.get("uri", "")
+            if uri and uri not in self._workspace_folders:
+                self._workspace_folders.append(uri)
 
     # ───── 文本同步 ─────
 

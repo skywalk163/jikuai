@@ -16,10 +16,19 @@
       background:var(--bg); color:var(--fg);
       font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
     }
-    /* 三段式：需求 / 候选 / 方案+结果，CSS Grid 手写竖向三段 */
+    /* 三段式：需求 / 候选 / 方案+结果，CSS Grid 手写竖向三段；
+       右侧再挂一条跨三行的历史侧栏（W31）。 */
     .grid{
       height:100vh; display:grid; gap:10px; padding:10px;
+      grid-template-columns:minmax(0,1fr) 232px;
       grid-template-rows:auto minmax(120px,1fr) minmax(220px,1.6fr);
+    }
+    #hist{grid-column:2; grid-row:1 / 4; display:flex; flex-direction:column; gap:8px}
+    /* 窄屏（手机 / 分屏）退回单列，历史沉到最下面，不挤主流程 */
+    @media (max-width:820px){
+      .grid{grid-template-columns:minmax(0,1fr);
+            grid-template-rows:auto minmax(120px,1fr) minmax(220px,1.6fr) auto}
+      #hist{grid-column:1; grid-row:4; max-height:34vh}
     }
     .panel{
       background:var(--panel); border:1px solid var(--line);
@@ -156,6 +165,22 @@
     .sec:first-child{margin-top:0}
     .body{white-space:pre-wrap;word-break:break-word;font-family:"Consolas","Menlo",monospace}
     .body.err{color:var(--err)}
+
+    /* ---- 历史侧栏（W31）---- */
+    .hist-list{flex:1;overflow:auto;display:flex;flex-direction:column;gap:4px}
+    .hist-item{
+      display:flex;gap:6px;align-items:center;padding:6px 8px;
+      background:var(--bg);border:1px solid var(--line);border-radius:6px;
+      font-size:12px;cursor:pointer;text-align:left;width:100%;color:var(--fg);
+    }
+    .hist-item:hover{border-color:var(--accent)}
+    .hist-item .ht{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .hist-item .hd{color:var(--dim);font-size:11px;white-space:nowrap}
+    .hist-item .hx{
+      background:transparent;color:var(--dim);border:0;padding:0 4px;
+      font-size:14px;line-height:1;cursor:pointer;flex:none;
+    }
+    .hist-item .hx:hover{color:var(--err)}
   </style>
 </head>
 <body>
@@ -198,6 +223,7 @@
           <div class="row">
             <h2 style="margin:0">合成源码 <span class="muted">（可编辑）</span></h2>
             <div class="tools">
+              <button id="btn-save" class="ghost sm" disabled title="保存当前方案到历史">保存 ⌂</button>
               <button id="btn-copy-plan" class="ghost sm" disabled>复制方案 JSON</button>
               <button id="btn-copy-src" class="ghost sm" disabled>复制源码</button>
               <button id="btn-dl" class="ghost sm" disabled>下载 .jk</button>
@@ -221,6 +247,11 @@
         </div>
       </div>
     </section>
+    <!-- 历史侧栏（W31）—— 放在 grid 容器内，靠 grid-column/grid-row 定位到右侧竖列。 -->
+    <aside id="hist" class="panel" aria-labelledby="hist-title">
+      <h2 id="hist-title">历史 <span class="muted" id="hist-hint">（加载中…）</span></h2>
+      <div class="hist-list" id="hist-list" role="list" aria-label="已保存方案列表"></div>
+    </aside>
   </div>
   <script src="app.js"></script>
 </body>

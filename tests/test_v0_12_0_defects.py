@@ -49,18 +49,22 @@ def _sexp(node):
 # ===========================================================================
 
 class TestReadWriteVerbs:
-    def test_read_existing_file(self, tmp_path):
-        p = tmp_path / "hello.txt"
-        p.write_text("你好，极快", encoding='utf-8')
-        path = str(p).replace('\\', '/')
-        assert run('读取 "%s"。' % path) == "你好，极快"
+    """v0.16.0 W28 更新：两个动词加了路径闸（限 CWD 内，绝对路径一律拒）。
+    原用例用 `tmp_path` 的**绝对路径**，现在会被 JK-E4002 挡下——这是有意的
+    行为变更，不是回归。改为 chdir 到 tmp_path + 相对路径，保持原断言不变。
+    安全闸自身的用例见 `tests/test_builtin_io.py`。
+    """
 
-    def test_write_then_read_back(self, tmp_path):
-        p = tmp_path / "out.txt"
-        path = str(p).replace('\\', '/')
+    def test_read_existing_file(self, tmp_path, monkeypatch):
+        (tmp_path / "hello.txt").write_text("你好，极快", encoding='utf-8')
+        monkeypatch.chdir(tmp_path)
+        assert run('读取 "hello.txt"。') == "你好，极快"
+
+    def test_write_then_read_back(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         # 写入返回内容（便于管道传递），并能被读回
-        assert run('写入 "%s" "内容甲"。' % path) == "内容甲"
-        assert run('读取 "%s"。' % path) == "内容甲"
+        assert run('写入 "out.txt" "内容甲"。') == "内容甲"
+        assert run('读取 "out.txt"。') == "内容甲"
 
 
 # ===========================================================================

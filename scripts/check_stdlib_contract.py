@@ -192,7 +192,117 @@ def main(argv):
     except Exception as e:
         print("G13 跳过（%s）" % e)
 
+    # G13 扩展（ADR-28 · W29）：L3 聚合块的三条结构约束，都长在同一张
+    # 「块 --依赖块--> 块」有向图上。与 G13/G14 同样的 try/except 风格：
+    # 老分支没有这些函数就静默跳过，不阻塞既有门禁。
+    #   1) 依赖环检测——依赖成环让层级失去偏序、粘合器链式推导打转
+    #   2) 层级一致性——声明 L3 但依赖够不上 L3 判定（如只依赖 L1）
+    #   3) 稳定性传递——stable L3 不得依赖 experimental/deprecated 的 L2/L3
+    # 三者都只扫内置块库（第三方块不拖红内置门禁，同 G14 策略）。
+    try:
+        from jikuai.pkg.blocks import (
+            check_dependency_acyclic,
+            check_level_consistency,
+            check_stability_propagation,
+        )
+        环 = check_dependency_acyclic()
+        if 环:
+            print("G13+ 依赖图有环（%d 个）：" % len(环))
+            for 路径 in 环:
+                print("  - %s" % " → ".join(路径))
+            exit_code = exit_code or 1
+        层级问题 = check_level_consistency()
+        if 层级问题:
+            print("G13+ L3 层级虚标（%d 处）：" % len(层级问题))
+            for 条 in 层级问题:
+                print("  - %s" % 条)
+            exit_code = exit_code or 1
+        稳定性问题 = check_stability_propagation()
+        if 稳定性问题:
+            print("G13+ L3 稳定性传递违规（%d 处）：" % len(稳定性问题))
+            for 条 in 稳定性问题:
+                print("  - %s" % 条)
+            exit_code = exit_code or 1
+    except Exception as e:
+        print("G13+ 跳过（%s）" % e)
+
+    # G15：版本号单一真源（W25 · v0.16.0）。`_version.__version__` 是唯一真源；
+    # pyproject（dynamic 引用它，解析后应相等）、CHANGELOG 最新条目、VS Code 扩展
+    # package.json 三处必须与之一致。历史上 pyproject/__init__/main/扩展四处停在
+    # 0.6.0 与实际发布 v0.15.0 脱节达九个版本，本门禁防止再次漂移。
+    problems = _check_version_consistency()
+    if problems:
+        print("G15 版本号不一致（%d 处）：" % len(problems))
+        for 条 in problems:
+            print("  - %s" % 条)
+        exit_code = exit_code or 1
+
     return exit_code
+
+
+def _read_source_version():
+    """唯一真源 `jikuai._version.__version__`。"""
+    from jikuai._version import __version__
+    return __version__
+
+
+def _read_pyproject_version(source_version):
+    """pyproject.toml 的版本。dynamic 模式下静态读不到字面量，
+    则确认它确实声明了 dynamic version + 指向 _version，视为一致。"""
+    path = os.path.join(REPO_ROOT, "pyproject.toml")
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    # 静态 version = "x.y.z"
+    m = re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']', text)
+    if m:
+        return m.group(1)
+    # dynamic 模式：必须同时声明 dynamic=["version"] 且 attr 指向 _version
+    has_dynamic = re.search(r'(?m)^\s*dynamic\s*=\s*\[[^\]]*["\']version["\']', text)
+    points_to_source = "jikuai._version.__version__" in text
+    if has_dynamic and points_to_source:
+        return source_version   # 由 setuptools 在构建期解析为真源，视为一致
+    return None
+
+
+def _read_changelog_version():
+    """CHANGELOG.md 最新条目版本号（首个 `## vX.Y.Z` 或 `## [X.Y.Z]`）。"""
+    path = os.path.join(REPO_ROOT, "CHANGELOG.md")
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"^##\s+\[?v?(\d+\.\d+\.\d+)", line.strip())
+            if m:
+                return m.group(1)
+    return None
+
+
+def _read_vscode_version():
+    """editors/vscode/package.json 的 version。"""
+    path = os.path.join(REPO_ROOT, "editors", "vscode", "package.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f).get("version")
+
+
+def _check_version_consistency():
+    """比对四处版本号，返回不一致描述列表（空 = 一致）。"""
+    problems = []
+    try:
+        src = _read_source_version()
+    except Exception as e:
+        return ["无法读取 _version.__version__：%s" % e]
+
+    checks = [
+        ("pyproject.toml", _read_pyproject_version(src)),
+        ("CHANGELOG.md 最新条目", _read_changelog_version()),
+        ("editors/vscode/package.json", _read_vscode_version()),
+    ]
+    for 名, 值 in checks:
+        if 值 is None:
+            problems.append("%s 读不到版本号" % 名)
+        elif 值 != src:
+            problems.append("%s = %r，真源 _version = %r" % (名, 值, src))
+    return problems
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ from . import semver
 __all__ = [
     'BLOCK_METADATA_NAME', 'BLOCK_METADATA_SUFFIX', 'BLOCK_INDEX_NAME',
     'BLOCK_INDEX_VERSION', 'ALLOWED_DOMAINS', 'STABILITY_LEVELS',
-    'DEFAULT_STABILITY',
+    'DEFAULT_STABILITY', 'MAX_BLOCK_LEVEL', 'AGGREGATE_LEVEL', 'L3_LEVEL',
     'SCALAR_TYPES', 'CONTAINER_TYPE_NAMES', 'UNION_TYPE_NAME',
     'VECTOR_INDEX_NAME', 'VECTOR_INDEX_META_NAME',
     'BlockError', 'BlockMetadata',
@@ -52,6 +52,9 @@ __all__ = [
     'extract_exports', 'block_exports', 'validate_block',
     'check_type_annotation', 'check_stdlib_type_annotations',
     'check_export_globally_unique',
+    'build_dependency_graph', 'find_dependency_cycles',
+    'check_dependency_acyclic', 'check_level_consistency',
+    'check_stability_propagation',
 ]
 
 #: 目录形态的元数据文件名。
@@ -96,6 +99,21 @@ UNION_TYPE_NAME = '联合'
 
 #: 未声明 `稳定性` 时的默认值。取最保守的一档：没表态的块不该被 CLI 推荐。
 DEFAULT_STABILITY = 'experimental'
+
+#: 层级上限（ADR-28 §3.3）。W29 起把 `层级` 从"任意非负整数"收紧到 `0..3`。
+#:
+#: **只开到 L3，刻意不开 L4**：层级每深一层，检索侧就多一层"为什么给你选这个块"
+#: 的解释负担（ADR-25 的召回解释链），粘合器的类型链推导分支也跟着涨。先用 L3
+#: 证明跨域场景聚合确有价值，再谈更深。要开 L4 必须另立 ADR + 拿出度量。
+MAX_BLOCK_LEVEL = 3
+
+#: 「聚合块」的层级门槛：`层级 >= 2` 视为聚合了子块的复合/场景块。
+#: L3 判定与稳定性传递都只对 L2+ 依赖计数（见 ADR-28 §3.1/§3.2）。
+AGGREGATE_LEVEL = 2
+
+#: L3（跨 L2 场景块）的层级值。单独起个名字，避免判定逻辑里散落魔法数字 3。
+L3_LEVEL = 3
+
 
 #: 块名白名单。规则同 `manifest._NAME_RE`（中文/字母/数字/下划线/连字符），
 #: 但**不套用包名的保留字表**——`工具`、`分词` 这类词在块生态里是正常块名，
@@ -418,6 +436,14 @@ def _validate(data: Any, path: Optional[str]) -> None:
     # bool 是 int 的子类，`"层级": true` 必须挡掉
     if isinstance(level, bool) or not isinstance(level, int) or level < 0:
         _fail('块「层级」必须是非负整数，得到 %r' % (level,), path)
+    # W29（ADR-28 §3.3）起加上限：`层级` 只允许 0..MAX_BLOCK_LEVEL。
+    # v0.15.0 及以前不设上限（`"层级": 7` 也能过），但深层聚合既没有块能证明
+    # 价值，又会拖垮检索解释与粘合器链式推导，故本轮显式封到 L3。
+    # 走到这里 level 已经是非负 int（上面不合规会 `_fail` 抛出）。
+    if level > MAX_BLOCK_LEVEL:
+        _fail('块「层级」最大 %d（L0 原子 / L1 复合 / L2 场景 / L3 跨域场景），'
+              '得到 %r；本轮不开 L4，见 ADR-28 §3.3'
+              % (MAX_BLOCK_LEVEL, level), path)
 
     domains = data['领域']
     if not isinstance(domains, list) or not domains:
@@ -945,6 +971,221 @@ def check_export_globally_unique(index=None):
     冲突 = [(k, sorted(v)) for k, v in 反向.items() if len(v) > 1]
     冲突.sort()
     return 冲突
+
+
+# ---------------------------------------------------------------------------
+# 依赖图 / 环检测 / L3 层级一致性 / 稳定性传递（G13 扩展，ADR-28 · W29）
+# ---------------------------------------------------------------------------
+#
+# ADR-28 把 `层级` 开到 L3（聚合 L2 的跨域场景块）。三条新约束都长在同一张
+# 「块 --依赖块--> 块」的有向图上，所以放在一节里：
+#
+#   依赖环检测   `check_dependency_acyclic`     A→B→A 这类环
+#   层级一致性   `check_level_consistency`      声明 L3 但依赖够不上 L3 判定
+#   稳定性传递   `check_stability_propagation`  stable L3 依赖 experimental L2/L3
+#
+# **图的节点键是块的 `名称`（叶名），不是"块全名"**。理由：`依赖块` 字段自
+# v0.14.0 起装的就是叶名（`["税单", "金额报表", "周岁"]`），且 `validate_block`
+# 步骤 6 的 G11 对账正是拿它与 `.jk` 里 `blocks.X.Y` 的**叶段**比对
+# （见 `_extract_import_deps`）。若在这里改用全名，G11 与全部现存 L2 块的
+# 元数据都得跟着翻——收益为零，故沿用叶名，不新造字段也不改语义。
+#
+# 叶名在单个命名空间内唯一（`scan_blocks` 的 `(命名空间, 名称)` 去重保证），
+# 因此在只扫内置块库的门禁场景下解析无歧义。跨命名空间同名块会被并成一个
+# 节点——已知局限，记在 ADR-28 §5，等第三方 L3 真出现再上全名解析。
+
+def build_dependency_graph(blocks: List[BlockMetadata]) -> Dict[str, List[str]]:
+    """把块列表构造成 `名称 -> [依赖块名, ...]` 的有向图（ADR-28 §3.4）。
+
+    边取自每个块的 `依赖块` 字段。值保序且**不做存在性过滤**——指向图外的边
+    （依赖了没扫进来的块）保留下来，由调用方决定怎么解释：环检测会自动忽略
+    它们（不成环），层级一致性把它们算作"无法判定"。
+    """
+    graph: Dict[str, List[str]] = {}
+    for b in blocks:
+        graph.setdefault(b.name, [])
+        for dep in b.dep_blocks:
+            graph[b.name].append(dep)
+    return graph
+
+
+def find_dependency_cycles(graph: Dict[str, List[str]]) -> List[List[str]]:
+    """在有向图里找出所有环。返回 `[[n1, n2, ..., n1], ...]`（闭合序列）。
+
+    三色 DFS：白（未访问）→ 灰（在当前递归栈上）→ 黑（子树已走完）。碰到一条
+    指向**灰**节点的边就是后向边，此时递归栈上从那个灰节点到当前节点的一段
+    正好是环体，闭合一下即为环。自环（A 依赖 A）返回 `['A', 'A']`。
+
+    为什么不用 Kahn 拓扑排序：拓扑排序只能回答"有没有环"，剩下的节点集是
+    所有环的并集，报错时指不出具体环路。贡献者需要的是「税单 → 工资册 →
+    税单」这样能照着改的路径。
+
+    去重按"环体的字典序最小旋转"：同一个环从不同起点走到会重复发现，
+    `A→B→A` 与 `B→A→B` 只报一次。返回结果按环体排序，保证报错稳定可 diff。
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in graph}
+    stack: List[str] = []
+    cycles: List[List[str]] = []
+    seen = set()
+
+    def 规范化(环体):
+        """取字典序最小旋转做去重键。"""
+        best = min(range(len(环体)), key=lambda i: 环体[i:] + 环体[:i])
+        return tuple(环体[best:] + 环体[:best])
+
+    def dfs(node):
+        color[node] = GRAY
+        stack.append(node)
+        for nb in graph.get(node, ()):
+            if nb not in color:
+                continue                    # 指向图外，不参与成环
+            if color[nb] == GRAY:
+                环体 = stack[stack.index(nb):]
+                键 = 规范化(环体)
+                if 键 not in seen:
+                    seen.add(键)
+                    cycles.append(list(键) + [键[0]])
+            elif color[nb] == WHITE:
+                dfs(nb)
+        stack.pop()
+        color[node] = BLACK
+
+    # 按名称排序遍历起点，让同一份块库每次跑出同样的环列表（否则 dict 顺序
+    # 一变，报错文本就抖，CI 日志没法比对）。
+    for n in sorted(graph):
+        if color[n] == WHITE:
+            dfs(n)
+    cycles.sort()
+    return cycles
+
+
+def _resolve_blocks(root=None, roots=None, blocks=None) -> List[BlockMetadata]:
+    """三个门禁函数共用的块列表解析：给了 `blocks` 就用，否则扫盘。
+
+    `root`/`roots` 都为 None 时**显式只扫内置块库**（与 G14 的
+    `check_stdlib_type_annotations` 同策略）——本机配了 `JIKUAI_PKG_ROOTS`
+    不该让内置门禁变红。
+    """
+    if blocks is not None:
+        return list(blocks)
+    if root is None and roots is None:
+        root = blocks_root()
+    return scan_blocks(root, roots)
+
+
+def check_dependency_acyclic(root=None, roots=None, blocks=None) -> List[List[str]]:
+    """G13 扩展：块依赖图必须无环（ADR-28 §3.4）。
+
+    返回环列表（每项是闭合节点序列 `[n1, ..., n1]`），空列表 = 门禁绿。
+
+    为什么环必须拒：`依赖块` 成环意味着两个块互相"聚合"对方，语义上讲不通；
+    工程上会让 W3-W4 粘合器的链式推导在候选图上打转，也让 `层级` 字段失去
+    偏序含义（谁聚合谁？）。运行时未必崩（`.jk` 的 `导入` 有模块缓存），
+    所以只有门禁能在 PR 阶段挡住。
+    """
+    return find_dependency_cycles(build_dependency_graph(
+        _resolve_blocks(root, roots, blocks)))
+
+
+def _tally_deps(block: BlockMetadata, by_name: Dict[str, BlockMetadata]):
+    """统计一个块的直接依赖，返回 `(聚合依赖数, 领域集合, 未解析依赖名列表)`。
+
+    - 聚合依赖数：`层级 >= AGGREGATE_LEVEL` 的依赖个数（L2 及以上）
+    - 领域集合：所有**可解析**依赖的 `领域` 并集（判"跨域"用）
+    - 未解析：名字在 `by_name` 里查不到的依赖（无法参与判定）
+
+    **按名字去重**：`依赖块` 里把同一个块写两遍在 G11 那边是过得去的
+    （对账用集合比较），但要是让它在这里记两次聚合依赖，`["L2甲","L2甲"]`
+    就能白蹭出一个"依赖 2 个 L2"的假 L3。
+    """
+    聚合数 = 0
+    领域 = set()
+    未解析 = []
+    for dep in sorted(set(block.dep_blocks)):
+        meta = by_name.get(dep)
+        if meta is None:
+            未解析.append(dep)
+            continue
+        领域.update(meta.domains)
+        if meta.level >= AGGREGATE_LEVEL:
+            聚合数 += 1
+    return 聚合数, 领域, 未解析
+
+
+def check_level_consistency(root=None, roots=None, blocks=None) -> List[str]:
+    """G13 扩展：声明 L3 的块，依赖结构必须真的够 L3（ADR-28 §3.1）。
+
+    L3 判定（满足其一即通过）：
+
+    1. 直接依赖 **>= 2 个 L2+ 聚合块**；或
+    2. 直接依赖 **>= 1 个 L2+ 聚合块**，且这些依赖**跨 >= 2 个领域**。
+
+    返回问题串列表，空 = 门禁绿。
+
+    **只查 `层级 == 3` 的块**：L0/L1/L2 的层级判定不在 ADR-28 范围内。既有
+    83 个 L0 / 19 个 L1 / 3 个 L2 块是在没有判定规则的年代写的，一刀切追溯
+    会把本轮变成大规模元数据返工，与 W29「只定规范 + 门禁」的边界不符。
+    L2 判定留待后续 ADR（真需要时连同存量一起收）。
+    """
+    blocks = _resolve_blocks(root, roots, blocks)
+    by_name = {b.name: b for b in blocks}
+    问题 = []
+    for b in blocks:
+        if b.level != L3_LEVEL:
+            continue
+        聚合数, 领域, 未解析 = _tally_deps(b, by_name)
+        通过 = (聚合数 >= 2) or (聚合数 >= 1 and len(领域) >= 2)
+        if 通过:
+            continue
+        细节 = ['L2+ 聚合依赖 %d 个' % 聚合数,
+                '依赖覆盖领域 %s' % ('/'.join(sorted(领域)) if 领域 else '无')]
+        if 未解析:
+            细节.append('未解析依赖 %s' % '、'.join(sorted(未解析)))
+        问题.append(
+            '块「%s」声明层级 %d（L3）但依赖结构不满足 L3 判定'
+            '（需 >=2 个 L2+ 依赖，或 >=1 个 L2+ 依赖且跨 >=2 领域；实测 %s）'
+            % (b.name, b.level, '，'.join(细节)))
+    return 问题
+
+
+def check_stability_propagation(root=None, roots=None, blocks=None) -> List[str]:
+    """G13 扩展：stable L3 不得依赖 experimental L2/L3（ADR-28 §3.2）。
+
+    这是 ADR-27 §2.5「stable 不得依赖 experimental」的**向上扩展**：那条规则
+    当时只写了规范没落校验，本函数把它在**聚合层**落地。返回问题串列表，
+    空 = 门禁绿。
+
+    刻意收窄的两处，都是为了不追溯存量（见 ADR-28 §5 已知欠账）：
+
+    - 只查**依赖方是 L3** 的情形。stable L2 依赖 experimental L1 是 v0.14.0
+      就有的既有形态（`工资条`→`税单`、`用户档案`→`姓名拆分`/`地址剖解`），
+      本轮不追溯，否则门禁一上线就是红的。
+    - 只查**被依赖方是 L2+** 的情形。stdlib 现有 26 个 experimental 的
+      L0/L1 原子块，跨域 L3 几乎不可能完全避开它们；聚合层的真风险来自
+      场景块之间的传递，不是叶子。
+
+    `deprecated` 依赖同样拒——它比 experimental 更糟（承诺要移除的东西，
+    stable 块不该压在上面）。
+    """
+    blocks = _resolve_blocks(root, roots, blocks)
+    by_name = {b.name: b for b in blocks}
+    问题 = []
+    for b in blocks:
+        if b.level != L3_LEVEL or b.stability != 'stable':
+            continue
+        for dep in sorted(b.dep_blocks):
+            meta = by_name.get(dep)
+            if meta is None or meta.level < AGGREGATE_LEVEL:
+                continue
+            if meta.stability != 'stable':
+                问题.append(
+                    'stable 的 L3 块「%s」依赖 %s 的 L%d 块「%s」'
+                    '（稳定性传递违规，ADR-28 §3.2：stable L3 的 L2+ 依赖'
+                    '必须也是 stable）'
+                    % (b.name, meta.stability, meta.level, dep))
+    return 问题
+
 
 
 # ---------------------------------------------------------------------------

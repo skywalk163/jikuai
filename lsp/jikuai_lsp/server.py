@@ -23,6 +23,11 @@ from .capabilities import (
     TEXT_DOCUMENT_SYNC_INCREMENTAL, COMMAND_SELECT_BLOCK,
 )
 
+# LSP SymbolKind（仅列本文件用到的）。数值出自 LSP 3.17 规范表。
+_SYMBOL_KIND_MODULE = 2
+_SYMBOL_KIND_CLASS = 5
+_SYMBOL_KIND_FUNCTION = 12
+
 # JSON-RPC 错误码（子集，只列本文件用到的）
 _ERR_METHOD_NOT_FOUND = -32601
 _ERR_INVALID_PARAMS = -32602
@@ -33,47 +38,73 @@ _jikuai_imported = False
 _SessionHost = None
 _TextDocumentStore = None
 _utf16_to_codepoint = None
+_codepoint_to_utf16 = None
 _to_lsp_diagnostic = None
 _complete_lsp = None
 _verb_documentation = None
 _keyword_documentation = None
+_verb_arity_text = None
 _ModuleLoader = None
 _blocks_root = None
 _ai_retrieval = None
 _schema = None
+_compile_source = None
+_VERB_ARITY = None
+_ADVERBS = None
+_ast_FuncDef = None
+_ast_ClassDef = None
+_ast_Import = None
 
 
 def _ensure_jikuai():
     """惰性导入主包的 service / completion / diagnostics / 块生态层。
 
     W14/W15 追加：`module_loader` / `pkg.blocks` / `ai.retrieval` / `service.schema`。
+    W32 追加：`frontend.compile_source`（documentSymbol 走 AST）、
+             `keywords.VERB_ARITY` + `completion.verb_arity_text`（signatureHelp
+             复用 completion.py 已有的动词元数查询）、`ast_nodes` 里的三类节点。
     """
     global _jikuai_imported, _SessionHost, _TextDocumentStore
-    global _utf16_to_codepoint, _to_lsp_diagnostic
+    global _utf16_to_codepoint, _codepoint_to_utf16, _to_lsp_diagnostic
     global _complete_lsp, _verb_documentation, _keyword_documentation
+    global _verb_arity_text
     global _ModuleLoader, _blocks_root, _ai_retrieval, _schema
+    global _compile_source, _VERB_ARITY, _ADVERBS
+    global _ast_FuncDef, _ast_ClassDef, _ast_Import
     if _jikuai_imported:
         return
     from jikuai.service import SessionHost, TextDocumentStore
-    from jikuai.service.position import utf16_to_codepoint
+    from jikuai.service.position import utf16_to_codepoint, codepoint_to_utf16
     from jikuai.service import schema
     from jikuai.diagnostics.adapters import to_lsp_diagnostic
     from jikuai.completion import (
-        complete_lsp, verb_documentation, keyword_documentation)
+        complete_lsp, verb_documentation, keyword_documentation,
+        verb_arity_text)
     from jikuai.module_loader import ModuleLoader
     from jikuai.pkg.blocks import blocks_root
     from jikuai.ai import retrieval as ai_retrieval
+    from jikuai.frontend import compile_source
+    from jikuai.keywords import VERB_ARITY, ADVERBS
+    from jikuai.ast_nodes import FuncDef, ClassDef, Import
     _SessionHost = SessionHost
     _TextDocumentStore = TextDocumentStore
     _utf16_to_codepoint = utf16_to_codepoint
+    _codepoint_to_utf16 = codepoint_to_utf16
     _to_lsp_diagnostic = to_lsp_diagnostic
     _complete_lsp = complete_lsp
     _verb_documentation = verb_documentation
     _keyword_documentation = keyword_documentation
+    _verb_arity_text = verb_arity_text
     _ModuleLoader = ModuleLoader
     _blocks_root = blocks_root
     _ai_retrieval = ai_retrieval
     _schema = schema
+    _compile_source = compile_source
+    _VERB_ARITY = VERB_ARITY
+    _ADVERBS = ADVERBS
+    _ast_FuncDef = FuncDef
+    _ast_ClassDef = ClassDef
+    _ast_Import = Import
     _jikuai_imported = True
 
 
@@ -153,11 +184,117 @@ def _uri_to_path(uri: str) -> Optional[str]:
     return path
 
 
+# ───── W32 · documentSymbol / signatureHelp 纯函数工具 ─────
+
+def _utf16_line_length(line_text: str) -> int:
+    """行文本的 UTF-16 code unit 总宽度（BMP 外字符算 2）。"""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in line_text)
+
+
+#: 语句终止符。signatureHelp 向前扫动词时不得跨越句号，
+#: 否则 `打印 1。加 ` 会把上一句的 `打印` 当成当前签名。
+_STATEMENT_ENDERS = '。;；'
+
+#: 参数推进分隔符：空格 / 制表符 / 中文逗号（管道 `，` 会把左值作为下一动词首参）。
+_ARG_SEPARATORS = ' \t，,'
+
+
+def _split_tokens(text: str):
+    """把文本切成 `(token, start_idx, end_idx)` 三元组（end 为开区间上界）。"""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] in _TOKEN_BOUNDARY:
+            i += 1
+            continue
+        start = i
+        while i < n and text[i] not in _TOKEN_BOUNDARY:
+            i += 1
+        out.append((text[start:i], start, i))
+    return out
+
+
+def _find_verb_before(left: str, verb_arity: Dict[str, int]):
+    """在光标左侧文本里找「当前动词调用」，返回 `(动词名, 动词结束索引)`。
+
+    识别顺序（从光标端往左）：
+      1. 先按语句终止符截断——不跨句取动词。
+      2. token 整体命中 VERB_ARITY（`加 1 2` 里的 `加`）。
+      3. token 以某个动词开头（免空格写法 `打印1` 里的 `打印`，取最长匹配）。
+    都不命中返回 `(None, -1)`。
+    """
+    if not left:
+        return None, -1
+    # 只看最后一句
+    cut = -1
+    for ch in _STATEMENT_ENDERS:
+        cut = max(cut, left.rfind(ch))
+    offset = cut + 1
+    segment = left[offset:]
+    tokens = _split_tokens(segment)
+    for token, start, end in reversed(tokens):
+        if token in verb_arity:
+            return token, offset + end
+        # 免空格调用：动词紧贴参数（`打印1`）。取最长前缀匹配，避免
+        # `大写` 抢在 `大写金额` 前面命中。
+        best = None
+        for length in range(len(token), 0, -1):
+            candidate = token[:length]
+            if candidate in verb_arity:
+                best = candidate
+                break
+        if best is not None:
+            return best, offset + start + len(best)
+    return None, -1
+
+
+def _count_arg_separators(tail: str) -> int:
+    """由「动词末尾到光标之间的文本」推断 0-based activeParameter。
+
+    规则：数已开始书写的参数个数。若 tail 以分隔符收尾，说明用户刚敲完
+    分隔符、准备写下一个参数 → 索引 = 已写参数数；否则最后那个参数正在
+    书写中 → 索引 = 已写参数数 - 1。
+    """
+    tokens = _split_tokens(tail)
+    written = len(tokens)
+    if tail and tail[-1] in _ARG_SEPARATORS:
+        return written
+    return max(0, written - 1)
+
+
+def _build_signature_parameters(verb: str, arity: int,
+                                is_adverb: bool) -> List[str]:
+    """按动词元数生成参数标签列表。命名与 `completion.verb_documentation` 同构。"""
+    if is_adverb or arity == -2:
+        # 副词是高阶操作：`列 ...，皆<动词> [初值]`
+        return ['<动词>', '[初值]']
+    if arity == -1:
+        return ['arg1', '…argN']
+    if arity <= 0:
+        return []
+    return [f'arg{i + 1}' for i in range(arity)]
+
+
+def _build_signature_label(verb: str, parameters: List[str],
+                           arity_text: str = '') -> str:
+    """签名首行：`加 arg1 arg2 · 2 元`。
+
+    元数短语放在参数之后并用 `·` 隔开——参数标签走**子串匹配**定位，
+    后缀里不含 `argN` 字样，不会误命中。
+    """
+    label = f'{verb} {" ".join(parameters)}' if parameters else verb
+    if arity_text:
+        label = f'{label} · {arity_text}'
+    return label
+
+
 class LspServer:
-    """极快 LSP 服务器（v0.15.0）。
+    """极快 LSP 服务器（v0.16.0 · W32）。
 
     支持：initialize / shutdown / exit / didOpen / didChange / didClose /
     textDocument/completion / textDocument/hover / textDocument/definition /
+    textDocument/documentSymbol / textDocument/signatureHelp /
     workspace/executeCommand / publishDiagnostics。
     """
 
@@ -229,6 +366,10 @@ class LspServer:
             self._handle_hover(msg_id, msg.get("params", {}))
         elif method == "textDocument/definition":
             self._handle_definition(msg_id, msg.get("params", {}))
+        elif method == "textDocument/documentSymbol":
+            self._handle_document_symbol(msg_id, msg.get("params", {}))
+        elif method == "textDocument/signatureHelp":
+            self._handle_signature_help(msg_id, msg.get("params", {}))
         elif method == "workspace/executeCommand":
             self._handle_execute_command(msg_id, msg.get("params", {}))
         elif msg_id is not None:
@@ -446,6 +587,199 @@ class LspServer:
                 "start": {"line": 0, "character": 0},
                 "end": {"line": 0, "character": 0},
             },
+        })
+
+    # ───── DocumentSymbol（W32） ─────
+
+    def _handle_document_symbol(self, msg_id: Any, params: Dict) -> None:
+        """遍历 AST 提取顶层三类符号：函数（FuncDef）、类（ClassDef）、导入（Import）。
+
+        返回 LSP `DocumentSymbol[]`（包含 `name`/`kind`/`range`/`selectionRange`）。
+        单文件即可，不做跨文件符号索引（rename/references 依赖这层跨文件表，
+        本轮不实现，见 README 缺口表 v0.17.0 计划）。
+
+        - 排序：按 AST 顺序，即源码书写顺序（`Program.body` 天然有序）。
+        - 编译失败：兜底走 `parse_with_import_whitelist`，实在拿不到 AST 就返回 []。
+        - Range/UTF-16：AST 携带 1-based 码点行列；用 `codepoint_to_utf16` 换算，
+          与 LSP 其它 handler 口径一致。
+        """
+        _ensure_jikuai()
+        host = self._get_host()
+        uri = params.get("textDocument", {}).get("uri", "")
+        text = host.store.get(uri) or ""
+        lines = host.store.lines_of(uri) or []
+        # 空文档 / 无行 → 空符号列表
+        if not lines:
+            self._send_response(msg_id, [])
+            return
+        ast = self._try_get_ast(text, uri)
+        if ast is None or not getattr(ast, 'body', None):
+            self._send_response(msg_id, [])
+            return
+        symbols: List[Dict] = []
+        for node in ast.body:
+            sym = self._ast_node_to_symbol(node, lines)
+            if sym is not None:
+                symbols.append(sym)
+        self._send_response(msg_id, symbols)
+
+    def _try_get_ast(self, text: str, uri: str):
+        """尽力拿到 AST；`compile_source` 内部对 ParseError 已兜底转诊断，
+        绝大多数情况下仍能返回合法 Program。彻底崩溃则返回 None。
+        """
+        try:
+            result = _compile_source(text, file=uri)
+            return result.ast
+        except Exception as e:
+            self._logger.debug("documentSymbol 编译失败：%s", e)
+            return None
+
+    def _ast_node_to_symbol(self, node, lines: List[str]) -> Optional[Dict]:
+        """把一个顶层 AST 节点投影成 LSP DocumentSymbol；不认识返回 None。"""
+        if isinstance(node, _ast_FuncDef):
+            return self._make_symbol(
+                name=node.name,
+                kind=_SYMBOL_KIND_FUNCTION,
+                start_line=getattr(node, 'line', 0) or 1,
+                start_col=getattr(node, 'col', 0) or 1,
+                end_line=getattr(node, 'end_line', 0)
+                or (getattr(node, 'line', 0) or 1),
+                lines=lines,
+                selection_name=node.name,
+            )
+        if isinstance(node, _ast_ClassDef):
+            return self._make_symbol(
+                name=node.name,
+                kind=_SYMBOL_KIND_CLASS,
+                start_line=getattr(node, 'line', 0) or 1,
+                start_col=getattr(node, 'col', 0) or 1,
+                # ClassDef 由 parser 显式标注 end_line（收尾 `。` 那一行）
+                end_line=getattr(node, 'end_line', 0)
+                or (getattr(node, 'line', 0) or 1),
+                lines=lines,
+                selection_name=node.name,
+            )
+        if isinstance(node, _ast_Import):
+            # module 允许 `蟒:os.path` / `blocks.数据.求和` 等；直接用作符号名。
+            module = getattr(node, 'module', '') or ''
+            if not module:
+                return None
+            return self._make_symbol(
+                name=module,
+                kind=_SYMBOL_KIND_MODULE,
+                start_line=getattr(node, 'line', 0) or 1,
+                start_col=getattr(node, 'col', 0) or 1,
+                end_line=getattr(node, 'line', 0) or 1,
+                lines=lines,
+                selection_name=module,
+            )
+        return None
+
+    def _make_symbol(self, name: str, kind: int, start_line: int, start_col: int,
+                     end_line: int, lines: List[str],
+                     selection_name: str) -> Dict:
+        """构造 DocumentSymbol 字典。
+
+        坐标换算：AST 是 1-based 码点，LSP 是 0-based UTF-16。
+        Range：起点 = 声明关键字位置（如 `函数`/`类`/`导入`），
+               终点 = end_line 行末（若 end_line == start_line 则同一行行末）。
+        SelectionRange：尝试在起始行内定位 selection_name 的位置，命中就用；
+        否则退化为 Range 起点后一位。
+        """
+        total_lines = len(lines)
+        s_line = max(1, min(start_line, total_lines))
+        e_line = max(s_line, min(end_line, total_lines))
+        start_line_text = lines[s_line - 1]
+        end_line_text = lines[e_line - 1]
+        start_char_utf16 = _codepoint_to_utf16(start_line_text, start_col)
+        end_char_utf16 = _utf16_line_length(end_line_text)
+        # 定位选择范围（selectionRange）
+        sel_line = s_line
+        sel_col_cp = start_col           # 兜底：从声明关键字开始
+        try:
+            idx = start_line_text.find(selection_name, start_col - 1)
+            if idx < 0:
+                # 声明关键字在关键字位置右侧找不到 name，退化到全行搜索
+                idx = start_line_text.find(selection_name)
+            if idx >= 0:
+                sel_col_cp = idx + 1
+        except Exception:
+            pass
+        sel_start_utf16 = _codepoint_to_utf16(start_line_text, sel_col_cp)
+        sel_end_utf16 = _codepoint_to_utf16(
+            start_line_text, sel_col_cp + len(selection_name))
+        return {
+            "name": name,
+            "kind": kind,
+            "range": {
+                "start": {"line": s_line - 1, "character": start_char_utf16},
+                "end": {"line": e_line - 1, "character": end_char_utf16},
+            },
+            "selectionRange": {
+                "start": {"line": sel_line - 1, "character": sel_start_utf16},
+                "end": {"line": sel_line - 1, "character": sel_end_utf16},
+            },
+        }
+
+    # ───── SignatureHelp（W32） ─────
+
+    def _handle_signature_help(self, msg_id: Any, params: Dict) -> None:
+        """光标处若在内建动词调用范围内 → 返回 SignatureHelp。
+
+        识别策略（保守而稳定，不依赖 AST）：
+          1. 取光标所在行 0..col-1 之间的文本片段。
+          2. 从该片段的**光标端**向前扫，找出第一个 VERB_ARITY 里的名字。
+             找不到 → null。
+          3. 命中的动词为「当前签名」，参数列表按 arity 生成 `arg1..argN`
+             （或 `-1` 时 `arg1..`）。副词按副词签名给出。
+          4. 通过统计动词末尾到光标之间的**空格/中文逗号**次数推断
+             `activeParameter`（管道 `，` 也算参数推进——极快语法里管道左侧
+             会作为下一动词的隐式首参）。
+        """
+        _ensure_jikuai()
+        host = self._get_host()
+        uri = params.get("textDocument", {}).get("uri", "")
+        pos = params.get("position", {})
+        lsp_line = int(pos.get("line", 0))
+        lsp_char = int(pos.get("character", 0))
+        lines = host.store.lines_of(uri) or []
+        if lsp_line < 0 or lsp_line >= len(lines):
+            self._send_response(msg_id, None)
+            return
+        line_text = lines[lsp_line]
+        cp_col = _utf16_to_codepoint(line_text, lsp_char)
+        # cp_col 是 1-based；取光标左侧内容（不含光标处字符）
+        left = line_text[:max(0, cp_col - 1)]
+        verb, verb_end_idx = _find_verb_before(left, _VERB_ARITY)
+        if verb is None:
+            self._send_response(msg_id, None)
+            return
+        arity = _VERB_ARITY.get(verb, 0)
+        is_adverb = verb in _ADVERBS
+        parameters = _build_signature_parameters(verb, arity, is_adverb)
+        # 元数短语直接复用 completion.py 的 `verb_arity_text`（只读查询）
+        label = _build_signature_label(verb, parameters, _verb_arity_text(verb))
+        # activeParameter：数动词末尾到光标之间的分隔符个数
+        tail = left[verb_end_idx:]
+        active = _count_arg_separators(tail)
+        # 副词或可变元数：最后一个 parameter 也可持续高亮
+        if parameters:
+            active = min(active, max(0, len(parameters) - 1))
+        else:
+            active = 0
+        signature = {
+            "label": label,
+            "documentation": {
+                "kind": "markdown",
+                "value": (_verb_documentation(verb)
+                          or f"**{verb}** —— 内建动词"),
+            },
+            "parameters": [{"label": p} for p in parameters],
+        }
+        self._send_response(msg_id, {
+            "signatures": [signature],
+            "activeSignature": 0,
+            "activeParameter": active,
         })
 
     # ───── ExecuteCommand（W15） ─────

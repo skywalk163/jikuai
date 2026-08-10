@@ -1,4 +1,4 @@
-# jikuai-lsp — 极快语言 Language Server（v0.15.0）
+# jikuai-lsp — 极快语言 Language Server（v0.16.0）
 
 极快（JiKuai）语言的 **Language Server Protocol** 实现，独立发行包。
 自实现最小 JSON-RPC over stdio（`transport.py`），**零第三方运行时依赖**。
@@ -51,6 +51,8 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 | `textDocument/completion` | 内建动词 / 关键字 / 用户名字 / `模块.成员`；触发字符 `.` 与 `，` |
 | `textDocument/hover` | 内建动词与关键字的中文 Markdown 说明；其他 token 返回 `null` |
 | `textDocument/definition` | `导入` / `从 … 导入` 语句里的点分块路径 → 块目录 URI；不命中返回 `null` |
+| `textDocument/documentSymbol` | 单文件 AST 遍历，提取函数（`函数`）/类（`类`）/导入（`导入`）三类顶层符号，含 `range` 与 `selectionRange`（W32） |
+| `textDocument/signatureHelp` | 光标位于内建动词调用范围内 → 返回签名与 `activeParameter`；复用 `completion.verb_arity_text` 元数查询；触发字符空格（W32） |
 | `workspace/executeCommand` | 命令 `极快.选块`：`{需求, top?}` → `{需求, 候选[]}`，与 `jk 块 选 --json` 同构 |
 
 ### 位置口径
@@ -91,12 +93,14 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 
 ## 已知缺口
 
+> 全量待办真源见 [`docs/BACKLOG.md`](../docs/BACKLOG.md) §1（含优先级与目标版本）。
+> 下表为快速索引；`rename`/`references`/`codeAction` 均已定于 v0.17.0。
+
 | 缺口 | 现状 |
 | --- | --- |
-| `textDocument/codeAction` | 未实现。v0.15.0 WBS 标为可选，本轮跳过 |
-| `textDocument/rename` / `references` | 未实现。需要跨文件符号表，依赖后续 workspace 索引 |
-| `documentSymbol` / `foldingRange` | 未实现 |
-| `signatureHelp` | 未实现。动词元数信息已有（`completion.verb_arity_text`），差协议层接线 |
+| `textDocument/codeAction` | 未实现。v0.15.0 WBS 已判定可选并跳过，v0.16.0 W32 复审后仍**推迟到 v0.17.0**——无新证据说明必要性，先把跨文件符号表的坑填了再说 |
+| `textDocument/rename` / `references` | 未实现。**推迟到 v0.17.0**——需要跨文件符号表 + 引用图，是独立的大工程，本轮不做增量补丁式的半吊子实现 |
+| `foldingRange` | 未实现 |
 | 增量诊断 | `didChange` 走增量同步，但诊断仍是整篇重编译 |
 | 多根 workspace | `definition` 只查 `blocks_root()` 与文档自身目录，不解析 `workspaceFolders` |
 | pull-based 诊断 | `diagnosticProvider: false`。诊断只走服务端 push |
@@ -115,6 +119,7 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 | v0.6.0 M5（F3 冻结点） | `textDocumentSync`(Full) + `completionProvider` + `hoverProvider` |
 | v0.15.0 W14 | 新增 `definitionProvider`；`textDocumentSync.change` 1 → 2 |
 | v0.15.0 W15 | 新增 `executeCommandProvider`（`极快.选块`） |
+| v0.16.0 W32 | 新增 `documentSymbolProvider`、`signatureHelpProvider`（触发字符空格） |
 
 ## 技术栈选型
 
@@ -137,6 +142,8 @@ python -m pytest tests/test_lsp_hover.py -q                # hover
 python -m pytest tests/test_lsp_definition.py -q           # definition
 python -m pytest tests/test_lsp_incremental_sync.py -q     # 增量同步
 python -m pytest tests/test_lsp_execute_command.py -q      # 极快.选块
+python -m pytest tests/test_lsp_document_symbol.py -q      # documentSymbol（W32）
+python -m pytest tests/test_lsp_signature_help.py -q       # signatureHelp（W32）
 python -m pytest tests/test_lsp_capabilities_freeze.py -q  # 能力冻结契约
 ```
 

@@ -473,3 +473,162 @@ def test_安全提示文案含关键风险():
     """启动横幅必须点明「无鉴权」「执行任意代码」「别绑 0.0.0.0」三件事。"""
     for 关键 in ('无鉴权', '执行', '0.0.0.0', '本地'):
         assert 关键 in server.SAFETY_NOTICE
+
+
+# ---- 方案存档端点（W31）-------------------------------------------------
+
+@pytest.fixture()
+def 存档目录(tmp_path, monkeypatch):
+    """把存档目录指向 tmp_path 子目录，不污染真实 ~/.jikuai。"""
+    根 = str(tmp_path / 'web-方案')
+    monkeypatch.setenv(server.PLANS_DIR_ENV, 根)
+    return 根
+
+
+def _存方案(服务, 方案=None, 标题=None):
+    """辅助：存一份方案，返回 (状态, data)。"""
+    body = {'方案': 方案 or _方案求和}
+    if 标题:
+        body['标题'] = 标题
+    return _JSON(服务, 'POST', '/api/方案/存', body)
+
+
+def test_方案_存取列删_端到端(服务, 存档目录):
+    """主链路：存 → 列 → 取 → 删 → 列空。"""
+    状态, 存 = _存方案(服务, 标题='测试方案一')
+    assert 状态 == 200, 存
+    assert server.ID_PATTERN.match(存['id'])
+    assert 存['标题'] == '测试方案一'
+    assert 存['时间戳']
+
+    # 列
+    状态, 列 = _JSON(服务, 'GET', '/api/方案/列')
+    assert 状态 == 200
+    assert len(列['方案列表']) == 1
+    assert 列['方案列表'][0]['id'] == 存['id']
+
+    # 取
+    状态, 取 = _JSON(服务, 'GET', '/api/方案/' + 存['id'])
+    assert 状态 == 200
+    assert '方案' in 取
+    assert 取['方案']['步骤']
+
+    # 删
+    状态, 删 = _JSON(服务, 'DELETE', '/api/方案/' + 存['id'])
+    assert 状态 == 200
+    assert 删['id'] == 存['id']
+
+    # 列空
+    状态, 列 = _JSON(服务, 'GET', '/api/方案/列')
+    assert 状态 == 200
+    assert 列['方案列表'] == []
+
+
+def test_方案_存_无标题则取需求(服务, 存档目录):
+    """不传 `标题` 时，自动从方案 `需求` 字段提取。"""
+    状态, 存 = _存方案(服务)
+    assert 状态 == 200
+    assert 存['标题'] == '把一批数求和'
+
+
+def test_方案_取_不存在404(服务, 存档目录):
+    状态, data = _JSON(服务, 'GET', '/api/方案/aabbccdd12345678')
+    assert 状态 == 404
+    assert '不存在' in data['错误']
+
+
+def test_方案_删_不存在404(服务, 存档目录):
+    状态, data = _JSON(服务, 'DELETE', '/api/方案/aabbccdd12345678')
+    assert 状态 == 404
+    assert '不存在' in data['错误']
+
+
+@pytest.mark.parametrize('坏id', [
+    '../../etc/passwd',
+    '..%2f..%2fetc%2fpasswd',
+    '/etc/passwd',
+    'C:\\Windows\\win.ini',
+    'CON',
+    'aabb..ccdd',
+    'AABBCCDD12345678',   # 大写 hex 不在白名单
+    'short',              # 太短 (<8)
+    'x' * 100,           # 太长 (>64)
+    '12345678/../../etc',
+    '123456789' + '\x00' + 'abc',
+])
+def test_方案_穿越攻击被拒(服务, 存档目录, 坏id):
+    """路径穿越 / 非法 id 必须被白名单正则拦住，返回 400/404，不落盘。"""
+    # GET
+    状态, _, _ = _请求(服务, 'GET', '/api/方案/' + 坏id)
+    assert 状态 in (400, 404), '坏 id %r 竟然返回 %d（GET）' % (坏id, 状态)
+    # DELETE
+    状态, _, _ = _请求(服务, 'DELETE', '/api/方案/' + 坏id)
+    assert 状态 in (400, 404), '坏 id %r 竟然返回 %d（DELETE）' % (坏id, 状态)
+    # 确认没有什么被写入存档目录
+    根 = 存档目录
+    if os.path.isdir(根):
+        assert all(
+            server.ID_PATTERN.match(n[:-5]) if n.endswith('.json') else True
+            for n in os.listdir(根)
+        ), '穿越攻击后存档目录出现了非白名单文件'
+
+
+def test_方案_存_坏方案被拒(服务, 存档目录):
+    """存的方案必须过 schema.ensure_plan，坏方案不落盘。"""
+    状态, data = _JSON(服务, 'POST', '/api/方案/存', {'方案': {'乱来': True}})
+    assert 状态 == 400
+    assert '步骤' in data['错误'] or '未知字段' in data['错误']
+
+
+def test_单页含历史侧栏与保存按钮(服务):
+    """W31 单页交互的静态自证：保存按钮、历史容器、无障碍 label 都在。
+
+    没有 headless 浏览器（会引入 pip 依赖），所以只做 DOM 契约的静态断言：
+    `app.js` 拿这几个 id 做 `$()`，id 掉了整页 JS 会在启动时炸。
+    """
+    _状态, 页, _ = _请求(服务, 'GET', '/')
+    正文 = 页.decode('utf-8')
+    for id in ('btn-save', 'hist', 'hist-list', 'hist-hint'):
+        assert 'id="%s"' % id in 正文, '单页缺少 #%s' % id
+    # 无障碍：侧栏有可读 label，列表有 role
+    assert 'aria-label="已保存方案列表"' in 正文
+    assert 'role="list"' in 正文
+
+    _状态, 脚本, _ = _请求(服务, 'GET', '/app.js')
+    js = 脚本.decode('utf-8')
+    for 端点 in ('/api/方案/存', '/api/方案/列', '/api/方案/'):
+        assert 端点 in js, 'app.js 没接 %s' % 端点
+    # 删除走 DELETE 而不是 POST
+    assert "method: 'DELETE'" in js
+
+
+def test_方案_体积上限断言():
+    """常量在模块上——单条 64 KB，总量 4 MB，条数 200。"""
+    assert server.MAX_PLAN_BYTES == 64 * 1024
+    assert server.MAX_STORE_BYTES == 4 * 1024 * 1024
+    assert server.MAX_PLAN_COUNT == 200
+
+
+# ---- 单页 gzip 体积上限 -------------------------------------------------
+
+def test_单页gzip体积不超18KB():
+    """单页（`index.html` + `app.js`）gzip 总体积 ≤18 KB。
+
+    这条自动化断言保障「零框架、无 CDN」的品牌主张：一旦有人偷偷引了 React
+    或 Tailwind，gzip 立刻超限。上限从 v0.15.0 的 15 KB 提高到 18 KB，
+    为 W31 历史侧栏 + 保存按钮留了交互额度。
+    """
+    import gzip
+    根 = server.static_root()
+    总 = 0
+    for 名 in ('index.html', 'app.js'):
+        路径 = os.path.join(根, 名)
+        if not os.path.isfile(路径):
+            pytest.skip('%s 不存在' % 名)
+        with open(路径, 'rb') as f:
+            原 = f.read()
+        压 = gzip.compress(原, compresslevel=9)
+        总 += len(压)
+    上限 = 18 * 1024
+    assert 总 <= 上限, '单页 gzip 总体积 %d 字节，超过上限 %d 字节' % (总, 上限)
+

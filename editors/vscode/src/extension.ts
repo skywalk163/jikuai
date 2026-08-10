@@ -5,7 +5,10 @@
 //   2. 以 stdio 方式拉起 `python -m jikuai_lsp`（M5-P1 已交付的 LSP Server）；
 //   3. 注册 `jikuai` 类型的调试适配器工厂，把 `python -m jikuai_dap`
 //      作为 DAP 后端接入 VS Code 的调试 UI（M6-P3 · ADR-20）；
-//   4. LSP / DAP 启动失败时降级到「仅语法高亮」，给出可操作提示，
+//   4. 注册命令面板命令 `极快.选块`（W33）：输入框收需求 → LSP
+//      `workspace/executeCommand: 极快.选块` → QuickPick 候选 →
+//      插入 `从 blocks.X.Y 导入 Z。` 到光标处（无编辑器时退回剪贴板）；
+//   5. LSP / DAP 启动失败时降级到「仅语法高亮」，给出可操作提示，
 //      不让扩展整体崩溃。
 //
 // 安全考虑：
@@ -29,6 +32,37 @@ const LANGUAGE_ID = 'jikuai';
 
 /** 调试类型（与 package.json 的 contributes.debuggers[].type 对齐） */
 const DEBUG_TYPE = 'jikuai';
+
+/**
+ * 「选块」命令 ID（与 package.json 的 contributes.commands[].command 以及
+ * LSP 端 `workspace/executeCommand` 的 command 名三处对齐）。
+ * LSP 契约见 `lsp/README.md` §`极快.选块`：`{需求, top?}` → `{需求, 候选[]}`。
+ */
+const COMMAND_SELECT_BLOCK = '极快.选块';
+
+/** LSP `极快.选块` 命令返回的单条候选（字段真源：`src/jikuai/service/schema.py`）。 */
+interface BlockCandidate {
+    名称: string;
+    领域: string;
+    层级: number;
+    描述: string;
+    分数: number;
+    路径?: string;
+    命名空间?: string;
+    /**
+     * 导出名。**注意**：当前 LSP `极快.选块` 响应的候选 schema
+     * （`schema.CANDIDATE_REQUIRED`）并不含此字段——见下方 `buildImportStatement`
+     * 的降级说明。保留此可选字段是为将来协议补齐时无需改客户端。
+     */
+    导出名?: string;
+}
+
+/** LSP `极快.选块` 命令的响应信封（`schema.make_select_envelope`）。 */
+interface SelectEnvelope {
+    需求: string;
+    候选: BlockCandidate[];
+    降级说明?: string;
+}
 
 /** 当前 LanguageClient 实例；未启用或启动失败时为 undefined。 */
 let client: LanguageClient | undefined;
@@ -113,6 +147,105 @@ class JiKuaiDebugConfigurationProvider
 }
 
 /**
+ * 由候选构造要插入编辑器的导入语句：`从 blocks.<领域>.<块名> 导入 <导出名>。`
+ *
+ * 降级说明（技术取舍，务必知悉）：
+ *   LSP `极快.选块` 响应的候选 schema（`schema.CANDIDATE_REQUIRED` =
+ *   名称/领域/层级/描述/分数/路径）**不含 `导出名`**。而块的目录名（`名称`）
+ *   与调用用的 `导出名` 允许不同（例如「个税」块导出「缴税」）。因此这里在
+ *   缺 `导出名` 时只能用 `名称` 兜底——生成的 `导入 <名称>` 对导出名与目录名
+ *   同名的块正确，对二者不同的块则需用户手动改成真实导出名。
+ *   彻底修复须由架构侧在候选 schema 增补 `导出名` 字段（已作为《实现反馈》
+ *   回传，不在本任务擅自改协议）。
+ */
+function buildImportStatement(候选: BlockCandidate): string {
+    const 领域 = 候选.领域;
+    const 块名 = 候选.名称;
+    const 导出名 = 候选.导出名 && 候选.导出名.trim() !== '' ? 候选.导出名 : 块名;
+    return `从 blocks.${领域}.${块名} 导入 ${导出名}。`;
+}
+
+/**
+ * 命令 `极快.选块` 的实现，完整交互链路：
+ *   输入框（showInputBox 收需求）
+ *     → LSP `workspace/executeCommand: 极快.选块`（{需求, top}）
+ *     → QuickPick（每条显示 名称/领域/层级/分数/描述）
+ *     → 选中后把导入语句插入当前编辑器光标处；无活动编辑器时退回复制到剪贴板。
+ *
+ * 前置：LSP 必须已启动（`极快.lsp.enabled=true` 且 `python -m jikuai_lsp` 拉起成功）。
+ * 未启动时给出可操作提示，不静默失败。
+ */
+async function selectBlockCommand(): Promise<void> {
+    if (!client) {
+        void vscode.window.showWarningMessage(
+            '极快选块：LSP 未启动，无法检索。请确认 `极快.lsp.enabled` 为 true '
+            + '且已 `pip install -e lsp/`（详见 docs/LSP-使用.md）。',
+        );
+        return;
+    }
+
+    const 需求 = await vscode.window.showInputBox({
+        title: '极快：选块',
+        prompt: '描述你要做的事，例如「把一批数字求和再算平均」',
+        placeHolder: '输入需求后回车…',
+        ignoreFocusOut: true,
+    });
+    if (需求 === undefined || 需求.trim() === '') {
+        return; // 用户取消或空输入
+    }
+
+    let envelope: SelectEnvelope | undefined;
+    try {
+        envelope = await client.sendRequest<SelectEnvelope>(
+            'workspace/executeCommand',
+            { command: COMMAND_SELECT_BLOCK, arguments: [{ 需求: 需求.trim(), top: 8 }] },
+        );
+    } catch (error) {
+        // LSP 端对空需求 / 非法 top 回 -32602，未知命令回 -32601；两者都会走到这里。
+        const detail = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`极快选块：检索失败 —— ${detail}`);
+        return;
+    }
+
+    const 候选列表 = envelope?.候选 ?? [];
+    if (候选列表.length === 0) {
+        void vscode.window.showInformationMessage(
+            `极快选块：「${需求.trim()}」没有匹配到候选块。`,
+        );
+        return;
+    }
+
+    const items: (vscode.QuickPickItem & { 候选: BlockCandidate })[] = 候选列表.map((c) => ({
+        label: `${c.名称}（${c.领域}）`,
+        description: `L${c.层级} · 分 ${c.分数}`,
+        detail: c.描述,
+        候选: c,
+    }));
+
+    const picked = await vscode.window.showQuickPick(items, {
+        title: `极快：选块 — ${envelope?.需求 ?? 需求.trim()}`,
+        placeHolder: '选择一个块，插入 `从 blocks.… 导入 …` 语句',
+        matchOnDescription: true,
+        matchOnDetail: true,
+    });
+    if (!picked) {
+        return; // 用户取消
+    }
+
+    const 语句 = buildImportStatement(picked.候选);
+    const editor = vscode.window.activeTextEditor;
+    if (editor) {
+        await editor.edit((b) => b.insert(editor.selection.active, 语句));
+        void vscode.window.showInformationMessage(`极快选块：已插入 ${语句}`);
+    } else {
+        await vscode.env.clipboard.writeText(语句);
+        void vscode.window.showInformationMessage(
+            `极快选块：无活动编辑器，已复制到剪贴板 —— ${语句}`,
+        );
+    }
+}
+
+/**
  * 扩展激活入口。
  *
  * 边界条件：
@@ -131,7 +264,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ),
     );
 
-    // ---- 2. LSP ----
+    // ---- 2. 注册命令面板命令（W33）----
+    // 无条件注册：LSP 关闭 / 启动失败时命令本身仍可被调起，由 selectBlockCommand
+    // 内部给出「LSP 未启动」的可操作提示。若放到 LSP 启动成功之后再注册，
+    // 用户在命令面板里会看到「command not found」这种毫无线索的报错。
+    context.subscriptions.push(
+        vscode.commands.registerCommand(COMMAND_SELECT_BLOCK, selectBlockCommand),
+    );
+
+    // ---- 3. LSP ----
     const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
     const lspEnabled = config.get<boolean>('lsp.enabled', true);
     if (!lspEnabled) {

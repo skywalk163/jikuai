@@ -1,5 +1,109 @@
 # 极快 JiKuai · 变更日志
 
+## v0.16.0（2026-08-10）· 发布卫生归零 + 链式召回真度量 + L3 场景块 + LSP 二阶
+
+> WBS 见 `docs/v0.16.0-WBS.md`；复盘见 `docs/v0.16-复盘.md`。
+> 全量回归 **1912 passed / 34 skipped**；契约门禁 **G10 + G11 + G12 + G13 + G13+ + G14 + G15 七门全绿**（`scripts/check_stdlib_contract.py` exit 0）。块库 **105 → 108**。
+
+### Breaking Change（先看这段）
+
+1. **`块.json` 的 `层级` 允许取 3**。此前上限为 2。校验逻辑随之增强：声明 `层级=3` 必须满足 ADR-28 §3.1 判定（依赖 ≥2 个 L2，或 ≥1 个 L2 且依赖领域并集跨 ≥2 域），**层级虚标会被门禁拒**。若你的第三方块之前靠不校验蒙过，升级后需补齐 `依赖块`
+2. **G13+ 三条新校验并入 `check_stdlib_contract.py`**：依赖环检测、层级一致性、稳定性传递（stable L3 不得依赖 experimental L2/L3）。**存量块库中若有依赖环或层级虚标，升级后 CI 立刻红** —— 这是有意为之
+3. **G15 版本一致性门禁**：`_version.__version__` / `pyproject` / `CHANGELOG` 最新条目 / `editors/vscode/package.json` 四处必须一致。**改版本号只改一处（`src/jikuai/_version.py`）**，其余三处需同步
+4. **`pyproject.toml` 改 `dynamic = ["version"]`**。静态解析 `version = "x.y.z"` 的下游脚本会读不到字面量，需改读 `jikuai._version.__version__` 或走构建后 metadata
+5. **LSP capabilities 新增两键**：`documentSymbolProvider` / `signatureHelpProvider`。依赖 `freeze_signature()` 冻结值的客户端需同步更新期望
+6. **Web 新增 4 个写端点** + `service/schema.py` 新增 `make_saved_plan` / `make_saved_plan_summary` / `make_saved_plan_list` 三个构造器。旧五端点行为未变
+
+**迁移建议**：先跑 `python scripts/check_stdlib_contract.py` 看七门哪条红，按报错逐条修；版本号只动 `_version.py`。
+
+### 发布卫生（W25-W26）
+
+- **版本号单一真源**：新增 `src/jikuai/_version.py`，`pyproject.toml` 改 `dynamic = ["version"]` 经 `[tool.setuptools.dynamic]` 引用。此前 `pyproject` / `__init__` / `main` / `editors/vscode/package.json` 四处停在 `0.6.0` 未随 v0.7.0-v0.15.0 同步，`jk --version` 与实际发布版本长期不符（**脱节达九个版本**）
+- **G15 门禁上线**：`scripts/check_stdlib_contract.py` 增校验四处一致，任一处漂移 CI 红；`tests/test_version_consistency.py` 4 条含反向用例（故意改坏 vscode/CHANGELOG 版本号必须被抓出）
+- `BLOCK_INDEX_VERSION` 保持独立于语言版本（v0.12.0 起的既定解耦），已在 `_version.py` 与 `blocks.py` 双向注明
+- 删除误建目录 `--check/`（`generate_block_index.py --check` 参数被当路径的产物）；`.gitignore` 加 `--*/` 兜底
+- **提交规约固化**：`scripts/check_commit_msg.py` 拦空 message / `$(...)` 命令替换字面量 / heredoc 起始；`docs/贡献指南.md` §3 补 PowerShell 正确写法（`-F <文件>` 或多个 `-m`）
+
+#### 勘误
+
+- commit `a299768`（v0.15.0 收官）的 message 因在 PowerShell 下误用 bash heredoc 而变成字面量 `$(cat <<'EOF'`。该 commit 已推双远端，**不追改公共历史**（代价大于收益），改以 `git notes` 补语义说明。其实际内容为：CHANGELOG v0.15.0 段 + `docs/v0.14-v0.15-复盘.md` + tag `v0.15.0` 及双远端推送
+
+### 链式召回真度量（W27）
+
+- `tools/ai-bridge/bench_retrieval_chain.py`（新）：三指标 —— **步覆盖率** / **序列完整命中率** / **顺序保真度**（宽松偏序），三臂对照 × K=3/5/10 三档
+- `tools/ai-bridge/评测集-链式-留出.json`（新，17 条）：与调优集零重叠，供无污染裁判
+- 原 `评测集-链式.json` 在 `bench_retrieval.py` 下全 0.0 的根因已闭环：评测 schema（单块召回）与数据集 schema（多步序列）不匹配，**不是回归**。`bench_retrieval.py` 未改动
+- 留出集实测（K=5）：TF-IDF 步覆盖 **94.1%** / 完整命中 **88.2%**，神经 55.9% / 35.3%，关键词 44.1% / 23.5%。**TF-IDF 臂在链式任务上泛化最稳**——与单块召回上神经胜出的结论相反，记为设计判断的证伪点
+- 神经臂在无 embedding 环境下优雅降级为「跳过」，不阻断另两臂（CI 硬要求）
+
+### 内建文件 I/O 落地（W28）
+
+- `写入` / `读取` 两个内建动词在 `evaluator.py` 实现（此前仅在 `keywords.py` 声明，运行期抛「未知动词」）
+- **安全边界复用 pybridge 同一套判定**：`pybridge._validate_script_path(path, os.getcwd())` —— 拒绝绝对路径 / `..` 段 / 跨盘符；`读取` 加 10 MiB 上限；诊断路径经 `_scrub_paths` 脱敏。**无新增旁路 flag 或环境变量**
+- 新诊断码 `JK-E4002`（路径越界）/ `JK-E4003`（超大小限），已登记 `docs/诊断编码表.md`
+- `stdlib/blocks/数据/存文/` 与 `载入/` 脱离 pybridge 换路，`.py` 背衬删除，改纯 `.jk`；`块.json` 元数据未变
+- `tests/test_builtin_io.py`（17 条）+ `tests/test_commit_msg_check.py`（6 条）
+
+### L3 聚合块（W29-W30）
+
+- **ADR-28 L3 聚合块规范**：层级判定 / 稳定性传递 / 深度上限（**只开到 L3，开 L4 须另立 ADR**）/ 依赖声明沿用既有 `依赖块` 字段（叶名，与 G11 对账同口径）/ 参数按 ADR-26 类型词表收敛
+- **G13+ 三条新门禁**：`check_dependency_acyclic`（三色 DFS 找环，环体按字典序最小旋转去重）、`check_level_consistency`（层级虚标）、`check_stability_propagation`（stable L3 不得依赖 experimental）
+- **3 个 L3 场景块**（均 `experimental`，首版未经业务打磨故保守）：
+  - `财务/报销单`（导出 `报单`）— 依赖 工资条(L2)·求和·日序·金额雅写，领域并集 财务·数据·历法·中文
+  - `财务/工资册`（导出 `薪册`）— 依赖 工资条(L2)·批量统计·金额报表
+  - `财务/客户对账`（导出 `对账`）— 依赖 月结单(L2)·分组·状态判定（网络块本地 mock，不发真请求）
+- `jk 块 新建` 脚手架补 `--依赖` 参数：写 `块.json.依赖块` **并**自动生成对应 `导入` 行，落地即过 G11 对账
+- `examples/scenarios/` +3 个端到端 demo；索引 **105 → 108**（L0×83 / L1×19 / L2×3 / L3×3），向量索引同步重跑（108×768 维，163.1 KB）
+- **粘合器对 L3 覆盖率如实报数**：末步整体链式命中 **0/3 = 0.0%**，入参槽级自动填充 **7/20 = 35.0%**。远低于 v0.14 的 ≥60% 基线 —— 根因是 L3 有 5-8 个同型 `数` 入参（贷款额/月薪/年月日），纯类型图无从区分同型不同义的槽。**这正是 ADR-28 §3.3「不开 L4，先看 L3 数字」的证据基础**
+
+### Web UI 可写化（W31）
+
+- **评估结论：不引框架**。五条可写化交互（编辑/保存/列历史/删历史/恢复）逐条判定原生 JS 全部胜任 —— 历史侧栏是严格单向数据流，服务端列表即唯一真相，DOM 整体重建，不存在框架真正解决的问题（双向绑定/虚拟 DOM diff/客户端路由）。且 React 运行时 ~40 KB gzip 单是运行时就击穿上限
+- 4 个新端点（全走 `service/schema.py`，通道内零字面量）：`POST /api/方案/存`、`GET /api/方案/列`、`GET /api/方案/<id>`、`DELETE /api/方案/<id>`
+- **安全**：仍只监听 `127.0.0.1`；id 白名单 `^[0-9a-f]{8,64}$`（unquote 后才校验，`..%2f` 已还原为 `../` 再被拒）；路径 abspath 归一 + 双重前缀/直接子文件校验；三道体积闸（单档 64 KiB / 总量 4 MiB / 条数 200）；原子替换落盘；**id 由服务端 `uuid4().hex` 生成，不接受调用方指定**
+- 单页 gzip **16.28 KB**（上限从 15 提到 18 KB，余量 1.72 KB）；无框架无 CDN 外链；历史条用平级双 `<button>` + `aria-label`
+- `tests/test_web_server.py` 33 → 56 条，含 11 参数化穿越用例 × GET/DELETE 两动词
+
+### LSP 二阶能力（W32）
+
+- `textDocument/documentSymbol`：遍历 AST 提取 函数 / 类 / 导入 三类符号（SymbolKind 12/5/2），码点位置经 `codepoint_to_utf16` 换算
+- `textDocument/signatureHelp`：复用 `completion.verb_arity_text` / `verb_documentation` + `keywords.VERB_ARITY`；触发字符选空格（`，` 已被 completion 占用为管道触发）
+- `capabilities.freeze_signature()` 同步更新（W13 立的规矩：caps 变了必须改冻结用例）
+- `lsp/README.md` 缺口表移出这两项；**明确标注 `rename` / `references` / `codeAction` 推迟 v0.17.0** 及各自理由
+- `tests/test_lsp_document_symbol.py`（6 条）+ `tests/test_lsp_signature_help.py`（6 条）
+
+### VS Code 扩展 · 清 v0.15.0 W16 欠账（W33）
+
+- `extension.ts` 补命令面板 `极快: 选块`：输入框 → LSP `workspace/executeCommand: 极快.选块` → QuickPick（名称/领域/L层级/分数/描述）→ **插入 `从 blocks.X.Y 导入 Z。` 到光标处**，无活动编辑器时退回剪贴板
+- 命令**无条件注册**：LSP 挂了时命令面板仍可见，选中给可读中文提示而非 `command not found`
+- `editors/vscode/build.ps1`（新）：一键 `npm install; npx vsce package`，含 node/npm 前置检查与失败可操作提示
+- `docs/LSP-使用.md`（新，原 W16 未交付产物）：三步装扩展 + 常见问题（Python 路径 / LSP 未装降级 / 中文输入法触发字符 / 日志排查）+ 装完能力清单
+- **已知限制**：`.vsix` **本次未实际产出** —— 主开发机无 Node.js 工具链，脚本与 extension.ts 为纸面产物未经真实执行。四点 DoD（诊断/hover/F12/选块）均为「代码就绪待人工验证」
+- **已知限制**：候选 schema 不含 `导出名`，而块目录名与导出名允许不同（如「个税」块导出「缴税」）。`buildImportStatement` 优先读可选 `导出名` 字段，缺失时用 `名称` 兜底 —— 目录名≠导出名的块需用户手改。彻底修法要为候选补 `导出名` 并同步 CLI/Web/LSP 三边，记入 BACKLOG
+
+### 文档与 CI（W34-W35）
+
+- `README.md` 项目结构图重画：覆盖 15 个顶级目录/子包（此前只列 v0.3.x 时代的 8 个文件，`service/` `ai/` `diagnostics/` `pkg/` `tools/` 全缺）；场景脚本数 3 → 6 平铺 + 4 目录；标注块数 108
+- **`docs/BACKLOG.md`（新）：唯一待办真源**，收敛 28 条 / 8 类，每条标来源文件路径。原散落四处（复盘 §5、`lsp/README.md` 缺口表、`docs/包管理.md`、`docs/语法参考.md` §13.2）改为链接 + 摘要
+- 文档 lint：81 条相对链接**零死链**；ADR 文件级引用零死链（14 个只在正文被引用而无独立 `.md` 的编号记为文档债，非死链）
+- 内部 WBS 术语（`W16（待做）` 等）从面向用户的文档清理
+- **CI 加 `windows-latest` job**（Python 3.12 单版本）：`PYTHONIOENCODING=utf-8` 解 GBK 乱码；**skip 数上限守卫 = 40**（本机实测 34 + 6 余量，防整文件被 collect-skip 的静默事故）；不装 gcc（AOT e2e 允许 skip），Linux job 的「gcc 可见 + AOT 零 skip」守卫原样保留
+- CI 门禁清单注释同步为 G10/G11/G12/G13/G13+/G14/G15
+
+### 发布数字（四套 bench，块库 108，神经臂全程在线）
+
+单块召回 · 主评测集（56 条，top=5）：
+- 关键词 R@1 50.0% / R@3 64.3% / MRR 0.5774
+- TF-IDF **R@1 67.9% / R@3 100.0% / MRR 0.8185**（R@3=1.0 系主集过拟合，留出集才是裁判）
+- 神经 R@1 62.5% / R@3 80.4% / MRR 0.7277
+
+单块召回 · 留出集（25 条，top=5，**唯一无污染裁判**）：
+- 关键词 R@1 48.0% / R@3 60.0% / MRR 0.5573
+- TF-IDF R@1 64.0% / R@3 76.0% / MRR 0.6867
+- 神经 **R@1 64.0% / R@3 80.0% / MRR 0.7300** —— 神经在留出集 R@3 仍胜 TF-IDF 4.0 pp，保持 v0.13.0 W8 首次达成的优势
+
+链式（步覆盖率 / 完整命中率 / 顺序保真度）：见上「链式召回真度量」段；**结论：单块任务神经胜，链式任务 TF-IDF 胜**
+
 ## v0.15.0（2026-08-10）· LSP 深化 + Web UI 零依赖 + 生态开放
 
 ### LSP 补齐

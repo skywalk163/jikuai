@@ -18,13 +18,14 @@ AC-104：`import jikuai` 只做模块导入，**不**触发任何 `load`，
 也不建立全局可变状态；`load` 每次返回独立的模块对象。
 """
 
+from ._version import __version__
 from .errors import ErrorCategory, ErrorFormatter, ErrorInfo
 from .evaluator import JiKuaiError
 from .main import main, repl, run_file, run_source
 from .pybridge import load
 
-__version__ = "0.6.0"
 __all__ = [
     'run_source', 'run_file', 'repl', 'main',
     'load', 'JiKuaiError', 'ErrorInfo', 'ErrorCategory', 'ErrorFormatter',
+    '__version__',
 ]

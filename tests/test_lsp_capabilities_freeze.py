@@ -9,6 +9,7 @@
     v0.6.0  M5 F3 冻结点：textDocumentSync(Full) + completion + hover
     v0.15.0 W14：+definitionProvider，textDocumentSync.change 1→2
     v0.15.0 W15：+executeCommandProvider（极快.选块）
+    v0.16.0 W32：+documentSymbolProvider，+signatureHelpProvider（触发字符空格）
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-#: v0.15.0（W13+W14+W15）冻结签名的**完整**期望值。改这里等于改对外契约。
+#: v0.16.0（W13+W14+W15+W32）冻结签名的**完整**期望值。改这里等于改对外契约。
 EXPECTED_FREEZE = {
     'completionProvider': {
         'resolveProvider': False,
@@ -45,11 +46,15 @@ EXPECTED_FREEZE = {
     },
     'definitionProvider': True,
     'diagnosticProvider': False,
+    'documentSymbolProvider': True,
     'executeCommandProvider': {
         'commands': ['极快.选块'],
     },
     'hoverProvider': True,
     'positionEncoding': 'utf-16',
+    'signatureHelpProvider': {
+        'triggerCharacters': [' '],
+    },
     'textDocumentSync': {
         'change': 2,
         'openClose': True,

@@ -2,6 +2,7 @@
 """极快语言 - CLI 入口与 REPL。"""
 
 import sys
+from ._version import __version__
 from .lexer import tokenize
 from .parser import parse, ParseError
 from .evaluator import Evaluator, JiKuaiError
@@ -10,10 +11,12 @@ from .frontend import compile_source
 from .diagnostics import NullSink, make_default_sink, render_all_text
 
 
-VERSION = "0.6.0"
+# 兼容旧引用（`from jikuai.main import VERSION`）。v0.16.0 W25 起单一真源在
+# `_version.__version__`；此别名仅作过渡，等确认无外部依赖后可清理。
+VERSION = __version__
 BANNER = f"""
 ╔══════════════════════════════════╗
-║   极快 JiKuai v{VERSION}                  ║
+║   极快 JiKuai v{VERSION}                 ║
 ║   极简·极速·极中国                ║
 ║   输入 退出 或 Ctrl+C 退出        ║
 ╚══════════════════════════════════╝

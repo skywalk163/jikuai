@@ -2,21 +2,27 @@
 #
 # 触发：push / pull_request 到 main。
 #
-# 关键目标（T1 CI 加固）：
-#   1. 在 Python 3.10 / 3.11 / 3.12 矩阵上跑全部 pytest 用例。
-#   2. **确保 AOT 端到端二进制测试真正运行、而非跳过**。
+# 关键目标（T1 CI 加固 + W35 双平台矩阵）：
+#   1. 在 Python 3.10 / 3.11 / 3.12 矩阵（ubuntu）上跑全部 pytest 用例；
+#      Windows 侧跑 Python 3.12 单版本（见下方第 4 点）。
+#   2. **确保 AOT 端到端二进制测试真正运行、而非跳过**（仅 Linux job）。
 #      这些用例通过 shutil.which('gcc'|'clang'|'cc'|'cl') 探测 C 编译器：
 #        - tests/test_v0_8_0_aot_controlflow.py 的 8 条 @requires_cc 参数化用例
 #          （pytest.mark.skipif(not _have_c_compiler())）
+#        - tests/test_v0_9_0_aot_for.py 的 14 条、test_v0_9_0_aot_functions.py 的 8 条
+#          （同一 skipif 写法）
 #        - tests/test_v0_7_0_aot.py::TestBinaryCompile（fixture 调用
 #          detect_c_compiler()，无编译器则 pytest.skip）
-#      本地开发机（Windows）通常无 gcc，故这 9 条会 skip；ubuntu-latest
-#      预装 gcc，我们再显式安装以兜底，令这 9 条从 skip 转为 run。
+#      本地开发机（Windows）通常无 gcc，故这 31 条会 skip；ubuntu-latest
+#      预装 gcc，我们再显式安装以兜底，令这 31 条从 skip 转为 run。
+
 #
-#   3. **契约门禁 G10 + G11 + G12 + G13 + G14**：`scripts/check_stdlib_contract.py`
-#      退出码必须为 0。除 G10/G11 外，G12/G13/G14 也全部由该脚本内部承载
-#      （分别调用 `blocks.check_vector_index()` / `blocks.check_export_globally_unique()` /
-#      `blocks.check_stdlib_type_annotations()`）。
+#   3. **契约门禁 G10 + G11 + G12 + G13 + G13+ + G14 + G15**：
+#      `scripts/check_stdlib_contract.py` 退出码必须为 0。除 G10/G11 外，其余门禁
+#      都由该脚本内部承载（分别调用 `blocks.check_vector_index()` /
+#      `blocks.check_export_globally_unique()` / `blocks.check_stdlib_type_annotations()` /
+#      `blocks.check_dependency_acyclic()` / `check_level_consistency()` /
+#      `check_stability_propagation()`，以及内置的版本一致性校验）。
 #      G10 = stdlib 导出 vs docs/标准库.md 声明一致；
 #      G11 = stdlib/blocks/索引.json 与 stdlib/blocks/ 扫描结果一致（该脚本
 #      末尾以子进程调用 `generate_block_index.py --check --quiet` 承载）；
@@ -26,8 +32,17 @@
 #      G13 = 导出名全局唯一（含跨命名空间，`blocks.check_export_globally_unique()`）——
 #      内置与第三方块（ADR-27 `JIKUAI_PKG_ROOTS`）合并索引后不得出现同名导出，
 #      短名如 `转义`/`环境` 高危块专门盯这条；
+#      G13+ = L3 聚合块的三条结构约束（ADR-28 · W29），都长在同一张
+#      「块 --依赖块--> 块」有向图上：依赖环检测（`check_dependency_acyclic()`）、
+#      层级一致性（`check_level_consistency()`，声明 L3 但依赖够不上 L3 判定则拒）、
+#      稳定性传递（`check_stability_propagation()`，stable L3 不得依赖
+#      experimental/deprecated 的 L2/L3）——三者都只扫内置块库；
 #      G14 = 块类型标注达 ADR-26 精度（`blocks.check_stdlib_type_annotations()`，
-#      裸 `列表`/`字典`/`元组` 一律拒，缺细化会让类型图粘合器推不出传参链）。
+#      裸 `列表`/`字典`/`元组` 一律拒，缺细化会让类型图粘合器推不出传参链）；
+#      G15 = 版本号单一真源（W25）。`jikuai._version.__version__` 是唯一真源；
+#      pyproject.toml（dynamic 引用它）、CHANGELOG 最新条目、VS Code 扩展
+#      package.json 三处必须与之相等——防止历史上四处停在 0.6.0 与实际发布
+#      脱节达九个版本的漂移重演。
 #
 # GitCode 兼容性说明：
 #   本仓库同时托管在 GitHub 与 GitCode（gitcode.com/skywalk163/jikuai）。
@@ -37,7 +52,7 @@
 #       - python -m pip install -e .[dev]
 #       - gcc --version   # 确认编译器在位
 #       - python -m pytest -v
-#       - python scripts/check_stdlib_contract.py   # G10 + G11 + G12 + G13 + G14
+#       - python scripts/check_stdlib_contract.py   # G10 + G11 + G12 + G13 + G13+ + G14 + G15
 #   命令与下方 Linux job 完全一致，仅 YAML 结构因平台而异。
 
 name: CI
@@ -86,13 +101,13 @@ jobs:
       - name: Run full test suite
         run: python -m pytest -v
 
-      # G10 stdlib 契约一致性 + G11 块索引一致性 + G12 向量索引同源 + G13 导出名全局唯一 + G14 类型精度。
-      # 说明：G11/G12/G13/G14 都由 check_stdlib_contract.py 内部承载——G11 以子进程
-      # 调用 `generate_block_index.py --check --quiet`，G12/G13/G14 直接 import
-      # `jikuai.pkg.blocks` 的校验函数（分别对应 `check_vector_index()` /
-      # `check_export_globally_unique()` / `check_stdlib_type_annotations()`）。
+      # G10 stdlib 契约一致性 + G11 块索引一致性 + G12 向量索引同源
+      # + G13 导出名全局唯一 + G13+ 依赖环/层级/稳定性 + G14 类型精度 + G15 版本一致性。
+      # 说明：G11/G12/G13/G13+/G14/G15 都由 check_stdlib_contract.py 内部承载——G11
+      # 以子进程调用 `generate_block_index.py --check --quiet`，其余直接 import
+      # `jikuai.pkg.blocks` 的校验函数。
       # 任一失败整体退出码非 0，故此处**不**单独追加 `generate_block_index.py --check` 步骤。
-      - name: Contract gates G10/G11/G12/G13/G14
+      - name: Contract gates G10/G11/G12/G13/G13+/G14/G15
         run: python scripts/check_stdlib_contract.py
 
       # 守卫：AOT 端到端二进制用例在有 gcc 的环境必须真正运行、零 skip。
@@ -108,3 +123,69 @@ jobs:
             exit 1
           fi
           echo "AOT 端到端用例全部运行，无跳过。"
+
+  # W35：Windows 平台守卫。主开发环境是 Windows，平台差异（路径分隔符、
+  # 可执行位、GBK 编码、PowerShell）过去全靠人肉发现——v0.11 的 AOT 产物缺
+  # 可执行位（Errno 13，commit 7170807）就是这么漏出去的。本 job 把 Windows
+  # 纳入 CI 常驻矩阵。为控制时长只跑 Python 3.12 单版本。
+  test-windows:
+    name: Test (Python 3.12, windows)
+    runs-on: windows-latest
+    env:
+      # Windows 控制台默认 GBK，中文块名/门禁输出会乱码甚至触发解码错误。
+      # 全 job 强制 UTF-8，保证 pytest -rs 摘要与 check_stdlib_contract.py 可读。
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package (editable) with dev deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      # Windows runner 通常无 gcc，AOT e2e 会 skip 属常态，无需装编译器。
+      # 仅记录编译器可见性供排查，不作断言（与 Linux job 的 gcc 守卫相反）。
+      - name: Report C compiler visibility (informational)
+        shell: pwsh
+        run: python -c "import shutil; print('gcc ->', shutil.which('gcc'))"
+
+      # 全量用例 + skip 上限守卫。
+      # Windows 无 gcc：AOT 编译-运行比对用例会 skip——
+      #   test_v0_7_0_aot.py（1）+ test_v0_8_0_aot_controlflow.py（8）
+      #   + test_v0_9_0_aot_for.py（14）+ test_v0_9_0_aot_functions.py（8）= 31 条；
+      # 外加 POSIX-only 权限位用例 test_v0_11_0_aot_binary_mode.py（3）；
+      # 合计本机实测 34 skip。允许这些 skip，但设硬上限防大面积静默跳过
+      # （例如某个 import 崩了会让整文件被 collect-skip）。阈值 = 实测 34 + 6 余量 = 40，
+      # 超过即 fail。PowerShell 下 `&&` 无效，全用换行/`;`。
+      - name: Run full test suite (skip count guarded)
+        shell: pwsh
+        run: |
+          $threshold = 40
+          $out = python -m pytest tests -q -rs 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) {
+            Write-Error "pytest 退出码 $code——存在失败或收集错误。"
+            exit $code
+          }
+          $m = [regex]::Match($out, '(\d+)\s+skipped')
+          if ($m.Success) { $skips = [int]$m.Groups[1].Value } else { $skips = 0 }
+          Write-Host "skip 数 = $skips（阈值 $threshold）"
+          if ($skips -gt $threshold) {
+            Write-Error "::error::skip 数 $skips 超过阈值 $threshold——疑似大面积静默跳过，请排查。"
+            exit 1
+          }
+          Write-Host "skip 数在阈值内，Windows 平台守卫通过。"
+
+      # 六门 + G13+ 契约门禁：Windows 上同样必须 exit 0（纯标准库，不需 gcc/torch）。
+      - name: Contract gates G10/G11/G12/G13/G13+/G14/G15
+        shell: pwsh
+        run: python scripts/check_stdlib_contract.py

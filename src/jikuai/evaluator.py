@@ -14,6 +14,13 @@ from .ast_nodes import *
 from .errors import ErrorInfo, ErrorCategory, ErrorFormatter, spelling_suggestion
 
 
+#: 内建 `读取` 的文件大小硬顶（10 MiB，v0.16.0 W28）。
+#: 选值理由：`读取` 是**整段吞入内存**的接口，块生态里常见的 CSV / JSON /
+#: 日志文本极少超过几 MB；10 MiB 兜住误指向大二进制的场景，避免瞬间吃光
+#: 内存，又不至于挡住任何合理的文本工作负载。诊断码 JK-E4003。
+_READ_FILE_SIZE_LIMIT = 10 * 1024 * 1024
+
+
 def _scan_self_fields(node, out):
     """递归扫描 AST，收集所有 `自身.X = ...` 里的 X，作为"声明字段"。
 
@@ -489,9 +496,11 @@ class Evaluator:
             # I/O
             '打印': self._builtin_print,
             '输入': self._builtin_input,
-            # D-1：`读取`/`写入` 早已在 VERB_ARITY 声明，但一直没有实现，
-            # 运行期报「未知动词」。这里补齐；用 with 保证句柄及时关闭
-            # （lambda 里裸 open 会留下未关闭的文件对象 + ResourceWarning）。
+            # D-1：`读取`/`写入` 从 v0.6.0 就在 VERB_ARITY 声明但缺实现，
+            # v0.16.0 W28 补齐并加安全边界（路径逃逸 + 大小上限，
+            # 复用 pybridge._validate_script_path，诊断码 JK-E4002/E4003）。
+            # 用 with 保证句柄及时关闭（lambda 里裸 open 会留下未关闭的文件
+            # 对象 + ResourceWarning）。
             '读取': self._builtin_read_file,
             '写入': self._builtin_write_file,
             # 中国特色
@@ -570,20 +579,72 @@ class Evaluator:
 
         编码固定 UTF-8：极快源码本身要求 UTF-8，读文本时再让用户操心编码
         参数只会引入一个几乎永远填 'utf-8' 的第三个位置参数。
+
+        安全边界（ADR-21 延伸 · v0.16.0 W28）：
+          - 路径必须落在 CWD 内。复用 `pybridge._validate_script_path`，
+            与 `jikuai.load` 同一套判定（拒绝绝对路径 / `..` 穿越 /
+            symlink 跨盘符逃逸），不另写一份。诊断码 JK-E4002。
+          - 文件大小硬顶 `_READ_FILE_SIZE_LIMIT`（10 MiB）—— 整段读入
+            内存的接口若不设上限，误指向大二进制会瞬间吃光内存；
+            10 MiB 覆盖块生态常见 CSV/JSON/日志，远大于任何合理文本，
+            又能兜住误操作。诊断码 JK-E4003。
         """
-        with open(str(path), 'r', encoding='utf-8') as f:
+        abspath = self._resolve_safe_path(path, action='读取')
+        try:
+            size = os.path.getsize(abspath)
+        except OSError as exc:
+            raise JiKuaiError(info=ErrorInfo(
+                category=ErrorCategory.RUNTIME,
+                message=f"读取失败：{exc}",
+                line=0, col=0)) from None
+        if size > _READ_FILE_SIZE_LIMIT:
+            raise JiKuaiError(info=ErrorInfo(
+                category=ErrorCategory.RUNTIME,
+                message=(f"读取拒绝：文件 {str(path)} 大小 {size} 字节，"
+                         f"超出上限 {_READ_FILE_SIZE_LIMIT} 字节"
+                         f"（JK-E4003）。"),
+                line=0, col=0))
+        with open(abspath, 'r', encoding='utf-8') as f:
             return f.read()
 
     def _builtin_write_file(self, path, content):
         """`写入 路径 内容` —— 以 UTF-8 覆盖写入，**返回写入的内容**。
 
         返回内容而不是字节数，是为了让 `写入` 能出现在管道中间：
-        `拼接 "a" "b"，写入 "out.txt"，长度` 这类链式写法才成立。
+        `定义赵N=写入 "out.txt" "甲乙"，长度` 这类链式写法才成立
+        （管道 `，` 把上一段结果塞给下一动词的**第一个**参数，所以
+        `拼接 ...，写入 "out.txt"` 会把拼接结果当**路径**——别那么写）。
+
+
+        安全边界（ADR-21 延伸 · v0.16.0 W28）：
+          - 路径必须落在 CWD 内，同上（诊断码 JK-E4002）。
+          - 目录必须已存在——不自动 `mkdir -p`，避免调用方在写路径里
+            拼错目录名却被静默补齐，方向偏差在文件系统里被固化。
         """
+        abspath = self._resolve_safe_path(path, action='写入')
         text = content if isinstance(content, str) else self._format_value(content)
-        with open(str(path), 'w', encoding='utf-8') as f:
+        with open(abspath, 'w', encoding='utf-8') as f:
             f.write(text)
         return content
+
+    def _resolve_safe_path(self, path, action):
+        """把 `读取`/`写入` 的字符串路径解析成安全的绝对路径。
+
+        统一复用 `pybridge._validate_script_path`：与 `jikuai.load` 走
+        同一把闸——拒绝绝对路径、`..` 穿越、跨盘符与解析后仍逃出 CWD 的
+        symlink。任何拒绝理由都抛 JK-E4002 中文诊断，消息里的路径经
+        `_scrub_paths` 脱敏（Windows 盘符 / POSIX 绝对路径都会被抹）。
+        """
+        from .pybridge import _scrub_paths, _validate_script_path
+        text = str(path)
+        try:
+            return _validate_script_path(text, os.getcwd())
+        except ValueError as exc:
+            detail = _scrub_paths(str(exc))
+            raise JiKuaiError(info=ErrorInfo(
+                category=ErrorCategory.RUNTIME,
+                message=f"{action}拒绝：{detail}（JK-E4002）。",
+                line=0, col=0)) from None
 
 
     def _format_value(self, v):

@@ -43,6 +43,10 @@ SCENARIO_EXAMPLES = [
     '财务计算.jk',
     '农历工具.jk',
     '管道数据清洗.jk',
+    # v0.16.0 W30：3 个 L3 聚合块的端到端 demo
+    '报销单演示.jk',
+    '工资册演示.jk',
+    '客户对账演示.jk',
 ]
 
 
@@ -106,9 +110,10 @@ def test_ac118_scenario_example_exit_zero(name):
 
 
 def test_ac118_scenario_count_is_three():
+    # v0.16.0 W30 起从 3 增至 6：新增 3 个 L3 聚合块（报销单/工资册/客户对账）demo。
     sdir = os.path.join(_EXAMPLES, 'scenarios')
     files = [f for f in os.listdir(sdir) if f.endswith('.jk')]
-    assert len(files) == 3, sorted(files)
+    assert len(files) == 6, sorted(files)
 
 
 # ============================================================
@@ -147,17 +152,26 @@ def test_ac107_readme_pipeline_correct_filter_is_18():
 # ============================================================
 
 def test_v041_version_consistency():
-    """main.py / __init__.py / pyproject.toml 三处版本号一致。"""
+    """main.py / __init__.py / pyproject.toml 三处版本号一致。
+
+    W25（v0.16.0）：真源下沉到 `_version.__version__`；pyproject 走 dynamic
+    引用，静态读不到字面量属正常。硬编码期望值下沉到 G15 门禁。
+    """
     import jikuai
     from jikuai.main import VERSION
-    expected = '0.6.0'
-    assert VERSION == expected, VERSION
-    assert jikuai.__version__ == expected, jikuai.__version__
+    from jikuai._version import __version__ as src_version
+    assert VERSION == src_version, VERSION
+    assert jikuai.__version__ == src_version, jikuai.__version__
     toml_path = os.path.join(_ROOT, 'pyproject.toml')
     toml_ver = None
+    import re as _re
     with open(toml_path, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.startswith('version'):
-                toml_ver = line.split('=', 1)[1].strip().strip('"').strip("'")
+            # 只认字面量形式 `version = "x.y.z"`；W25 dynamic 引用形式
+            # (`version = {attr = ...}`) 归 G15 门禁在构建期校验。
+            m = _re.match(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', line.strip())
+            if m:
+                toml_ver = m.group(1)
                 break
-    assert toml_ver == expected, toml_ver
+    if toml_ver is not None:
+        assert toml_ver == src_version, toml_ver

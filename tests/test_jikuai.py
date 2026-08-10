@@ -505,16 +505,25 @@ def test_lexer_comment_not_broken():
 # ---------- R4: 版本一致性测试 ----------
 
 def test_version_consistency():
-    """R4: pyproject.toml version 与 jikuai.__version__ 一致。"""
+    """R4: pyproject.toml version 与 jikuai.__version__ 一致。
+
+    W25（v0.16.0）起 pyproject 走 dynamic version 指向 `_version.__version__`，
+    静态解析拿不到字面量属正常。这里若能读到（老格式或构建后）则做等值断言，
+    读不到就由 G15 门禁（`check_stdlib_contract.py`）在 CI 侧兜底。
+    """
     import jikuai
     toml_path = os.path.join(os.path.dirname(__file__), '..', 'pyproject.toml')
+    toml_ver = None
+    import re as _re
     with open(toml_path, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.startswith('version'):
-                # version = "0.3.0-beta"
-                toml_ver = line.split('=', 1)[1].strip().strip('"').strip("'")
+            m = _re.match(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', line.strip())
+            if m:
+                toml_ver = m.group(1)
                 break
-    assert toml_ver == jikuai.__version__, f"pyproject={toml_ver} vs __init__={jikuai.__version__}"
+    if toml_ver is not None:
+        assert toml_ver == jikuai.__version__, (
+            f"pyproject={toml_ver} vs __init__={jikuai.__version__}")
 
 
 # ---------- R5: 补充反例测试 ----------
@@ -806,20 +815,31 @@ def test_ac35_no_ctor_anywhere_is_safe():
 # ---------- 版本对齐（AC-36） ----------
 
 def test_ac36_version_consistency():
-    """AC-36: main.py / __init__.py / pyproject.toml 三处版本号一致。"""
+    """AC-36: main.py / __init__.py / pyproject.toml 三处版本号一致。
+
+    W25（v0.16.0）起 `_version.__version__` 是唯一真源；pyproject 走 dynamic
+    引用同一份，所以静态读不到字面量属正常。本用例只断言运行时导入的三条路径
+    指向同一份，硬编码期望值下沉到 `test_version_consistency.py`（G15）。
+    """
     import jikuai
     from jikuai.main import VERSION
-    expected = '0.6.0'
-    assert VERSION == expected, VERSION
-    assert jikuai.__version__ == expected, jikuai.__version__
+    from jikuai._version import __version__ as src_version
+    assert VERSION == src_version, (VERSION, src_version)
+    assert jikuai.__version__ == src_version, (jikuai.__version__, src_version)
     toml_path = os.path.join(os.path.dirname(__file__), '..', 'pyproject.toml')
     toml_ver = None
+    import re as _re
     with open(toml_path, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.startswith('version'):
-                toml_ver = line.split('=', 1)[1].strip().strip('"').strip("'")
+            m = _re.match(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', line.strip())
+            if m:
+                toml_ver = m.group(1)
                 break
-    assert toml_ver == expected, toml_ver
+    # W25 起 pyproject 走 dynamic version（引用 `_version.__version__`），
+    # 静态字面量已经不存在。找到就顺带断言一致；找不到属正常，交给 G15 门禁在
+    # 构建期通过 setuptools 解析后校验（`_check_version_consistency`）。
+    if toml_ver is not None:
+        assert toml_ver == src_version, toml_ver
 
 
 # ---------- M2-2：REPL 增强（R-1 起改为 parser 权威判定） ----------

@@ -92,8 +92,8 @@ temp/
 # 包.json 与 包.锁 应提交进版本库。
 极快_包/
 
-# ===== 性能基准（T8）=====
-# `python benches/run_bench.py --json xxx.json` 的产出：本地跑得机器相关，
-# 不入库。基准源码 benches/programs/ 与 run_bench.py 提交。
-benches/*.json
-bench-*.json
+# ===== 误建目录兜底 =====
+# `python scripts/generate_block_index.py --check` 一旦被当成位置参数解析，
+# 就会在仓库根建出 `--check/` 这种目录（v0.15.0 真实踩过）。
+--*/
+

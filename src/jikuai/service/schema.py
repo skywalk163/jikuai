@@ -32,8 +32,10 @@ __all__ = [
     'DIAGNOSTIC_REQUIRED', 'DIAGNOSTIC_OPTIONAL', 'DIAGNOSTIC_LEVELS',
     'SELECT_ENVELOPE_REQUIRED', 'SELECT_ENVELOPE_OPTIONAL',
     'RUN_ENVELOPE_REQUIRED', 'RUN_ENVELOPE_OPTIONAL',
+    'SAVED_PLAN_REQUIRED', 'SAVED_PLAN_LIST_FIELDS', 'SAVED_PLAN_LIST_ENVELOPE',
     'make_candidate', 'make_step', 'make_plan', 'make_result',
     'make_select_envelope', 'make_run_envelope',
+    'make_saved_plan', 'make_saved_plan_summary', 'make_saved_plan_list',
     'candidate_from_hit', 'level_table', 'diagnostics_from_error',
     'validate_candidate', 'validate_plan', 'validate_result',
     'validate_select_envelope', 'validate_run_envelope',
@@ -97,6 +99,17 @@ SELECT_ENVELOPE_OPTIONAL = ('降级说明',)
 #: 跨两个通道、含嵌套的 `执行结果`，字段名手写两遍必然漂。
 RUN_ENVELOPE_REQUIRED = ('源码', '执行结果')
 RUN_ENVELOPE_OPTIONAL = ('需求',)
+
+#: `已存方案` 存档项字段（v0.16.0 W31）。`id` / `标题` / `时间戳` 是列表
+#: 与详情共用的元数据，`方案` 只在详情里出现（列表 endpoint 不返回方案本体，
+#: 省流量也免得把用户的整批共享量甩进列表 payload）。
+#: 落盘 JSON 的键名 = 这里的常量，前后端两侧都从本文件取，Web 层零字面量。
+SAVED_PLAN_REQUIRED = ('id', '标题', '时间戳', '方案')
+#: `已存方案.列` 的条目字段（不含 `方案` 本体，只回元数据）。
+SAVED_PLAN_LIST_FIELDS = ('id', '标题', '时间戳')
+#: `已存方案.列` 的响应信封。给它一个信封而不是裸数组：后面要加 `总数`
+#: / `上限` 之类的元信息时不必再做一次破坏性契约变更。
+SAVED_PLAN_LIST_ENVELOPE = ('方案列表',)
 
 
 # ---- 构造器 -----------------------------------------------------------
@@ -223,6 +236,26 @@ def make_run_envelope(源码: str, 执行结果: Dict[str, Any],
     if 需求 is not None:
         信封['需求'] = 需求
     return 信封
+
+
+def make_saved_plan(id: str, 标题: str, 时间戳: str,
+                    方案: Dict[str, Any]) -> Dict[str, Any]:
+    """构造一份 `已存方案` 落盘项（v0.16.0 W31）。
+
+    `id` 是 hex 串（`uuid4().hex`），`时间戳` 是 ISO 8601 UTC 字符串。
+    键名一律从 `SAVED_PLAN_REQUIRED` 常量取。
+    """
+    return dict(zip(SAVED_PLAN_REQUIRED, (id, 标题, 时间戳, 方案)))
+
+
+def make_saved_plan_summary(id: str, 标题: str, 时间戳: str) -> Dict[str, Any]:
+    """构造 `已存方案.列` 条目（仅元数据，不含方案本体）。"""
+    return dict(zip(SAVED_PLAN_LIST_FIELDS, (id, 标题, 时间戳)))
+
+
+def make_saved_plan_list(条目: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """构造 `已存方案.列` 的响应信封。"""
+    return dict(zip(SAVED_PLAN_LIST_ENVELOPE, (list(条目),)))
 
 
 # ---- Hit → 候选 -------------------------------------------------------

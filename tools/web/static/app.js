@@ -74,6 +74,27 @@ async function getJSON(url) {
   return data;
 }
 
+/** DELETE 请求，成功回响应对象。用于删除历史。 */
+async function delJSON(url) {
+  let resp;
+  try {
+    resp = await fetch(url, {method: 'DELETE'});
+  } catch (e) {
+    throw new Error('网络请求失败：' + e.message);
+  }
+  const text = await resp.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error('响应不是合法 JSON（HTTP ' + resp.status + '）');
+  }
+  if (!resp.ok) {
+    throw new Error(data && data['错误'] ? data['错误'] : ('HTTP ' + resp.status));
+  }
+  return data;
+}
+
 function note(el, msg, isErr) {
   if (!msg) {
     el.hidden = true;
@@ -363,6 +384,8 @@ function 刷新按钮() {
   $('btn-copy-src').disabled = !有源码;
   $('btn-dl').disabled = !有源码;
   $('btn-run').disabled = !有源码;
+  // 保存按钮：选了块（能拼方案）就允许存。允许在没跑之前存草稿。
+  $('btn-save').disabled = 选中.length === 0;
 }
 
 /** 降级提示条：明显但不阻塞，可关。 */
@@ -681,6 +704,172 @@ function 清空() {
   $('q').focus();
 }
 
+// ---- 历史：保存 / 列出 / 恢复 / 删除（W31）----------------------------
+//
+// 全部原生 JS：一个 fetch + 一段 createElement，没有框架。评估结论见
+// `tools/web/README.md` §可写化评估。历史侧栏的数据流是单向的：
+//   服务端 `/api/方案/列` → 数组 → 重建整个列表 DOM
+// 不做增量 diff —— 历史条数上限 200，整体重建的开销可以忽略，换来的是
+// 「不存在本地状态与服务端不一致」这个强保证。
+
+/** 时间戳（ISO 8601 UTC）→ 本地可读短串。解析不了就原样显示。 */
+function 短时间(戳) {
+  const d = new Date(String(戳 || ''));
+  if (isNaN(d.getTime())) { return String(戳 || ''); }
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
+    + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/** 拉历史列表并重建侧栏。失败只提示、不抛——历史坏了不该拖垮主流程。 */
+async function 载入历史() {
+  const box = $('hist-list');
+  try {
+    const data = await getJSON('/api/方案/列');
+    渲染历史(Array.isArray(data['方案列表']) ? data['方案列表'] : []);
+  } catch (e) {
+    box.textContent = '';
+    $('hist-hint').textContent = '（读取失败）';
+    const p = document.createElement('div');
+    p.className = 'muted';
+    p.textContent = e.message;
+    box.appendChild(p);
+  }
+}
+
+function 渲染历史(列表) {
+  const box = $('hist-list');
+  box.textContent = '';
+  $('hist-hint').textContent = '（' + 列表.length + ' 份 · 点击恢复）';
+  if (!列表.length) {
+    const p = document.createElement('div');
+    p.className = 'muted';
+    p.textContent = '还没有保存过方案。选块组装后点「保存 ⌂」。';
+    box.appendChild(p);
+    return;
+  }
+  列表.forEach(项 => box.appendChild(建历史条(项)));
+}
+
+/**
+ * 建一条历史项：外层 div（role=listitem）+ 恢复按钮 + 删除按钮。
+ *
+ * 为什么不是「整条 <button> 里再套删除 <button>」：HTML 禁止按钮嵌套，浏览器
+ * 会把内层按钮甩到外面，键盘 Tab 顺序也会乱。两个平级按钮才是可达的写法。
+ * 标题与时间戳全走 textContent —— 标题来自用户输入，绝不当 HTML。
+ */
+function 建历史条(项) {
+  const id = String(项['id'] || '');
+  const 标题 = String(项['标题'] || '') || '（未命名）';
+  const 行 = document.createElement('div');
+  行.setAttribute('role', 'listitem');
+  行.className = 'hist-item';
+
+  const 载 = document.createElement('button');
+  载.type = 'button';
+  载.className = 'ht';
+  载.style.cssText = 'background:transparent;border:0;color:inherit;font:inherit;'
+    + 'text-align:left;padding:0;cursor:pointer;overflow:hidden;'
+    + 'text-overflow:ellipsis;white-space:nowrap';
+  载.textContent = 标题;
+  载.title = 标题 + '　' + String(项['时间戳'] || '');
+  载.setAttribute('aria-label', '恢复方案：' + 标题);
+  载.addEventListener('click', () => 恢复历史(id));
+
+  const 时 = document.createElement('span');
+  时.className = 'hd';
+  时.textContent = 短时间(项['时间戳']);
+
+  const 删 = document.createElement('button');
+  删.type = 'button';
+  删.className = 'hx';
+  删.textContent = '×';
+  删.title = '删除这份方案';
+  删.setAttribute('aria-label', '删除方案：' + 标题);
+  删.addEventListener('click', () => 删除历史(id, 标题));
+
+  行.append(载, 时, 删);
+  return 行;
+}
+
+/** 保存当前方案。标题默认用需求文本，服务端在为空时会自己兜底。 */
+async function 保存方案() {
+  if ($('btn-save').disabled) { return; }
+  const btn = $('btn-save');
+  btn.disabled = true;
+  try {
+    const 方案 = 组装方案();
+    const body = {'方案': 方案};
+    const 标题 = $('q').value.trim();
+    if (标题) { body['标题'] = 标题; }
+    const 存 = await postJSON('/api/方案/存', body);
+    note($('run-note'), '已保存到历史：' + (存['标题'] || 存['id']));
+    await 载入历史();
+  } catch (e) {
+    note($('run-note'), '保存失败：' + e.message, true);
+  } finally {
+    刷新按钮();
+  }
+}
+
+/**
+ * 从历史恢复：取回方案 → 回填需求/喂数据 → 重建候选卡片并全选 → 重新 `组`。
+ *
+ * 源码不进存档（存的是**方案**，源码是方案的函数），所以恢复时重新走一次
+ * `/api/组`。好处：块升级后恢复出来的源码是新的，而不是一份僵化的旧快照。
+ */
+async function 恢复历史(id) {
+  try {
+    const 档 = await getJSON('/api/方案/' + encodeURIComponent(id));
+    const 方案 = 档['方案'] || {};
+    const 步骤 = Array.isArray(方案['步骤']) ? 方案['步骤'] : [];
+    $('q').value = String(方案['需求'] || '');
+    const 共享 = Array.isArray(方案['共享']) ? 方案['共享'] : [];
+    $('feed').value = 共享.length ? String(共享[0]['值'] || '') : '';
+
+    // 从步骤反推候选卡片：描述/层级查块索引，分数留 0、路径留空（不是检索来的）
+    const cands = 步骤.map(s => {
+      const b = 块表.get(s['块']) || {};
+      return {
+        '名称': String(s['块'] || ''), '领域': String(s['领域'] || ''),
+        '层级': Number(b['层级'] || 0), '描述': String(b['描述'] || ''),
+        '分数': 0, '路径': '',
+      };
+    });
+    渲染候选(cands);
+    显示降级('');
+    // 全选，顺序 = 步骤顺序（`选中` 的顺序就是方案的步骤顺序）
+    const 卡片 = $('cands').querySelectorAll('.card');
+    cands.forEach((c, i) => { if (卡片[i]) { 切换选中(c['名称'], 卡片[i]); } });
+
+    // 用**存档里的原方案**重新组（而不是 组装方案()）：参数与共享量原样保留
+    const data = await postJSON('/api/组', {'方案': 方案});
+    $('src').value = data['源码'] || '';
+    当前诊断 = [];
+    诊断失效 = false;
+    刷新代码视图();
+    渲染诊断(当前诊断);
+    note($('sel-note'), '');
+    note($('asm-note'), '');
+    note($('run-note'), '已从历史恢复方案，可直接 Ctrl+Enter 跑。');
+  } catch (e) {
+    note($('run-note'), '恢复失败：' + e.message, true);
+  } finally {
+    刷新按钮();
+  }
+}
+
+async function 删除历史(id, 标题) {
+  if (!window.confirm('删除方案「' + 标题 + '」？此操作不可撤销。')) { return; }
+  try {
+    await delJSON('/api/方案/' + encodeURIComponent(id));
+    note($('run-note'), '已删除「' + 标题 + '」。');
+  } catch (e) {
+    note($('run-note'), '删除失败：' + e.message, true);
+  }
+  await 载入历史();
+}
+
 // ---- 能力探测 ---------------------------------------------------------
 
 /**
@@ -747,6 +936,7 @@ function 绑定() {
   });
   $('btn-copy-src').addEventListener('click', () => 复制($('src').value, '源码'));
   $('btn-dl').addEventListener('click', 下载jk);
+  $('btn-save').addEventListener('click', 保存方案);
 
   // 需求框回车 = 选块，但组字中的回车不算
   $('q').addEventListener('keydown', e => {
@@ -776,6 +966,7 @@ async function 启动() {
   绑定();
   刷新代码视图();
   探测能力();                          // 不 await：能力探测不该拖慢首屏
+  载入历史();                          // 同上：历史侧栏并行加载
   try {
     const idx = await getJSON('/api/blocks');
     (idx['块'] || []).forEach(b => 块表.set(b['名称'], b));

@@ -9,6 +9,8 @@
     - completionProvider：文本补全（触发字符 `.` 与 `，`）
     - hoverProvider：悬浮说明
     - definitionProvider：`导入` 点分块路径 → 块目录（W14）
+    - documentSymbolProvider：单文件 AST 符号提纲——函数/类/导入（W32）
+    - signatureHelpProvider：动词调用签名帮助，触发字符空格（W32）
     - executeCommandProvider：命令 `极快.选块`（W15）
     - publishDiagnostics 走服务端 push，故 diagnosticProvider 显式为 False
       （表示不提供 pull-based 诊断）
@@ -41,6 +43,11 @@ COMPLETION_TRIGGER_CHARACTERS: List[str] = ['.', '，']
 #: `极快` 前缀避免与其它 LSP 服务器命名空间冲突（例如 Python 是 `python.`）。
 COMMAND_SELECT_BLOCK = '极快.选块'
 
+#: signatureHelp 触发字符：空格（动词后接参数的自然分隔符）。
+#: 极快语法里动词调用形如 `加 1 2`，用户打完动词名后键入空格开始填参数，
+#: 此时触发签名提示最自然。
+SIGNATURE_HELP_TRIGGER_CHARACTERS: List[str] = [' ']
+
 #: 纯数据能力声明；测试可直接断言 SERVER_CAPABILITIES['completionProvider']。
 #:
 #: 契约变更历史（改这里 = 改对外契约，必须过 freeze 测试）：
@@ -48,6 +55,7 @@ COMMAND_SELECT_BLOCK = '极快.选块'
 #:   v0.15.0 W14：新增 definitionProvider；textDocumentSync.change 1 → 2
 #:                （Incremental sync，配合 TextDocumentStore._apply_change）
 #:   v0.15.0 W15：新增 executeCommandProvider（命令 `极快.选块`）
+#:   v0.16.0 W32：新增 documentSymbolProvider + signatureHelpProvider
 SERVER_CAPABILITIES: Dict[str, Any] = {
     'textDocumentSync': {
         'openClose': True,
@@ -63,6 +71,12 @@ SERVER_CAPABILITIES: Dict[str, Any] = {
     # W14：跳转到定义。只支持 `导入`/`从 … 导入` 语句里的点分块路径 → 块目录，
     # 用户符号跳转依赖 workspace 索引，留到后续版本。
     'definitionProvider': True,
+    # W32：文档符号。单文件 AST 遍历，提取函数/类/导入三类符号。
+    'documentSymbolProvider': True,
+    # W32：签名帮助。复用 completion.py 的动词元数查询。
+    'signatureHelpProvider': {
+        'triggerCharacters': list(SIGNATURE_HELP_TRIGGER_CHARACTERS),
+    },
     # W15：workspace/executeCommand。当前只暴露 `极快.选块`；未声明的 command
     # 由 server 层回 -32601 MethodNotFound，不静默返回 null。
     'executeCommandProvider': {

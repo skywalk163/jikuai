@@ -8,4 +8,5 @@ tsconfig.json
 **/tsconfig.json
 **/.eslintrc.json
 **/*.vsix
+build.ps1
 .gitignore

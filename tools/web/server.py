@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-"""极快 Web UI 通道 —— 本地开发服务（v0.15.0 W17/W18）。
+"""极快 Web UI 通道 —— 本地开发服务（v0.15.0 W17/W18，v0.16.0 W31 可写化）。
 
 三段式设计语言在 Web 上的落地：`[需求]→[候选]→[方案]→[源码]→[结果]`，与
-`jk 块 选/组/跑` 完全同构，只是换了传输层。五个端点：
+`jk 块 选/组/跑` 完全同构，只是换了传输层。端点：
 
-    GET  /api/blocks   → `stdlib/blocks/索引.json` 原文
-    GET  /api/能力     → {神经可用, 索引版本, 块数}      能力探测（W19 前端用）
-    POST /api/选       → {需求, top?, 神经?}      → `选响应` {需求, 候选[, 降级说明]}
-    POST /api/组       → {方案} 或方案本体        → `组响应` {源码}
-    POST /api/跑       → {方案} 或方案本体        → `跑响应` {源码, 执行结果[, 需求]}
+    GET    /api/blocks       → `stdlib/blocks/索引.json` 原文
+    GET    /api/能力         → {神经可用, 索引版本, 块数}      能力探测（W19 前端用）
+    POST   /api/选           → {需求, top?, 神经?}      → `选响应` {需求, 候选[, 降级说明]}
+    POST   /api/组           → {方案} 或方案本体        → `组响应` {源码}
+    POST   /api/跑           → {方案} 或方案本体        → `跑响应` {源码, 执行结果[, 需求]}
+    POST   /api/方案/存      → {方案[, 标题]}           → {id, 标题, 时间戳}     （W31）
+    GET    /api/方案/列      →                          → {方案列表:[{id,标题,时间戳}]}
+    GET    /api/方案/<id>    →                          → {id, 标题, 时间戳, 方案}
+    DELETE /api/方案/<id>    →                          → {id}
 
 `/` 挂 `tools/web/static/` 的单页。
 
@@ -21,8 +25,14 @@
 * 仅供本机单人开发调试使用，不是生产服务，也不是多租户服务；
 * 任何需要暴露给他人的场景，请改走 CLI（`jk 块 跑`）或自建带沙箱的通道。
 
-**实现约束**：只用标准库（`http.server` + `json` + `logging`）。W17 DoD 明写
-不许新增 pip 依赖。协议字段一律取自 `jikuai.service.schema`（唯一真源，见
+W31 引入了**写端点**，因此又多了三条硬约束（细节见 `README.md` §已做的安全处理）：
+
+* 路径 id 走白名单正则 `ID_PATTERN`（`^[0-9a-f]{8,64}$`），非白名单一律 400；
+* 落盘路径经 `abspath` 归一化后再确认前缀仍在 `plans_root()` 内（双重防护）；
+* 单档 / 总量 / 条数三道体积闸，防「一次请求写满本地磁盘」。
+
+**实现约束**：只用标准库（`http.server` + `json` + `logging` + `uuid`）。W17 DoD
+明写不许新增 pip 依赖。协议字段一律取自 `jikuai.service.schema`（唯一真源，见
 `docs/协议-三通道.md`），本通道**不自造字段**——`/api/能力` 的三个字段是
 能力探测而非数据协议，不进 schema，只在协议文档里记一笔。
 """
@@ -39,6 +49,8 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _HERE = os.path.abspath(os.path.dirname(__file__))
@@ -57,10 +69,15 @@ _F需求, _F共享, _F打印 = schema.PLAN_OPTIONAL
 _F步骤 = schema.PLAN_REQUIRED[0]
 _F块, _F领域, _F导出名 = schema.STEP_REQUIRED
 _F源码, _F执行结果 = schema.RUN_ENVELOPE_REQUIRED
+#: `已存方案` 的字段名（W31）。`_F方案` 同时也是 `/api/组`、`/api/跑` 请求体
+#: 里那个信封键——存档项与请求信封用的是同一个字段名，取自同一处常量。
+_Fid, _F标题, _F时间戳, _F方案 = schema.SAVED_PLAN_REQUIRED
 
 __all__ = [
     'DEFAULT_HOST', 'DEFAULT_PORT', 'MAX_BODY', 'SAFETY_NOTICE',
-    'JiKuaiHandler', 'build_server', 'static_root', 'main',
+    'PLANS_DIR_ENV', 'PLANS_DIR_HOME', 'ID_PATTERN',
+    'MAX_PLAN_BYTES', 'MAX_STORE_BYTES', 'MAX_PLAN_COUNT', 'MAX_TITLE_CHARS',
+    'plans_root', 'JiKuaiHandler', 'build_server', 'static_root', 'main',
 ]
 
 _LOG = logging.getLogger('jikuai.web')
@@ -80,6 +97,36 @@ MAX_DRAIN = 8 * 1024 * 1024
 
 #: `top` 的上限。105 个块全返回也没意义，防止有人拿 `top=1e9` 找乐子。
 MAX_TOP = 50
+
+#: 方案存档目录的环境变量覆盖（测试用；也方便把存档挪到别处）。
+#: 刻意用纯 ASCII 名字：Windows 上带中文的环境变量名在部分 shell 里传不进来。
+PLANS_DIR_ENV = 'JIKUAI_WEB_PLANS_DIR'
+
+#: 方案存档目录相对家目录的位置：`~/.jikuai/web-方案/`（与 `~/.jikuai/注册表`
+#: 同一个家目录约定，见 `pkg/registry.py`）。
+PLANS_DIR_HOME = ('.jikuai', 'web-方案')
+
+#: 单个方案存档的字节上限（序列化后）。方案是一小段 JSON，64 KiB 已经很宽裕；
+#: 设上限是为了防「一次请求写满磁盘」。
+MAX_PLAN_BYTES = 64 * 1024
+
+#: 存档目录的总字节上限。单个上限挡不住「存一万份合规大小的方案」，
+#: 所以总量必须**另有**一道闸。
+MAX_STORE_BYTES = 4 * 1024 * 1024
+
+#: 存档条数上限。总字节数之外再加一道：一堆微小文件也会吃满 inode。
+MAX_PLAN_COUNT = 200
+
+#: 标题的码点上限。标题只是给人看的索引，超长的一律截断而不是报错
+#: （用户在需求框里写长句是常态，为此拒绝保存太粗暴）。
+MAX_TITLE_CHARS = 120
+
+#: 方案 id 白名单。**严格锚定** `^...$`，只允许小写 hex，长度 8..64。
+#: 这一条正则同时挡掉：`..`、`/`、`\`、盘符、百分号编码残留、绝对路径、
+#: 超长名、Windows 保留名（`CON`/`NUL` 都含非 hex 字符）。
+#: id 由服务端 `uuid4().hex`（32 位小写 hex）生成，天然落在白名单内。
+ID_PATTERN = re.compile(r'^[0-9a-f]{8,64}$')
+
 
 #: 启动时必打的中文风险提示（README 里同步有一份）。
 SAFETY_NOTICE = (
@@ -379,12 +426,259 @@ def 块索引() -> dict:
         raise _请求错误('块索引不是合法 JSON：%s' % e, 状态=503)
 
 
+# ---- 方案存档（W31）---------------------------------------------------
+
+def plans_root() -> str:
+    """方案存档目录的绝对路径。
+
+    环境变量 `JIKUAI_WEB_PLANS_DIR` 优先；否则用 `~/.jikuai/web-方案/`。
+    环境变量给的是测试与迁移用的逃生舱，运行时并不鼓励改。
+    """
+    覆盖 = os.environ.get(PLANS_DIR_ENV)
+    if 覆盖:
+        return os.path.abspath(os.path.expanduser(覆盖))
+    return os.path.abspath(
+        os.path.join(os.path.expanduser('~'), *PLANS_DIR_HOME))
+
+
+def _方案文件路径(id: str) -> str:
+    """把 id 拼成落盘文件路径，同时做**双重**归一化校验。
+
+    先走白名单正则（`ID_PATTERN` 已经严格锚定 `^[0-9a-f]{8,64}$`），再对
+    join 后的路径做 `abspath` 归一化，最后确认前缀仍在 `plans_root()` 之内。
+    单靠正则理论上够，但根目录经过 `expanduser` 里的软链接可能不是自己以为
+    的那一层——第二步兜住这种意外。
+    """
+    if not isinstance(id, str) or not ID_PATTERN.match(id):
+        raise _请求错误('方案 id 不合法（只允许 8..64 位小写 hex）', 状态=400)
+    根 = os.path.abspath(plans_root())
+    目标 = os.path.abspath(os.path.join(根, id + '.json'))
+    # 归一化后的目标必须是「根目录下」的直接子文件。用带分隔符的前缀比较，
+    # 避免 `/foo` 与 `/foobar` 误判成同一前缀。
+    根前缀 = 根 + os.sep
+    if not (目标.startswith(根前缀) and os.path.dirname(目标) == 根):
+        raise _请求错误('方案 id 不合法（归一化后逃出存档目录）', 状态=400)
+    return 目标
+
+
+def _确保根目录() -> str:
+    根 = plans_root()
+    try:
+        os.makedirs(根, exist_ok=True)
+    except OSError as e:
+        raise _请求错误('存档目录不可用：%s' % e, 状态=500)
+    return 根
+
+
+def _当前时间戳() -> str:
+    """UTC ISO 8601 秒级时间戳。写字符串是为了跨语言易读、易排序。"""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _列存档() -> list:
+    """扫存档目录，返回按时间戳倒序（新到旧）的元数据数组。
+
+    坏 JSON、非白名单文件名一律跳过而不是把整个 `列` 打挂——一份坏文件不该
+    让整份历史读不到。跳过的会以 warning 打到日志里。
+    """
+    根 = plans_root()
+    if not os.path.isdir(根):
+        return []
+    条目 = []
+    try:
+        文件名列表 = os.listdir(根)
+    except OSError as e:
+        raise _请求错误('存档目录不可读：%s' % e, 状态=500)
+    for 名 in 文件名列表:
+        if not 名.endswith('.json'):
+            continue
+        id = 名[:-len('.json')]
+        if not ID_PATTERN.match(id):
+            continue
+        路径 = os.path.join(根, 名)
+        try:
+            with open(路径, 'r', encoding='utf-8') as f:
+                档 = json.load(f)
+        except (OSError, ValueError) as e:
+            _LOG.warning('跳过坏存档 %s：%s', 名, e)
+            continue
+        if not isinstance(档, dict):
+            continue
+        条目.append(schema.make_saved_plan_summary(
+            id=str(档.get(_Fid) or id),
+            标题=str(档.get(_F标题) or ''),
+            时间戳=str(档.get(_F时间戳) or ''),
+        ))
+    # 时间戳字符串按 ISO 8601 天然可字典序排。倒序 = 新在前。
+    条目.sort(key=lambda x: x.get(_F时间戳, ''), reverse=True)
+    return 条目
+
+
+def _目录总字节数(根: str) -> int:
+    """存档目录下所有合规 .json 的字节数之和。用于总量上限检查。"""
+    总 = 0
+    try:
+        for 名 in os.listdir(根):
+            if not 名.endswith('.json'):
+                continue
+            id = 名[:-len('.json')]
+            if not ID_PATTERN.match(id):
+                continue
+            try:
+                总 += os.path.getsize(os.path.join(根, 名))
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return 总
+
+
+def _有效存档数(根: str) -> int:
+    n = 0
+    try:
+        for 名 in os.listdir(根):
+            if not 名.endswith('.json'):
+                continue
+            if ID_PATTERN.match(名[:-len('.json')]):
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def _提标题(方案: dict) -> str:
+    """从方案里挤出一个能给人看的标题。
+
+    优先级：请求体明确给的 `标题` > 方案的 `需求` > 首步骤 `块` 名 > 空串
+    （空串意味着 UI 里显示时用「（未命名）」占位）。截断到 `MAX_TITLE_CHARS`
+    个码点——用户在需求框里写长句是常态，为长度拒收太粗暴。
+    """
+    从需求 = 方案.get(_F需求)
+    if isinstance(从需求, str) and 从需求.strip():
+        return 码点截断(从需求.strip(), MAX_TITLE_CHARS)
+    步骤 = 方案.get(_F步骤) or []
+    if 步骤 and isinstance(步骤, list):
+        首 = 步骤[0]
+        if isinstance(首, dict):
+            块 = 首.get(_F块)
+            if isinstance(块, str) and 块:
+                return 码点截断(块, MAX_TITLE_CHARS)
+    return ''
+
+
+def 码点截断(s: str, 上限: int) -> str:
+    """按码点（`Array.from` 口径）截断，保持与前端一致。"""
+    cps = [c for c in s]
+    if len(cps) <= 上限:
+        return s
+    return ''.join(cps[:上限])
+
+
+def 方案_存(body: dict) -> dict:
+    """`POST /api/方案/存`：把方案存到 `~/.jikuai/web-方案/<id>.json`。
+
+    请求体接受两种写法（与 `/api/组`、`/api/跑` 同款）：
+        {"方案": {...}}   -- 信封式，推荐
+        {"方案": {...}, "标题": "自定义"}
+    直接把方案本体当 body 也收，标题走 `_提标题` 兜底。
+
+    id 由服务端 `uuid4().hex` 生成——不接受调用方指定的 id，避免手写 id
+    落进白名单外或覆盖别人已存的方案。
+    """
+    if not isinstance(body, dict):
+        raise _请求错误('请求体必须是对象')
+    方案原始 = body.get(_F方案) if _F方案 in body else body
+    if not isinstance(方案原始, dict):
+        raise _请求错误('「方案」必须是 JSON 对象')
+    try:
+        schema.ensure_plan(方案原始)
+    except schema.SchemaError as e:
+        raise _请求错误(str(e))
+    方案 = _校验块存在(方案原始)
+
+    自定义标题 = body.get(_F标题) if _F方案 in body else None
+    if 自定义标题 is not None and not isinstance(自定义标题, str):
+        raise _请求错误('「标题」必须是字符串')
+    标题 = 码点截断((自定义标题 or '').strip(), MAX_TITLE_CHARS) or _提标题(方案)
+
+    根 = _确保根目录()
+    # 提前拦总量：写完再删的策略会在磁盘满时把用户已有的方案挤丢。
+    if _有效存档数(根) >= MAX_PLAN_COUNT:
+        raise _请求错误('存档条数已达上限 %d，请先删旧的' % MAX_PLAN_COUNT,
+                      状态=413)
+
+    id = uuid.uuid4().hex          # 32 位小写 hex，天然过白名单
+    时间戳 = _当前时间戳()
+    存档 = schema.make_saved_plan(id=id, 标题=标题, 时间戳=时间戳, 方案=方案)
+    数据 = json.dumps(存档, ensure_ascii=False).encode('utf-8')
+    if len(数据) > MAX_PLAN_BYTES:
+        raise _请求错误('方案序列化后 %d 字节，超过单档上限 %d 字节'
+                      % (len(数据), MAX_PLAN_BYTES), 状态=413)
+    if _目录总字节数(根) + len(数据) > MAX_STORE_BYTES:
+        raise _请求错误('存档总量已达上限 %d 字节，请先删旧的' % MAX_STORE_BYTES,
+                      状态=413)
+
+    目标 = _方案文件路径(id)
+    # 原子写：先落临时文件同目录，再 replace 覆盖；防止半写状态被读到。
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix='.tmp_', suffix='.json', dir=根)
+    try:
+        with os.fdopen(tmp_fd, 'wb') as f:
+            f.write(数据)
+        os.replace(tmp_path, 目标)
+    except OSError as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise _请求错误('落盘失败：%s' % e, 状态=500)
+    return schema.make_saved_plan_summary(id=id, 标题=标题, 时间戳=时间戳)
+
+
+def 方案_列() -> dict:
+    """`GET /api/方案/列`：返回 `{方案列表:[{id,标题,时间戳}, ...]}`（新在前）。"""
+    return schema.make_saved_plan_list(_列存档())
+
+
+def 方案_取(id: str) -> dict:
+    """`GET /api/方案/<id>`：取单个存档（含方案本体）。"""
+    目标 = _方案文件路径(id)
+    if not os.path.isfile(目标):
+        raise _请求错误('方案不存在：%s' % id, 状态=404)
+    try:
+        with open(目标, 'r', encoding='utf-8') as f:
+            档 = json.load(f)
+    except (OSError, ValueError) as e:
+        raise _请求错误('存档读取失败：%s' % e, 状态=500)
+    if not isinstance(档, dict) or _F方案 not in 档:
+        raise _请求错误('存档格式错误：缺少「方案」', 状态=500)
+    return 档
+
+
+def 方案_删(id: str) -> dict:
+    """`DELETE /api/方案/<id>`：删单个存档。幂等——已不在也回 200。"""
+    目标 = _方案文件路径(id)
+    try:
+        os.unlink(目标)
+    except FileNotFoundError:
+        raise _请求错误('方案不存在：%s' % id, 状态=404)
+    except OSError as e:
+        raise _请求错误('删除失败：%s' % e, 状态=500)
+    return {_Fid: id}
+
+
+
 #: POST 路由表。键是 URL path，值是 `(dict) -> dict`。
 _POST路由 = {
     '/api/选': 选,
     '/api/组': 组,
     '/api/跑': 跑,
+    '/api/方案/存': 方案_存,
 }
+
+#: 方案的固定 path 匹配（`/api/方案/列` 是 GET 的**枚举**端点，与 `/api/方案/<id>`
+#: 是不同资源；不能混用同一段前缀分派，否则 id=`列` 就会歧义）。
+_方案列路径 = '/api/方案/列'
+_方案id前缀 = '/api/方案/'
 
 
 # ---- HTTP 层 -----------------------------------------------------------
@@ -396,7 +690,7 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
     不用自己写。
     """
 
-    server_version = 'JiKuaiWeb/0.15.0'
+    server_version = 'JiKuaiWeb/0.16.0'
     protocol_version = 'HTTP/1.1'      # 要 Content-Length 精确才敢开长连接
 
     # -- 输出辅助 --
@@ -535,6 +829,17 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._分发(self._POST)
 
+    def do_DELETE(self) -> None:
+        self._分发(self._DELETE)
+
+    def _取方案id(self, 路径: str) -> str:
+        """从 `/api/方案/<id>` 里抠出 id 段。
+
+        不在这里做白名单校验——校验统一由 `_方案文件路径` 一处负责，避免两处
+        规则漂开。这里只负责「切出来」，切出来的可能是 `../../etc/passwd`。
+        """
+        return 路径[len(_方案id前缀):]
+
     def _GET(self) -> None:
         原始路径 = urllib.parse.urlsplit(self.path).path
         路径 = urllib.parse.unquote(原始路径)
@@ -542,9 +847,14 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
             self._发JSON(200, 块索引())
         elif 路径 == '/api/能力':
             self._发JSON(200, 能力())
+        elif 路径 == _方案列路径:
+            self._发JSON(200, 方案_列())
+        elif 路径.startswith(_方案id前缀):
+            self._发JSON(200, 方案_取(self._取方案id(路径)))
         elif 路径.startswith('/api/'):
-            raise _请求错误('未知端点 %s（GET 只有 /api/blocks、/api/能力）'
-                          % 路径, 状态=404)
+            raise _请求错误('未知端点 %s（GET 只有 /api/blocks、/api/能力、'
+                          '%s、%s<id>）' % (路径, _方案列路径, _方案id前缀),
+                          状态=404)
         else:
             # 静态走**原始**（未 unquote）路径：`_解析静态路径` 内部只 unquote 一次，
             # 提前 unquote 会让 `%252e` 这类二次编码逃逸绕过校验。
@@ -557,6 +867,14 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
             raise _请求错误('未知端点 %s（POST 只有 %s）'
                           % (路径, '、'.join(sorted(_POST路由))), 状态=404)
         self._发JSON(200, 处理(self._读body()))
+
+    def _DELETE(self) -> None:
+        """DELETE 只服务 `/api/方案/<id>`，其余一律 404。"""
+        路径 = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        if 路径 == _方案列路径 or not 路径.startswith(_方案id前缀):
+            raise _请求错误('未知端点 %s（DELETE 只有 %s<id>）'
+                          % (路径, _方案id前缀), 状态=404)
+        self._发JSON(200, 方案_删(self._取方案id(路径)))
 
     def _分发(self, 处理) -> None:
         """统一的异常边界：调用方的错 → 4xx，我们的错 → 500。

@@ -156,12 +156,21 @@ obj = mod.某类(参数)     # 实例化极快类
 | `06_中国特色管道.jk` | 人民币金额、农历/干支/生肖进管道 |
 
 ### 场景脚本（`examples/scenarios/`）
+
+平铺单文件脚本 **6 个**：
+
 | 文件 | 场景 |
 |------|------|
 | `财务计算.jk` | 报销单：`￥` 字面量、税费、大写金额、汇总 |
 | `农历工具.jk` | 公历→农历、干支纪年、生肖、甲子循环 |
 | `管道数据清洗.jk` | 脏数据 → 多级管道（≥3 段）→ 干净结果 |
-| `推理演示/main.jk` | Reasonix 推理引擎：4 阶段 Chain-of-Thought + AI 大模型调用 |
+| `报销单演示.jk` | L3 聚合块 `报销单`：财务 + 历法 + 中文跨域 |
+| `工资册演示.jk` | L3 聚合块 `工资册`：多人工资条批量 → 中文报表 |
+| `客户对账演示.jk` | L3 聚合块 `客户对账`：载入 → 分组汇总 → 差异比对 |
+
+另有 **4 个多文件场景**（各自一个目录，含 `main.jk` + `README.md` + `expected.txt` 快照）：
+`财务报表/`、`农历日程/`、`文本批处理/`、`推理演示/`。
+
 
 ### Reasonix 推理引擎演示
 
@@ -275,7 +284,7 @@ jk 块 跑 方案.json --json        # 执行，出 {源码, 执行结果:{stdou
 ```powershell
 $env:PYTHONPATH = "src;lsp"       # 或先 pip install -e . 与 lsp/
 python -m jikuai_lsp               # completion/hover/definition/极快.选块
-# VS Code 扩展 .vsix 打包与安装见 W16（待做）
+# VS Code 扩展安装指引见 docs/LSP-使用.md
 ```
 
 **Web** —— 本地只读单页（标准库 `http.server`，不引框架）：
@@ -289,20 +298,43 @@ python tools/web/server.py         # 默认 http://127.0.0.1:5000/
 
 ```
 jikuai/
-├── src/jikuai/
-│   ├── __init__.py
-│   ├── main.py          # CLI 与 REPL
-│   ├── keywords.py      # 关键字/动词/百家姓定义
-│   ├── tokens.py        # Token 类型
-│   ├── lexer.py         # 无空格分词器
-│   ├── ast_nodes.py     # AST 节点
-│   ├── parser.py        # 元数驱动解析器
-│   ├── evaluator.py     # 求值器/解释器
-│   └── builtins.py      # 内建函数与中国特色库
-├── stdlib/              # 标准库（.jk 文件）
-├── examples/            # 示例程序
-│   ├── pipelines/       # 管道范式示例（6 个）
-│   └── scenarios/       # 场景化脚本（3 个）
-├── tests/               # 测试
-└── docs/                # 文档
+├── src/jikuai/               # 主包（解释器 + 前端 + 服务层）
+│   ├── main.py               # CLI 与 REPL 入口
+│   ├── lexer.py              # 无空格分词器
+│   ├── parser.py             # 元数驱动解析器
+│   ├── frontend.py           # 两遍分词前端（ADR-06 X2）
+│   ├── evaluator.py          # 求值器/解释器
+│   ├── keywords.py           # 关键字/动词/百家姓定义
+│   ├── surnames.py           # 百家姓表（400+ 单姓 + 复姓）
+│   ├── tokens.py             # Token 类型
+│   ├── ast_nodes.py          # AST 节点
+│   ├── module_loader.py      # 模块解析（.jk / stdlib / 包）
+│   ├── pybridge.py           # 蟒: Python 互操作桥
+│   ├── completion.py         # 补全/元数查询（LSP/REPL 共用）
+│   ├── stdlib_contract.py    # 标准库导出契约
+│   ├── diagnostics/          # 诊断内核（ADR-14，唯一真源）
+│   ├── service/              # 三通道服务层（schema/session/position）
+│   ├── ai/                   # 语义选块检索（纯标准库，ADR-25）
+│   └── pkg/                  # 块生态 + 包管理（jk 块 / jk 包）
+├── stdlib/                   # 标准库
+│   ├── blocks/               # 块生态（108 块 · 索引.json + 向量索引.bin）
+│   └── *.jk / *.py           # 分词/排版/校验/成语/正则/简繁/历法/工具
+├── lsp/                      # Language Server（独立发行包，零依赖）
+│   └── jikuai_lsp/           # server/capabilities/transport
+├── dap/                      # Debug Adapter（独立发行包）
+│   └── jikuai_dap/
+├── tools/                    # 试验性 / 辅助工具（不随主包发行）
+│   ├── aot/                  # AOT 子集编译（Experimental · ADR-19）
+│   ├── web/                  # 本地 Web 单页（标准库 http.server）
+│   └── ai-bridge/            # 神经检索/向量索引/粘合器（neural 依赖隔离于此）
+├── editors/vscode/           # VS Code 扩展（语法高亮 + LSP 客户端 + 调试）
+├── examples/                 # 示例程序
+│   ├── pipelines/            # 管道范式示例（6 个）
+│   └── scenarios/            # 场景化脚本（6 个平铺 .jk + 4 个多文件 demo）
+├── benches/                  # 基准测试
+├── scripts/                  # 门禁与工具脚本（契约校验 / 索引生成）
+├── tests/                    # 测试
+└── docs/                     # 文档（语法参考 / 包管理 / ADR / BACKLOG 等）
 ```
+
+> 待办与已知边界的**唯一真源**是 [`docs/BACKLOG.md`](docs/BACKLOG.md)。

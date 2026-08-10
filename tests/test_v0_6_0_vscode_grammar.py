@@ -11,6 +11,8 @@ PACKAGE_JSON = os.path.join(EXT_DIR, 'package.json')
 GRAMMAR_JSON = os.path.join(EXT_DIR, 'syntaxes', '极快.tmLanguage.json')
 LANG_CONFIG_JSON = os.path.join(EXT_DIR, 'language-configuration.json')
 EXTENSION_TS = os.path.join(EXT_DIR, 'src', 'extension.ts')
+BUILD_PS1 = os.path.join(EXT_DIR, 'build.ps1')
+LSP_USAGE_DOC = os.path.join(REPO_ROOT, 'docs', 'LSP-使用.md')
 
 def _load_json(path):
     with open(path, encoding='utf-8') as f:
@@ -56,7 +58,8 @@ def test_package_json_is_valid_json(pkg):
     assert pkg['name'] == 'jikuai-vscode'
 
 def test_package_version_matches_main_package(pkg):
-    assert pkg['version'] == '0.6.0'
+    # W25（v0.16.0）起两处对齐主包 `_version.__version__`；此前长期
+    # 停在 `0.6.0` 与主包脱节九个版本，G15 门禁已并入 CI 防止再次漂移。
     assert pkg['version'] == jikuai.__version__
 
 def test_package_engines_and_activation(pkg):
@@ -184,10 +187,11 @@ def test_vscodeignore_excludes_sources():
     assert 'src/**' in lines
     assert 'node_modules/**' in lines
 
-def test_changelog_has_0_6_0_entry(pkg):
+def test_changelog_has_current_version_entry(pkg):
+    """扩展 CHANGELOG 应有当前版本条目（W25：不再硬编码 0.6.0）。"""
     with open(os.path.join(EXT_DIR, 'CHANGELOG.md'), encoding='utf-8') as f:
         text = f.read()
-    assert '[0.6.0]' in text
+    assert f"[{pkg['version']}]" in text
 
 def test_readme_documents_install_build_and_scope():
     with open(os.path.join(EXT_DIR, 'README.md'), encoding='utf-8') as f:
@@ -196,3 +200,76 @@ def test_readme_documents_install_build_and_scope():
     assert 'npm run compile' in text
     assert '极快.pythonPath' in text
     assert 'M6' in text
+
+
+# ---- W33（v0.16.0）：命令面板选块 + 打包脚本 + 使用文档 ----------------
+#
+# 静态契约测试。命令面板交互本身要真 VS Code 宿主才能跑，这里守的是
+# 「三处命令名一致 + 交付物存在」这条线——名字漂了 VS Code 会报
+# 「command not found」，而那种错在打包后才暴露，代价远高于在此拦住。
+
+SELECT_BLOCK_COMMAND = '极快.选块'
+
+
+def test_contributes_commands_registers_select_block(pkg):
+    commands = pkg['contributes']['commands']
+    assert isinstance(commands, list) and commands
+    by_id = {c['command']: c for c in commands}
+    assert SELECT_BLOCK_COMMAND in by_id, sorted(by_id)
+    assert by_id[SELECT_BLOCK_COMMAND]['title'] == '极快: 选块'
+
+
+def test_activation_event_for_select_block(pkg):
+    # VS Code 1.75+ 可由 contributes.commands 隐式推导，仍显式声明以求清晰。
+    assert f'onCommand:{SELECT_BLOCK_COMMAND}' in pkg['activationEvents']
+
+
+def test_extension_ts_wires_select_block_command():
+    """命令名、executeCommand 调用与插入语句三者都在源码里。"""
+    with open(EXTENSION_TS, encoding='utf-8') as f:
+        src = f.read()
+    assert f"'{SELECT_BLOCK_COMMAND}'" in src          # 命令 ID 常量
+    assert 'registerCommand' in src                     # 注册进命令面板
+    assert 'showInputBox' in src                        # 需求输入框
+    assert 'showQuickPick' in src                       # 候选列表
+    assert 'workspace/executeCommand' in src            # 走 LSP 命令通道
+    assert '从 blocks.' in src                          # 插入的导入语句模板
+    assert 'clipboard' in src                           # 无编辑器时的兜底
+
+
+def test_build_ps1_exists_and_checks_toolchain():
+    assert os.path.isfile(BUILD_PS1), BUILD_PS1
+    with open(BUILD_PS1, encoding='utf-8') as f:
+        text = f.read()
+    # 前置检查 + 两条核心命令
+    assert 'Get-Command node' in text
+    assert 'Get-Command npm' in text
+    assert 'npm install' in text
+    assert 'vsce package' in text
+
+
+def test_lsp_usage_doc_exists_and_covers_three_steps():
+    assert os.path.isfile(LSP_USAGE_DOC), LSP_USAGE_DOC
+    with open(LSP_USAGE_DOC, encoding='utf-8') as f:
+        text = f.read()
+    assert 'pip install -e lsp/' in text        # 第 1 步
+    assert 'build.ps1' in text                  # 第 2 步
+    assert 'VSIX' in text                       # 第 3 步
+    assert '极快.pythonPath' in text            # 常见问题：Python 路径
+    for 能力 in ('documentSymbol', 'signatureHelp', SELECT_BLOCK_COMMAND):
+        assert 能力 in text, 能力
+
+
+def test_root_readme_points_to_usage_doc_not_internal_wbs():
+    """根 README 不该对外暴露内部 WBS 编号欠账，应指向使用文档。"""
+    with open(os.path.join(REPO_ROOT, 'README.md'), encoding='utf-8') as f:
+        text = f.read()
+    assert 'docs/LSP-使用.md' in text
+    assert 'W16（待做）' not in text
+
+
+def test_extension_changelog_has_no_todo_placeholder():
+    with open(os.path.join(EXT_DIR, 'CHANGELOG.md'), encoding='utf-8') as f:
+        text = f.read()
+    assert '待填' not in text
+    assert 'build.ps1' in text

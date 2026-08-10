@@ -1,22 +1,24 @@
-# jikuai-lsp — 极快语言 LSP 桩（v0.5.0 · M4）
+# jikuai-lsp — 极快语言 Language Server（v0.15.0）
 
 极快（JiKuai）语言的 **Language Server Protocol** 实现，独立发行包。
-当前处于 **M4 桩阶段**，作为 F1 冻结点「CLI + LSP 桩双消费者实证」的载体。
+自实现最小 JSON-RPC over stdio（`transport.py`），**零第三方运行时依赖**。
 
 ## 与主包的隔离关系（ADR-15）
 
 - **物理隔离**：本包 `jikuai-lsp` 独立发行，主包 `jikuai` 不依赖 `jikuai-lsp`。
 - **单向依赖**：`jikuai_lsp` 可以 `import jikuai`；反之禁止。
-- **零副作用**：主包在不安装 `jikuai-lsp` 时行为完全不变（测试用例数与结果一致）。
+- **零副作用**：主包在不安装 `jikuai-lsp` 时行为完全不变。
+  `tests/test_v0_5_0_lsp_stub.py::test_physical_isolation_import_jikuai_alone`
+  在子进程里守这条线：`import jikuai` 后 `sys.modules` 不得出现
+  `jikuai_lsp` 或 `pygls`。
+- **主包惰性导入**：`server._ensure_jikuai()` 在首次用到时才导入
+  `jikuai.service` / `jikuai.completion` / `jikuai.diagnostics`。
 
 ## 安装
 
 ```bash
-# 主包（前置依赖）
-pip install -e .
-
-# LSP 桩
-pip install -e lsp/
+pip install -e .        # 主包（前置依赖）
+pip install -e lsp/     # LSP 服务器
 ```
 
 或直接通过 PYTHONPATH 运行（测试即走此路径，无需 pip install）：
@@ -32,55 +34,114 @@ python -m jikuai_lsp
 python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 ```
 
-服务器读取 stdin、写 stdout 的 JSON-RPC 消息（LSP 帧格式：
+服务器读 stdin、写 stdout 的 JSON-RPC 消息（LSP 帧格式：
 `Content-Length: N\r\n\r\n<UTF-8 JSON>`），日志走 stderr。
 
-## M4 桩能力边界
+## 已实现能力
 
-| 功能 | 状态 | 说明 |
-| --- | --- | --- |
-| `initialize` | ✅ | 返回 `capabilities` + `serverInfo` |
-| `initialized` | ✅ | 静默接收 |
-| `shutdown` / `exit` | ✅ | 正常关闭链路，退出码 0 |
-| `textDocument/didOpen` | ✅ | 缓存文档 + 推送 `publishDiagnostics` |
-| `textDocument/didChange` | ✅ | Full sync；缓存更新 + 推送诊断 |
-| `textDocument/didClose` | ✅ | 清缓存 + 推送空诊断 |
-| **真实诊断投影** | ✅ | ParseError → `diagnostics.from_error_info` → `to_lsp_diagnostic` |
-| `completionProvider` | ⏭️ M5 | M4 桩**未声明**（声明即承诺响应，规避契约风险） |
-| `hoverProvider` | ⏭️ M5 | 同上 |
-| 增量同步（Incremental） | ⏭️ M5 | 桩用 Full sync（`change=1`），文本每次整篇重传 |
+| 方法 / 能力 | 说明 |
+| --- | --- |
+| `initialize` | 返回 `capabilities` + `serverInfo`（name=`jikuai-lsp`） |
+| `initialized` | 静默接收 |
+| `shutdown` / `exit` | 正常关闭链路，退出码 0 |
+| `textDocument/didOpen` | 缓存文档 + 推送 `publishDiagnostics` |
+| `textDocument/didChange` | **Incremental sync**（`change=2`）；无 `range` 的变更按全文替换兜底 |
+| `textDocument/didClose` | 清缓存 + 推送空诊断 |
+| `textDocument/publishDiagnostics` | 服务端 push。走 `service.SessionHost.compile_and_diagnose`，ParseError → `diagnostics.from_error_info` → `to_lsp_diagnostic` |
+| `textDocument/completion` | 内建动词 / 关键字 / 用户名字 / `模块.成员`；触发字符 `.` 与 `，` |
+| `textDocument/hover` | 内建动词与关键字的中文 Markdown 说明；其他 token 返回 `null` |
+| `textDocument/definition` | `导入` / `从 … 导入` 语句里的点分块路径 → 块目录 URI；不命中返回 `null` |
+| `workspace/executeCommand` | 命令 `极快.选块`：`{需求, top?}` → `{需求, 候选[]}`，与 `jk 块 选 --json` 同构 |
 
-## 能力声明（capabilities.py）
+### 位置口径
 
-```python
-SERVER_CAPABILITIES = {
-    "textDocumentSync": {"openClose": True, "change": 1},  # 1 = Full
-    "positionEncoding": "utf-16",
+`positionEncoding = "utf-16"`。所有列换算经 `jikuai.service.position`
+的 `utf16_to_codepoint` / `codepoint_to_utf16`，与
+`diagnostics.adapters.to_lsp_diagnostic` 的 0-based UTF-16 code unit
+口径一致。中文源码里这一步不能省——汉字在 UTF-16 里是 1 个单元，
+但 emoji 与部分生僻字是 2 个。
+
+### `极快.选块` 命令契约
+
+请求：
+
+```json
+{
+  "command": "极快.选块",
+  "arguments": [{"需求": "把一批数字求和再算平均", "top": 3}]
 }
 ```
 
-`positionEncoding = "utf-16"` 与主包 `diagnostics.adapters.to_lsp_diagnostic`
-的列换算口径（0-based UTF-16 code unit）保持一致。
+响应（字段定义唯一真源在 `src/jikuai/service/schema.py`）：
+
+```json
+{
+  "需求": "把一批数字求和再算平均",
+  "候选": [
+    {"名称": "求和", "领域": "数据", "层级": 0,
+     "描述": "…", "分数": 6.1234, "路径": "[启发式]"}
+  ]
+}
+```
+
+- `需求` 缺失或为空 → JSON-RPC 错误（`-32602` InvalidParams）。
+- 未知 command → JSON-RPC 错误（`-32601` MethodNotFound），**不静默返回 null**。
+- 默认走启发式检索（纯标准库，不起子进程）。神经路径需调用方提供查询向量，
+  LSP 通道当前不暴露该入口。
+
+## 已知缺口
+
+| 缺口 | 现状 |
+| --- | --- |
+| `textDocument/codeAction` | 未实现。v0.15.0 WBS 标为可选，本轮跳过 |
+| `textDocument/rename` / `references` | 未实现。需要跨文件符号表，依赖后续 workspace 索引 |
+| `documentSymbol` / `foldingRange` | 未实现 |
+| `signatureHelp` | 未实现。动词元数信息已有（`completion.verb_arity_text`），差协议层接线 |
+| 增量诊断 | `didChange` 走增量同步，但诊断仍是整篇重编译 |
+| 多根 workspace | `definition` 只查 `blocks_root()` 与文档自身目录，不解析 `workspaceFolders` |
+| pull-based 诊断 | `diagnosticProvider: false`。诊断只走服务端 push |
+| 补全空前缀 | LSP 口径下空前缀返回 `[]`（不列全表），与 REPL 的 Tab 行为**故意不同** |
+
+## 能力声明（capabilities.py）
+
+`SERVER_CAPABILITIES` 是**纯数据 dict**，测试直接断言，不反射运行期对象。
+`freeze_signature()` 返回按 key 递归排序的规范化字典，是对外契约的唯一判据；
+锁死在 `tests/test_lsp_capabilities_freeze.py`。
+
+契约变更历史：
+
+| 版本 | 变更 |
+| --- | --- |
+| v0.6.0 M5（F3 冻结点） | `textDocumentSync`(Full) + `completionProvider` + `hoverProvider` |
+| v0.15.0 W14 | 新增 `definitionProvider`；`textDocumentSync.change` 1 → 2 |
+| v0.15.0 W15 | 新增 `executeCommandProvider`（`极快.选块`） |
 
 ## 技术栈选型
 
-**当前实现：自实现最小 JSON-RPC over stdio（`transport.py`）。**
+**自实现最小 JSON-RPC over stdio（`transport.py`），不用 pygls。**
 
-原因：
 1. 本机 pygls 为 2.x（`from pygls.lsp.server import LanguageServer`），
-   与 M4 假设的 1.x API 不符。自实现可控性最高。
-2. **物理隔离最干净**：运行期 `sys.modules` 无 `pygls`，
-   与「主包不感知 LSP」的 ADR-15 契约完全一致。
-3. LSP 底层帧格式极其简单，写测试子进程也是手写 client。
-4. `pygls` 已在 `pyproject.toml` 的 `optional-dependencies` 中登记，
-   M5 可平滑切换。
+   与早期设计假设的 1.x API 不符。
+2. **物理隔离最干净**：运行期 `sys.modules` 无 `pygls`，与
+   「主包不感知 LSP」的 ADR-15 契约一致。
+3. LSP 帧格式极简，测试子进程也是手写 client，收发完全可控。
+4. `pygls` 保留在 `pyproject.toml` 的 `optional-dependencies`，
+   将来若要切换有退路。
 
-## M5 计划
+## 测试
 
-- 基于 pygls 或继续自实现（届时二选一）重构 `server.py`。
-- 补齐 `completionProvider` / `hoverProvider` / `definitionProvider`。
-- 抽出 `service/TextDocumentStore` 至主包 L3 层，CLI 与 LSP 共享。
-- 支持 Incremental sync + 增量诊断。
+```powershell
+python -m pytest tests/test_v0_5_0_lsp_stub.py -q          # 生命周期 + 诊断 + 隔离
+python -m pytest tests/test_lsp_completion.py -q           # completion
+python -m pytest tests/test_lsp_hover.py -q                # hover
+python -m pytest tests/test_lsp_definition.py -q           # definition
+python -m pytest tests/test_lsp_incremental_sync.py -q     # 增量同步
+python -m pytest tests/test_lsp_execute_command.py -q      # 极快.选块
+python -m pytest tests/test_lsp_capabilities_freeze.py -q  # 能力冻结契约
+```
+
+所有 LSP 测试都起真子进程（`python -m jikuai_lsp`）走真实协议对话，
+共享 helper 在 `tests/lsp_helpers.py`。
 
 ## 目录结构
 
@@ -91,7 +152,7 @@ lsp/
 └── jikuai_lsp/
     ├── __init__.py          # __version__ / main 导出
     ├── __main__.py          # `python -m jikuai_lsp` 入口
-    ├── server.py            # LSP 消息循环与生命周期
-    ├── capabilities.py      # SERVER_CAPABILITIES 纯数据
+    ├── server.py            # LSP 消息循环、生命周期与各 handler
+    ├── capabilities.py      # SERVER_CAPABILITIES 纯数据 + freeze_signature
     └── transport.py         # JSON-RPC over stdio 帧读写
 ```

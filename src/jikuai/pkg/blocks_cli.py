@@ -11,6 +11,7 @@
     jk 块 详情 <块名>                                    show
     jk 块 校验 [块目录]                                  check
     jk 块 索引 [块目录]                                  index
+    jk 块 新建 --领域 X --名 <块名> ...                  new/init
     jk 块 帮助                                           help
 
 三段式设计语言：`[需求]→[候选]→[方案]→[源码]→[结果]`
@@ -27,13 +28,15 @@ import json
 import os
 import sys
 import tempfile
+import time
 from typing import List, Optional
 
 from . import blocks
 from .blocks import (
-    ALLOWED_DOMAINS, BLOCK_INDEX_NAME, STABILITY_LEVELS,
+    ALLOWED_DOMAINS, BLOCK_INDEX_NAME, BLOCK_METADATA_NAME, STABILITY_LEVELS,
     BlockError, BlockMetadata,
 )
+from ..service import schema
 
 __all__ = ['main', 'run']
 
@@ -53,13 +56,18 @@ _USAGE = f"""极快块生态 用法：
   jk 块 校验 [块目录]            校验一个块或全部块的合规性
                                  （元数据/主 .jk/导出/词法原子/依赖块 一致性）
   jk 块 索引 [块目录]            重新生成 {BLOCK_INDEX_NAME}
+  jk 块 新建 --领域 X --名 <块名> [--导出 <名>] [--参 赵甲 赵乙]
+            [--层级 N] [--稳定性 experimental]
+                                 生成合规块脚手架三件套（{BLOCK_METADATA_NAME} /
+                                 <块名>.jk / 测试.jk）；块名、导出名与每个形参名
+                                 都先过词法原子性预检，不原子当场拒绝
   jk 块 帮助                     显示本帮助
 
 三段式：选（需求→候选）→ 组（方案→源码）→ 跑（方案→结果）
   端到端：jk 块 选 "需求" --组 | jk 块 跑 -
 
 英文别名：list(ls) / search(find) / select(pick) / synthesize(assemble) /
-          run / show(info) / check(validate) / index / help
+          run / show(info) / check(validate) / index / new(init) / help
 
 领域白名单：{'/'.join(sorted(ALLOWED_DOMAINS))}
 稳定性等级：{'/'.join(sorted(STABILITY_LEVELS))}
@@ -76,6 +84,7 @@ _ALIASES = {
     '详情': 'show', '显示': 'show', 'show': 'show', 'info': 'show',
     '校验': 'check', '检查': 'check', 'check': 'check', 'validate': 'check',
     '索引': 'index', 'index': 'index',
+    '新建': 'new', '起块': 'new', 'new': 'new', 'init': 'new',
     '帮助': 'help', 'help': 'help', '-h': 'help', '--help': 'help',
 }
 
@@ -146,19 +155,21 @@ def _display_name(block_dir: str) -> str:
 
 
 # ---- 三段式共用：候选 / 方案 / 结果 -------------------------------------
-# 一份 schema 走三段（W12 会跨 CLI/LSP/Web 复用）：
+# 三通道 JSON 协议的**唯一真源**是 `jikuai.service.schema`（见
+# `docs/协议-三通道.md`）；本文件只做参数解析与人读输出，构造 JSON 一律
+# 走 `schema.make_*`，不再手写字段名字面量。
 #
-#   {
-#     "需求": "把一批数字求和再算平均",     -- 选/组/跑 都只当注释用
-#     "候选": [{名称,领域,描述,分数,路径}],  -- 选 产出
-#     "共享": [{"名":"赵料","值":"列 1 2 3"}],
-#     "步骤": [{块,领域,导出名,说明,参数}],  -- 方案主体（协议.md）
-#     "打印": ["赵果1"],
-#     "源码": "-- 由 极快 AI 桥接…",         -- 组 产出
-#     "结果": ["6"]                          -- 跑 产出（程序打印的每一行）
-#   }
-#
-# `步骤` 是「方案」的判据：有它就是方案，没有但有 `候选` 就先把候选提成方案。
+# 读取入参 / 拼中间态方案时也不写裸字符串，键名从 schema 常量解包出来——
+# 用整元组解包而不是硬编码下标：协议真加了字段，这里会当场 ValueError，
+# 而不是静默读错一个键。
+_F需求, _F共享, _F打印 = schema.PLAN_OPTIONAL
+_, _F候选 = schema.SELECT_ENVELOPE_REQUIRED
+_F步骤 = schema.PLAN_REQUIRED[0]
+_F块, _F领域, _F导出名 = schema.STEP_REQUIRED
+_F参数, _F说明 = schema.STEP_OPTIONAL
+_F名称, _, _, _F描述, _, _ = schema.CANDIDATE_REQUIRED
+_Fstdout, _Fstderr, _F返回值, _F耗时毫秒 = schema.RESULT_REQUIRED
+_F错误, _F诊断 = schema.RESULT_OPTIONAL
 
 #: `选` 的人读候选行：`  1. 求和（数据）  分数 0.1234`
 import re as _re
@@ -253,7 +264,8 @@ def _解析人读候选(text: str) -> Optional[dict]:
 
     为什么要这一层：DoD 里的管道是 `jk 块 选 "…" | jk 块 组 -`，中间没有
     `--json`。宽容地认这份人读清单，管道才真的能一把接上；解析失败不猜，
-    交给调用方报错。
+    交给调用方报错。人读候选没带 `层级`/`分数`/`路径`——本层只捞名/域，
+    真正的候选校验交给下游的 `_校验方案`。
     """
     需求 = None
     候选 = []
@@ -264,10 +276,11 @@ def _解析人读候选(text: str) -> Optional[dict]:
             continue
         m = _人读候选行.match(line)
         if m:
-            候选.append({'名称': m.group('名').strip(), '领域': m.group('域').strip()})
+            候选.append({_F名称: m.group('名').strip(),
+                       _F领域: m.group('域').strip()})
     if not 候选:
         return None
-    return {'需求': 需求 or '', '候选': 候选}
+    return {_F需求: 需求 or '', _F候选: 候选}
 
 
 def _候选转方案(信封: dict, 步数: int) -> dict:
@@ -275,22 +288,29 @@ def _候选转方案(信封: dict, 步数: int) -> dict:
 
     候选没有参数信息，所以 `参数` 一律省略，交给 `--自动链式` 的类型图去推；
     推不出的由粘合器落 `?` 占位并写明「需人工填参」——不静默硬塞。
+
+    只把 `需求`/`共享`/`打印` 这几个**方案字段**带过去：`候选`/`降级说明`
+    是「选」阶段的产物，不是方案的一部分，留在里面会被
+    `schema.ensure_plan`（glue 入口）当未知字段拒掉——协议禁止通道私自加字段。
     """
-    候选 = 信封.get('候选')
+    候选 = 信封.get(_F候选)
     if not isinstance(候选, list) or not 候选:
         raise BlockError('输入既没有「步骤」也没有非空「候选」，无从组装')
     步骤 = []
     for h in 候选[:步数]:
-        if not isinstance(h, dict) or not h.get('名称') or not h.get('领域'):
+        if not isinstance(h, dict) or not h.get(_F名称) or not h.get(_F领域):
             raise BlockError('候选项必须含「名称」与「领域」：%r' % (h,))
         步骤.append({
-            '块': h['名称'],
-            '领域': h['领域'],
-            '说明': h.get('描述') or ('候选 %s' % h['名称']),
+            _F块: h[_F名称],
+            _F领域: h[_F领域],
+            _F说明: h.get(_F描述) or ('候选 %s' % h[_F名称]),
         })
-    方案 = dict(信封)
-    方案['步骤'] = 步骤
-    return 方案
+    return schema.make_plan(
+        步骤,
+        需求=信封.get(_F需求),
+        共享=信封.get(_F共享),
+        打印=信封.get(_F打印),
+    )
 
 
 def _校验方案(方案: dict) -> dict:
@@ -301,9 +321,9 @@ def _校验方案(方案: dict) -> dict:
     """
     if not isinstance(方案, dict):
         raise BlockError('方案必须是 JSON 对象（得到 %s）' % type(方案).__name__)
-    步骤 = 方案.get('步骤')
+    步骤 = 方案.get(_F步骤)
     if 步骤 is None or 步骤 == []:
-        raise BlockError('方案缺少非空的「步骤」字段（schema 见 tools/ai-bridge/协议.md）')
+        raise BlockError('方案缺少非空的「步骤」字段（schema 见 docs/协议-三通道.md）')
     if not isinstance(步骤, list):
         raise BlockError('「步骤」必须是数组（得到 %s）' % type(步骤).__name__)
 
@@ -312,10 +332,10 @@ def _校验方案(方案: dict) -> dict:
         if not isinstance(s, dict):
             raise BlockError('步骤 %d 必须是 JSON 对象（得到 %s）' % (i, type(s).__name__))
         s = dict(s)
-        for 字段 in ('块', '领域'):
+        for 字段 in (_F块, _F领域):
             if not s.get(字段):
                 raise BlockError('步骤 %d 缺少必填字段「%s」' % (i, 字段))
-        块, 领域 = s['块'], s['领域']
+        块, 领域 = s[_F块], s[_F领域]
         if 领域 not in ALLOWED_DOMAINS:
             raise BlockError('步骤 %d 的领域 %r 不在白名单（允许：%s）'
                              % (i, 领域, '/'.join(sorted(ALLOWED_DOMAINS))))
@@ -323,12 +343,12 @@ def _校验方案(方案: dict) -> dict:
             raise BlockError('步骤 %d 的块「%s」不存在：%s 下没有这个目录'
                              '（`jk 块 查找 %s` 看看真名）'
                              % (i, 块, os.path.join('blocks', 领域), 块))
-        if not s.get('导出名'):
-            s['导出名'] = _推导出名(领域, 块)
+        if not s.get(_F导出名):
+            s[_F导出名] = _推导出名(领域, 块)
         新步骤.append(s)
 
     新方案 = dict(方案)
-    新方案['步骤'] = 新步骤
+    新方案[_F步骤] = 新步骤
     return 新方案
 
 
@@ -350,7 +370,7 @@ def _读方案(路径: str, 步数: int) -> dict:
         if data is None:
             raise BlockError('输入既不是 JSON 方案，也不是「选」的候选清单；'
                              '试试 `jk 块 选 "需求" --json`')
-    if isinstance(data, dict) and data.get('步骤') is None and data.get('候选'):
+    if isinstance(data, dict) and data.get(_F步骤) is None and data.get(_F候选):
         data = _候选转方案(data, 步数)
     return _校验方案(data)
 
@@ -368,28 +388,63 @@ def _组装(方案: dict, 自动链式: bool = True) -> str:
 _占位记号 = '需人工填参'
 
 
+def _诊断条(e: Exception) -> Optional[List[dict]]:
+    """从异常里尽力提取结构化诊断（协议 `执行结果.诊断`）；拿不到返回 None。
+
+    只有 `JiKuaiError` 且带 `info`（`errors.ErrorInfo`，含 1-based 码点
+    行/列）时才有位置信息可填。拿不到就不伪造——协议里 `诊断` 是可选字段。
+    字段键走 `schema.DIAGNOSTIC_REQUIRED` 常量，不手写字面量。
+    """
+    info = getattr(e, 'info', None)
+    if info is None:
+        return None
+    行 = getattr(info, 'line', None)
+    列 = getattr(info, 'col', None)
+    if not isinstance(行, int) or not isinstance(列, int):
+        return None
+    级别 = getattr(getattr(info, 'category', None), 'value', '错误')
+    条 = dict(zip(schema.DIAGNOSTIC_REQUIRED,
+                 (行, 列, 级别, getattr(info, 'message', str(e)))))
+    return [条]
+
+
 def _执行源码(源码: str):
-    """把源码落**临时** `.jk` 再交给解释器跑，返回 `(结果, 打印出的文本)`。
+    """把源码落**临时** `.jk` 再交给解释器跑，返回 `schema.make_result`。
 
     为什么落临时文件而不直接 `run_source(源码)`：模块解析要靠 `current_file`
     定位搜索路径（`module_loader._search_paths`），给个真实路径最省事，也让
     报错信息里的文件名可点。临时文件在 finally 里删掉，工作区不留垃圾。
 
-    程序的打印用 `redirect_stdout` 收进内存——`--json` 要把它塞进 `结果`
-    字段，人读模式再原样吐回真 stdout，两条路输出一致。
+    stdout 与 stderr **同时**拦下（`redirect_stdout`/`redirect_stderr`）：诊断
+    是打到 stderr 的，协议要求 `执行结果.stderr` 把它带上，人读模式再把两条流
+    原样吐回真终端。异常收敛成 `错误='<类名>：<消息>'`（不带 traceback），带
+    位置信息时顺手填 `诊断`。`耗时毫秒` 用 `time.perf_counter`。
     """
     import io
-    from contextlib import redirect_stdout
+    from contextlib import redirect_stdout, redirect_stderr
     from ..main import run_source
 
     fd, path = tempfile.mkstemp(prefix='jk_块跑_', suffix='.jk')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
             f.write(源码)
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            结果 = run_source(源码, file=path)
-        return 结果, buf.getvalue()
+        缓出, 缓错 = io.StringIO(), io.StringIO()
+        错误 = None
+        诊断 = None
+        结果 = None
+        起 = time.perf_counter()
+        try:
+            with redirect_stdout(缓出), redirect_stderr(缓错):
+                结果 = run_source(源码, file=path)
+        except Exception as e:                           # noqa: BLE001
+            错误 = '%s：%s' % (type(e).__name__, e)
+            诊断 = _诊断条(e)
+        耗时 = (time.perf_counter() - 起) * 1000.0
+        return schema.make_result(
+            stdout=缓出.getvalue(), stderr=缓错.getvalue(),
+            返回值='' if 错误 else repr(结果),
+            耗时毫秒=耗时, 错误=错误, 诊断=诊断,
+        )
     finally:
         try:
             os.unlink(path)
@@ -627,6 +682,7 @@ def _cmd_select(args: List[str]) -> int:
         return _err('缺少需求文本。用法：jk 块 选 <需求> [--top N] [--json]')
 
     查询向量 = None
+    降级说明 = None
     if 向量文件:
         try:
             with open(向量文件, 'r', encoding='utf-8') as f:
@@ -650,7 +706,9 @@ def _cmd_select(args: List[str]) -> int:
         expected = embed_client.index_dim()
         vec, why = embed_client.fetch_query_vector(需求, expected_dim=expected)
         if vec is None:
-            print(f'神经检索不可用，降级到启发式：{why}', file=sys.stderr)
+            # 降级原因既打 stderr（保留旧交互）也进 JSON `降级说明`（协议字段）。
+            降级说明 = f'神经检索不可用，降级到启发式：{why}'
+            print(降级说明, file=sys.stderr)
         else:
             查询向量 = vec
 
@@ -664,19 +722,20 @@ def _cmd_select(args: List[str]) -> int:
         return _err(str(e))
 
     if as_json:
-        print(json.dumps({
-            '需求': 需求,
-            '候选': [h.as_dict() for h in hits],
-        }, ensure_ascii=False, indent=2))
+        信封 = schema.make_select_envelope(
+            需求, [schema.candidate_from_hit(h) for h in hits],
+            降级说明=降级说明,
+        )
+        print(json.dumps(信封, ensure_ascii=False, indent=2))
         return 0
 
     if as_组:
         # --组：选完直接过 校验（补 导出名）+ glue.synthesize 出源码
         try:
             方案 = _校验方案({
-                '需求': 需求,
-                '步骤': [{'块': h.name, '领域': h.domain,
-                        '说明': h.description} for h in hits],
+                _F需求: 需求,
+                _F步骤: [{_F块: h.name, _F领域: h.domain,
+                        _F说明: h.description} for h in hits],
             })
             源码 = _glue().synthesize(方案, 自动链式=True)
         except BlockError as e:
@@ -781,30 +840,258 @@ def _cmd_run(args: List[str]) -> int:
     if show_src:
         sys.stderr.write(源码 if 源码.endswith('\n') else 源码 + '\n')
         sys.stderr.write('----\n')
+    占位提示 = ('方案有步骤的参数未指定（源码里出现「%s」）；'
+              '在「步骤」里补 `参数`，或换成类型图能自动链上的组合' % _占位记号)
     if _占位记号 in 源码:
-        return _err('方案有步骤的参数未指定（源码里出现「%s」）；'
-                    '在「步骤」里补 `参数`，或换成类型图能自动链上的组合'
-                    % _占位记号)
-    try:
-        结果, 打印文本 = _执行源码(源码)
-    except Exception as e:                            # noqa: BLE001
-        错误 = '%s：%s' % (type(e).__name__, e)
         if as_json:
-            print(json.dumps({'需求': 方案.get('需求', ''), '错误': 错误,
-                              '源码': 源码}, ensure_ascii=False, indent=2))
-        else:
-            print('执行错误：%s' % 错误, file=sys.stderr)
-        return _EXIT_RUN
+            执行结果 = schema.make_result(错误=占位提示)
+            信封 = schema.make_run_envelope(源码, 执行结果, 需求=方案.get(_F需求))
+            print(json.dumps(信封, ensure_ascii=False, indent=2))
+            return _EXIT_INPUT
+        return _err(占位提示)
+    执行结果 = _执行源码(源码)
     if as_json:
-        print(json.dumps({
-            '需求': 方案.get('需求', ''),
-            '源码': 源码,
-            '结果': 打印文本.splitlines(),
-            '返回值': repr(结果),
-        }, ensure_ascii=False, indent=2))
+        信封 = schema.make_run_envelope(源码, 执行结果, 需求=方案.get(_F需求))
+        print(json.dumps(信封, ensure_ascii=False, indent=2))
     else:
-        sys.stdout.write(打印文本)
-    return 0
+        # 人读模式：stdout 直出、stderr 转发到真 stderr（诊断也走这条）；
+        # 有 `错误` 时再补一行「执行错误：…」，等价于旧行为里裸异常打的那条。
+        sys.stdout.write(执行结果.get(_Fstdout, ''))
+        sys.stderr.write(执行结果.get(_Fstderr, ''))
+        错误 = 执行结果.get(_F错误)
+        if 错误:
+            print('执行错误：%s' % 错误, file=sys.stderr)
+    return _EXIT_RUN if 执行结果.get(_F错误) else _EXIT_OK
+
+
+#: 脚手架产出的初始版本号。块生态里 `0.1.0` 是「刚起、还没人用」的约定起点。
+_新块版本 = '0.1.0'
+
+#: 描述字段的占位。刻意留成刺眼的 TODO：`_validate` 只要求「非空字符串」，
+#: 描述空着会静默过校验，但检索侧（TF-IDF / 向量）吃的就是这段文字——留白
+#: 等于把块从 `jk 块 选` 里删掉。
+_新块描述占位 = 'TODO: 填写描述'
+
+#: 未标注类型时的兜底。`任意` 在 SCALAR_TYPES 里，能过 `_validate`，但会被
+#: G14（`check_type_annotation`）留下精度问题——脚手架故意不猜类型，让 W23
+#: 的门禁把「该细化了」这件事顶到贡献者脸上，而不是替他编一个假类型。
+_新块类型占位 = '任意'
+
+
+def _原子性拒绝(角色: str, 名: str, pieces, 补充: str) -> int:
+    """把一次词法原子性失败翻译成人读理由 + 返回码 1。
+
+    `pieces` 是 `check_*_atomicity` 的第二个返回值 `[(词形, 文本), ...]`。
+    报错里**必须**带切分结果——只说「不原子」用户不知道是哪个字招的祸，
+    带上 `赵(IDENT)+次(KEYWORD)` 他立刻看懂是 `次` 撞了关键字。
+    格式与 `blocks.validate_block` 的报错保持一致，两处输出可互相对照。
+    """
+    frag = '+'.join('%s(%s)' % (v, t) for t, v in pieces)
+    return _err('%s「%s」非词法原子，切分为 %s；%s' % (角色, 名, frag, 补充))
+
+
+def _取形参(args: List[str]) -> List[str]:
+    """从 args 里就地取出 `--参 赵甲 赵乙 ...` 的变长形参列表。
+
+    与 `_take_option` 的区别：它只吃一个值，`--参` 要吃到下一个 `--` 选项
+    （或参数结束）为止。可以给多次，结果按出现顺序拼接。
+    """
+    形参: List[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] in ('--参', '--params'):
+            j = i + 1
+            while j < len(args) and not args[j].startswith('--'):
+                形参.append(args[j])
+                j += 1
+            if j == i + 1:
+                raise BlockError('%s 后面至少要跟一个形参名（如 --参 赵文 赵数）'
+                                 % args[i])
+            del args[i:j]
+        else:
+            i += 1
+    return 形参
+
+
+def _cmd_new(args: List[str]) -> int:
+    """`jk 块 新建` —— 一步生成合规块脚手架三件套（v0.15.0 W21）。
+
+    产出（都落 `stdlib/blocks/<领域>/<块名>/`，UTF-8 + LF）：
+
+        块.json      名称/版本/层级/领域/描述/[输入]/输出/导出/稳定性
+        <块名>.jk    `函数 <导出名> [接收 …]` 骨架 + `导出 <导出名>。`
+        测试.jk      `从 blocks.<领域>.<块名> 导入 <导出名>` 的最小冒烟
+
+    `.py` 背衬不生成——需要混合模块（ADR-16 §3.3）的块是少数，多写一个空
+    壳只会让 `jk 块 校验` 与人都要多看一个没内容的文件。
+
+    **两套原子性标准，刻意分开**（ADR-15 §3.7 / 交接文档坑 #4、#5）：
+
+    * 块名（= 目录名 = 点分路径段）走 `check_module_segment_atomicity`：
+      单个 token 即可，词形不限。所以 `求和`（单 VERB）是合法块名。
+    * 导出名与每个形参名走 `check_export_atomicity`：必须是单个 **IDENT**。
+      调用方分词时不知道被导入模块的导出名，非 IDENT 名一律被切碎。
+
+    默认导出名 = 块名，于是 `--名 求和`（不给 `--导出`）会在导出名这一关被拒，
+    提示去取一个非动词的导出名——这正是「目录名与导出名分离」的既有惯例。
+
+    退出码：0 成功 / 1 参数或预检失败（不产生半个块——所有校验都在建目录前）。
+    """
+    args = list(args)
+    try:
+        领域 = _take_option(args, ('--领域', '--domain'))
+        块名 = _take_option(args, ('--名', '--name'))
+        导出名 = _take_option(args, ('--导出', '--export'))
+        层级原文 = _take_option(args, ('--层级', '--level'))
+        稳定性 = _take_option(args, ('--稳定性', '--stability'))
+        形参 = _取形参(args)
+    except BlockError as e:
+        return _err(str(e))
+
+    # 选项全部摘完后还有残留 → 拼错了选项名，早报比生成一个错块好
+    if args:
+        return _err('无法识别的参数：%s（用法见 `jk 块 帮助`）' % ' '.join(args))
+
+    if not 领域:
+        return _err('缺少 --领域。用法：jk 块 新建 --领域 X --名 <块名> '
+                    '[--导出 <名>] [--参 赵甲 赵乙]')
+    if not 块名:
+        return _err('缺少 --名。用法：jk 块 新建 --领域 X --名 <块名> '
+                    '[--导出 <名>] [--参 赵甲 赵乙]')
+    if 领域 not in ALLOWED_DOMAINS:
+        return _err('未知领域 %r（允许：%s）；新增领域要走 ADR-15 §3.6 注册流程'
+                    % (领域, '/'.join(sorted(ALLOWED_DOMAINS))))
+
+    if 层级原文 is None:
+        层级 = 0
+    else:
+        try:
+            层级 = int(层级原文)
+        except ValueError:
+            return _err('--层级 需要一个非负整数，得到 %r' % 层级原文)
+        if 层级 < 0:
+            return _err('--层级 必须是非负整数，得到 %d' % 层级)
+
+    if 稳定性 is None:
+        稳定性 = blocks.DEFAULT_STABILITY
+    elif 稳定性 not in STABILITY_LEVELS:
+        return _err('未知稳定性 %r（允许：%s）'
+                    % (稳定性, '/'.join(sorted(STABILITY_LEVELS))))
+
+    # ---- 预检 1：命名（词法原子性）------------------------------------
+    # 全部在落盘之前跑完。一条不过就整体退出，工作区一个字节都不动。
+    段原子, 段切分 = blocks.check_module_segment_atomicity(块名)
+    if not 段原子:
+        return _原子性拒绝(
+            '块名', 块名, 段切分,
+            '它要作为 `从 blocks.%s.%s 导入 …` 的点分路径段，'
+            '被切成多个 token 就会 ParseError' % (领域, 块名))
+
+    if 导出名 is None:
+        导出名 = 块名
+        默认导出 = True
+    else:
+        默认导出 = False
+    出原子, 出切分 = blocks.check_export_atomicity(导出名)
+    if not 出原子:
+        补充 = ('调用方分词时不知道本块的导出名，非单 IDENT 名必然被切碎；'
+              '建议改用 汇总/合计/聚合/整合 这类词')
+        if 默认导出:
+            补充 = ('默认导出名取的是块名。' + 补充
+                  + '——用 `--导出 <名>` 单独指定一个原子导出名即可'
+                    '（目录名与导出名分离是既有惯例）')
+        return _原子性拒绝('导出名', 导出名, 出切分, 补充)
+
+    for p in 形参:
+        参原子, 参切分 = blocks.check_export_atomicity(p)
+        if not 参原子:
+            return _原子性拒绝(
+                '形参名', p, 参切分,
+                '变量名首字须是百家姓姓氏且整体是单个 IDENT；'
+                '`赵列表`/`赵次` 这类会被内建动词或关键字切碎，'
+                '改用 `赵数值`/`赵项表` 这种')
+
+    # ---- 预检 2：不撞车（目录 / 块名 / 导出名）-------------------------
+    目录 = _块目录(领域, 块名)
+    if os.path.exists(目录):
+        return _err('目标已存在，不覆盖：%s（换个块名，或先自己删掉）' % 目录)
+
+    try:
+        既有 = _load_all()
+    except BlockError as e:
+        # 现有块库本身坏了不该阻断新建——但要说清楚唯一性预检因此没跑全。
+        print('提示：扫描现有块失败（%s），块名/导出名唯一性预检跳过；'
+              '生成后请务必跑 `jk 块 索引` + `jk 块 校验`。' % e, file=sys.stderr)
+        既有 = []
+    for m in 既有:
+        if m.name == 块名:
+            return _err('已有同名块「%s」：%s（块名全局唯一，见 scan_blocks）'
+                        % (块名, m.root))
+
+    # G13 导出名全局唯一。真源是索引里的 `导出` 字段；索引不在/没这个字段时
+    # 退回扫到的元数据 `导出`——两条都查不到就只能放过，由 CI 的 G13 兜底。
+    占用 = {}
+    try:
+        索引 = blocks.load_index()
+    except BlockError:
+        索引 = None
+    if 索引:
+        for entry in 索引.get('块') or []:
+            for e in entry.get('导出') or []:
+                占用.setdefault(e, entry.get('名称'))
+    for m in 既有:
+        for e in m.exports:
+            占用.setdefault(e, m.name)
+    if 导出名 in 占用:
+        return _err('导出名「%s」已被块「%s」占用（G13 导出名全局唯一）；'
+                    '换一个名字，别指望 CI 放过' % (导出名, 占用[导出名]))
+
+    # ---- 生成三件套 ----------------------------------------------------
+    元数据 = {'名称': 块名, '版本': _新块版本, '层级': 层级, '领域': [领域],
+            '描述': _新块描述占位}
+    if 形参:
+        # `名` 取形参去掉百家姓首字：`赵文` → `文`。形参名带姓是极快的变量名
+        # 规则（坑 #4），但元数据 `输入.名` 是给人和 AI 读的文档字段，不是代码
+        # 标识符，带着姓反而噪音。单字形参没法去姓，原样保留。
+        元数据['输入'] = [{'名': (p[1:] if len(p) > 1 else p),
+                       '类型': _新块类型占位} for p in 形参]
+    元数据['输出'] = {'类型': _新块类型占位}
+    元数据['导出'] = [导出名]
+    元数据['稳定性'] = 稳定性
+
+    签名 = '函数 %s 接收 %s：' % (导出名, ' '.join(形参)) if 形参 \
+        else '函数 %s：' % 导出名
+    主源码 = ('%s\n  -- TODO: 实现\n  返回 空。\n。\n\n导出 %s。\n'
+            % (签名, 导出名))
+
+    # 测试用 `空` 占位实参：`tests/test_blocks_smoke.py` 会真跑每个 测试.jk，
+    # 骨架 `返回 空。` 吃什么参数都不会崩，所以脚手架一落地就是绿的——贡献者
+    # 改实现时才需要把占位换成真数据。多参形如 `合计(空 空)`（空格分隔）。
+    实参 = ' '.join('空' for _ in 形参)
+    测试源码 = ('-- 块 %s.%s 的单元测试。\n\n从 blocks.%s.%s 导入 %s。\n\n'
+             '-- TODO: 补充测试用例\n定义赵结果=%s(%s)。\n打印 赵结果。\n'
+             % (领域, 块名, 领域, 块名, 导出名, 导出名, 实参))
+
+    try:
+        os.makedirs(目录)
+        # `newline='\n'` 三个文件都要：Windows 默认把 `\n` 翻成 `\r\n`，
+        # 同一条命令在两个平台会产出字节不同的块（理由同 blocks.save_index）。
+        with open(os.path.join(目录, BLOCK_METADATA_NAME), 'w',
+                  encoding='utf-8', newline='\n') as f:
+            f.write(json.dumps(元数据, ensure_ascii=False, indent=2) + '\n')
+        with open(os.path.join(目录, 块名 + '.jk'), 'w',
+                  encoding='utf-8', newline='\n') as f:
+            f.write(主源码)
+        with open(os.path.join(目录, '测试.jk'), 'w',
+                  encoding='utf-8', newline='\n') as f:
+            f.write(测试源码)
+    except OSError as e:
+        return _err('写脚手架失败：%s' % e)
+
+    print('✓ 已创建块 %s.%s → %s' % (领域, 块名, 目录))
+    print('  下一步：编辑 %s.jk 实现逻辑，再跑 `jk 块 校验 %s`'
+          % (块名, 目录))
+    return _EXIT_OK
 
 
 _DISPATCH = {
@@ -816,6 +1103,7 @@ _DISPATCH = {
     'show': _cmd_show,
     'check': _cmd_check,
     'index': _cmd_index,
+    'new': _cmd_new,
 }
 
 

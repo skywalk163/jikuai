@@ -31,6 +31,12 @@ _SRC = os.path.join(_REPO, 'src')
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+# 协议校验走 `service.schema`——glue 不重复发明字段规则。
+# 注意加载方式：glue.py 不是包，靠上面的 sys.path.insert 把 `src/` 挂上，
+# 才能 `from jikuai.service import schema` 成功；`tools/ai-bridge/` 目录
+# 本身不做成包也不该做，那样会让「桥接工具」污染主发布包的命名空间。
+from jikuai.service import schema  # noqa: E402
+
 __all__ = ['synthesize', 'result_var', 'TypeGraph', 'type_feeds', 'normalize_type']
 
 #: 占位符：参数无法推断时写在实参位，配一行注释提示人工补。
@@ -267,23 +273,23 @@ def _导入行(steps):
 
 
 def synthesize(方案, 自动链式=False, root=None):
-    """把选块方案（`协议.md` 定义的 JSON）合成为极快源码字符串。
+    """把选块方案（`docs/协议-三通道.md` 定义的 JSON）合成为极快源码字符串。
 
-    参数校验：`方案` 必须是 dict 且含非空 `步骤`；每步须有 `块/领域/导出名`。
+    参数校验走 `schema.ensure_plan`（三通道协议的唯一真源）：字段形状、`步骤`
+    非空、`步骤[i]` 有 `块/领域/导出名` 都由它兜底。协议已锁死，glue 不再
+    重复发明校验规则。校验失败会抛 `schema.SchemaError`；`blocks_cli._组装`
+    只捕 `ValueError`，为兼容旧调用点这里再原样转成 `ValueError`。
+
     `自动链式=True` 时，对**缺 `参数`** 的步骤用 `TypeGraph` 按类型推断实参链；
     推不出的仍落 `?` 占位并把拒绝理由写进注释。
 
     返回：以换行分隔、末尾带单个换行的极快源码。
     """
-    if not isinstance(方案, dict):
-        raise ValueError('方案必须是 JSON 对象（dict）')
-    steps = 方案.get('步骤') or []
-    if not steps:
-        raise ValueError('方案缺少非空的 `步骤` 字段')
-    for i, s in enumerate(steps):
-        for 字段 in ('块', '领域', '导出名'):
-            if not s.get(字段):
-                raise ValueError('步骤 %d 缺少必填字段「%s」' % (i + 1, 字段))
+    try:
+        schema.ensure_plan(方案)
+    except schema.SchemaError as e:
+        raise ValueError(str(e))
+    steps = 方案['步骤']
 
     自动实参 = None
     拒绝理由 = []

@@ -1,0 +1,475 @@
+# -*- coding: utf-8 -*-
+"""极快 Web UI 通道测试（v0.15.0 W17/W18，W20 协议收敛）。
+
+覆盖面：
+
+- 五个端点各至少一条正例（`GET /api/blocks|/api/能力`、`POST /api/选|组|跑`）
+- 静态单页可取（`GET /`）+ 目录穿越被拒
+- 坏 JSON / 缺 Content-Length / 超大 body / 未知端点 的错误分层
+- `降级说明` 的降级链路（mock 掉 sidecar，**绝不真跑模型**）
+- W20：`/api/跑` 的 `跑响应` 信封与 CLI `跑 --json` 逐字同构
+
+工程约束：
+
+* **不用 requests**（W17 DoD：零新增 pip 依赖），只用标准库 `http.client`。
+* 服务跑在后台线程里，端口用 `0` 让内核分配 —— 写死 5000 会因为端口被占
+  让 CI 随机红。测完 `shutdown()` + `server_close()`。
+* `tools/web` 不是包，按文件路径 `importlib` 加载 `server.py`，与
+  `blocks_cli._glue()` 加载 `glue.py` 同一套做法。
+"""
+
+import http.client
+import importlib.util
+import json
+import os
+import socket
+import sys
+import threading
+import urllib.parse
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+_REPO = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
+_SERVER_PY = os.path.join(_REPO, 'tools', 'web', 'server.py')
+
+
+def _load_server():
+    """按文件路径加载 `tools/web/server.py`（该目录不是包，刻意的）。"""
+    spec = importlib.util.spec_from_file_location('_jikuai_web_server', _SERVER_PY)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+server = _load_server()
+
+
+# ---- 夹具 -------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def 服务():
+    """后台线程里跑一个真服务，端口交给内核分配。返回 (host, port)。"""
+    srv = server.build_server('127.0.0.1', 0)
+    t = threading.Thread(target=srv.serve_forever, name='jk-web-test', daemon=True)
+    t.start()
+    try:
+        yield srv.server_address[0], srv.server_address[1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=5)
+
+
+def _请求(服务, 方法, 路径, body=None, 原始body=None, 头=None):
+    """发一次 HTTP 请求，返回 `(状态码, 响应体bytes, 头对象)`。"""
+    host, port = 服务
+    conn = http.client.HTTPConnection(host, port, timeout=30)
+    try:
+        数据 = None
+        头 = dict(头 or {})
+        if 原始body is not None:
+            数据 = 原始body
+        elif body is not None:
+            数据 = json.dumps(body, ensure_ascii=False).encode('utf-8')
+        if 数据 is not None:
+            头.setdefault('Content-Type', 'application/json; charset=utf-8')
+        # 请求行必须是 ASCII（http.client 的硬约束，也防 CVE-2019-9740）。
+        # 端点名带中文（`/api/选`），发之前 percent-encode。
+        路径ascii = urllib.parse.quote(路径, safe="/?&=%:")
+        conn.request(方法, 路径ascii, body=数据, headers=头)
+        resp = conn.getresponse()
+        return resp.status, resp.read(), resp
+    finally:
+        conn.close()
+
+
+def _JSON(服务, 方法, 路径, body=None, **kw):
+    状态, 原文, resp = _请求(服务, 方法, 路径, body=body, **kw)
+    assert 'application/json' in resp.getheader('Content-Type', ''), \
+        '所有 API 响应都该是 JSON，实际 %r' % resp.getheader('Content-Type')
+    return 状态, json.loads(原文.decode('utf-8'))
+
+
+def _裸请求(服务, 报文: bytes) -> bytes:
+    """裸 socket 发一段原始 HTTP 报文，收全部响应字节。
+
+    专门用于构造 `http.client` 不肯发的畸形请求（比如缺 Content-Length）。
+    """
+    host, port = 服务
+    s = socket.create_connection((host, port), timeout=30)
+    try:
+        s.sendall(报文)
+        块 = []
+        while True:
+            b = s.recv(4096)
+            if not b:
+                break
+            块.append(b)
+        return b''.join(块)
+    finally:
+        s.close()
+
+
+#: 一份能真跑出结果的最小方案：把 `列 10 20 30` 求和 → 60。
+_方案求和 = {
+    '需求': '把一批数求和',
+    '共享': [{'名': '赵料', '值': '列 10 20 30'}],
+    '步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']}],
+    '打印': ['赵果1'],
+}
+
+
+# ---- GET /api/blocks --------------------------------------------------
+
+def test_blocks_返回索引原文(服务):
+    """`GET /api/blocks` 吐 `索引.json` 原文：版本 + 生成时间 + 块数组。"""
+    状态, data = _JSON(服务, 'GET', '/api/blocks')
+    assert 状态 == 200
+    assert set(data) >= {'版本', '生成时间', '块'}
+    assert isinstance(data['块'], list) and data['块']
+    名字 = {b['名称'] for b in data['块']}
+    assert '求和' in 名字
+    # 索引里带 `导出`，前端就是靠它把候选补成方案里的 `导出名`（见 README）
+    求和 = next(b for b in data['块'] if b['名称'] == '求和')
+    assert 求和['导出'] and isinstance(求和['领域'], list)
+
+
+# ---- POST /api/选 -----------------------------------------------------
+
+def test_选_返回协议候选(服务):
+    """`POST /api/选` 的候选逐字段符合 `schema` 协议（含 `层级`）。"""
+    from jikuai.service import schema
+    状态, data = _JSON(服务, 'POST', '/api/选', {'需求': '求和', 'top': 3})
+    assert 状态 == 200
+    assert data['需求'] == '求和'
+    assert 1 <= len(data['候选']) <= 3
+    for c in data['候选']:
+        assert schema.validate_candidate(c) == [], c
+    assert '降级说明' not in data, '没要神经就不该出现降级说明'
+    assert {c['名称'] for c in data['候选']} & {'求和'}
+
+
+def test_选_需求为空被拒(服务):
+    状态, data = _JSON(服务, 'POST', '/api/选', {'需求': '   '})
+    assert 状态 == 400
+    assert '需求' in data['错误']
+
+
+def test_选_top越界被拒(服务):
+    状态, data = _JSON(服务, 'POST', '/api/选', {'需求': '求和', 'top': 0})
+    assert 状态 == 400
+    assert 'top' in data['错误']
+    状态, data = _JSON(服务, 'POST', '/api/选',
+                     {'需求': '求和', 'top': 10 ** 6})
+    assert 状态 == 400
+
+
+def test_选_神经不可用时降级并带说明(服务, monkeypatch):
+    """`神经: true` 但 sidecar 拿不到向量 → 200 + 启发式候选 + `降级说明`。
+
+    这里 mock 的是 `embed_client.fetch_query_vector`，不起子进程、不碰 torch。
+    """
+    from jikuai.ai import embed_client
+    monkeypatch.setattr(embed_client, 'fetch_query_vector',
+                        lambda *a, **k: (None, '测试注入：sidecar 不存在'))
+    状态, data = _JSON(服务, 'POST', '/api/选',
+                     {'需求': '求和', 'top': 2, '神经': True})
+    assert 状态 == 200
+    assert data['候选']
+    assert '降级说明' in data
+    assert '测试注入' in data['降级说明']
+    assert '启发式' in data['降级说明']
+
+
+def test_选_神经字段类型错被拒(服务):
+    状态, data = _JSON(服务, 'POST', '/api/选', {'需求': '求和', '神经': '是'})
+    assert 状态 == 400
+    assert '神经' in data['错误']
+
+
+# ---- POST /api/组 -----------------------------------------------------
+
+def test_组_信封式方案出源码(服务):
+    """`{"方案": {...}}` 信封写法 → `{源码}`，导入行与调用行都对。"""
+    状态, data = _JSON(服务, 'POST', '/api/组', {'方案': _方案求和})
+    assert 状态 == 200
+    assert '从 blocks.数据.求和 导入 汇总' in data['源码']
+    assert '汇总(赵料)' in data['源码']
+    assert data['源码'].endswith('\n')
+
+
+def test_组_裸方案也收(服务):
+    """直接把方案本体当 body（`jk 块 组 -` 的 JSON 原样贴）也要能组。"""
+    状态, data = _JSON(服务, 'POST', '/api/组', _方案求和)
+    assert 状态 == 200
+    assert '汇总(赵料)' in data['源码']
+
+
+def test_组_缺步骤被schema拒(服务):
+    状态, data = _JSON(服务, 'POST', '/api/组', {'方案': {'需求': '空'}})
+    assert 状态 == 400
+    assert '步骤' in data['错误']
+
+
+def test_组_未知字段被schema拒(服务):
+    """协议不允许通道私自加字段——多一个键就该 400，这是 W20 硬门槛的下沉。"""
+    坏 = dict(_方案求和, 乱入=1)
+    状态, data = _JSON(服务, 'POST', '/api/组', {'方案': 坏})
+    assert 状态 == 400
+    assert '未知字段' in data['错误']
+
+
+def test_组_块不存在被拒(服务):
+    坏 = {'步骤': [{'块': '不存在的块XYZ', '领域': '数据', '导出名': 'x'}]}
+    状态, data = _JSON(服务, 'POST', '/api/组', {'方案': 坏})
+    assert 状态 == 400
+    assert '不存在' in data['错误']
+
+
+def test_组_领域不在白名单被拒(服务):
+    坏 = {'步骤': [{'块': '求和', '领域': '玄学', '导出名': '汇总'}]}
+    状态, data = _JSON(服务, 'POST', '/api/组', {'方案': 坏})
+    assert 状态 == 400
+    assert '白名单' in data['错误']
+
+
+# ---- POST /api/跑 -----------------------------------------------------
+# W20 起 `/api/跑` 回的是 `跑响应` 信封 `{源码, 执行结果[, 需求]}`，与
+# `jk 块 跑 --json` 完全一致；不再是裸 `执行结果`。这是有意的契约变更
+# （见 docs/协议-三通道.md §契约变更史），旧断言随之上移一层。
+
+def test_跑_端到端出结果(服务):
+    """`POST /api/跑` 返回 `跑响应` 信封：`执行结果.stdout` 里有 60，不带 `错误`。"""
+    from jikuai.service import schema
+    状态, data = _JSON(服务, 'POST', '/api/跑', {'方案': _方案求和})
+    assert 状态 == 200
+    assert schema.validate_run_envelope(data) == [], data
+    assert '从 blocks.数据.求和 导入 汇总' in data['源码']
+    结果 = data['执行结果']
+    assert '60' in 结果['stdout']
+    assert '错误' not in 结果
+    assert 结果['耗时毫秒'] >= 0
+
+
+def test_跑_信封与CLI逐字同构(服务, tmp_path):
+    """同一份方案，Web `/api/跑` 与 CLI `跑 --json` 的键必须逐字相同。
+
+    W20 硬门槛的核心断言：三通道同构不是「差不多」。`耗时毫秒` 值必然不同，
+    所以比键集合 + 比 `源码`/`stdout` 这两个应当完全相同的值。
+    """
+    import io
+    from contextlib import redirect_stdout
+    from jikuai.pkg import blocks_cli
+
+    状态, web = _JSON(服务, 'POST', '/api/跑', {'方案': _方案求和})
+    assert 状态 == 200
+
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(_方案求和, ensure_ascii=False), encoding='utf-8')
+    缓 = io.StringIO()
+    with redirect_stdout(缓):
+        rc = blocks_cli.run(['跑', str(p), '--json'])
+    assert rc == 0, 缓.getvalue()
+    cli = json.loads(缓.getvalue())
+
+    assert set(web) == set(cli), (sorted(web), sorted(cli))
+    assert set(web['执行结果']) == set(cli['执行结果'])
+    assert web['源码'] == cli['源码']
+    assert web['执行结果']['stdout'] == cli['执行结果']['stdout']
+    assert web['需求'] == cli['需求']
+
+
+def test_跑_执行失败是200带错误字段(服务):
+    """业务失败不是传输失败：参数填不上 → 200 + `执行结果.错误`，不是 5xx。"""
+    from jikuai.service import schema
+    无参方案 = {'步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总'}]}
+    状态, data = _JSON(服务, 'POST', '/api/跑', {'方案': 无参方案})
+    assert 状态 == 200
+    assert schema.validate_run_envelope(data) == [], data
+    assert '需人工填参' in data['执行结果']['错误']
+
+
+def test_跑_解释器报错收敛成错误字段(服务):
+    """参数写成不存在的变量 → 解释器抛错 → 200 + `执行结果.错误`，不含 traceback。"""
+    from jikuai.service import schema
+    方案 = {'步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总',
+                  '参数': ['赵没定义过的东西']}]}
+    状态, data = _JSON(服务, 'POST', '/api/跑', {'方案': 方案})
+    assert 状态 == 200
+    assert schema.validate_run_envelope(data) == [], data
+    assert data['执行结果']['错误']
+    assert 'Traceback' not in data['执行结果']['错误']
+    assert _REPO not in data['执行结果']['错误'], '错误消息不该泄露服务端绝对路径'
+
+
+# ---- GET /api/能力 ----------------------------------------------------
+
+def test_能力_契约字段齐全(服务):
+    """`GET /api/能力` 的键集合就是 W19 前端约定的三个，一个不多一个不少。"""
+    状态, data = _JSON(服务, 'GET', '/api/能力')
+    assert 状态 == 200
+    assert set(data) == {'神经可用', '索引版本', '块数'}
+    assert isinstance(data['神经可用'], bool)
+    assert isinstance(data['索引版本'], str)
+    assert isinstance(data['块数'], int)
+    # 仓库里有真索引，块数必然为正
+    assert data['块数'] > 0
+    assert data['索引版本']
+
+
+def test_能力_神经可用为真当sidecar与索引都在(服务, monkeypatch):
+    """sidecar 命令可解析 + 向量索引能加载 → `神经可用: true`。
+
+    两个判据都 mock 掉运行时的现成函数（而不是伪造文件），断言 `/api/能力`
+    真的复用了它们、没有自己 `os.path.isfile` 另搞一套。
+    """
+    from jikuai.ai import embed_client, retrieval
+    monkeypatch.setattr(embed_client, 'resolve_command', lambda: ['python', 'x.py'])
+    monkeypatch.setattr(retrieval, 'load_vector_index', lambda *a, **k: object())
+    状态, data = _JSON(服务, 'GET', '/api/能力')
+    assert 状态 == 200
+    assert data['神经可用'] is True
+
+
+def test_能力_神经不可用当sidecar缺失(服务, monkeypatch):
+    """sidecar 解析不出命令（pip 安装场景 `tools/` 不随包发布）→ `神经可用: false`。"""
+    from jikuai.ai import embed_client
+    monkeypatch.setattr(embed_client, 'resolve_command', lambda: None)
+    状态, data = _JSON(服务, 'GET', '/api/能力')
+    assert 状态 == 200
+    assert data['神经可用'] is False
+    # 能力探测不该因此报错：索引信息照给
+    assert data['块数'] > 0
+
+
+def test_能力_神经不可用当索引加载不了(服务, monkeypatch):
+    """向量索引读不到 / 魔数不对 → `神经可用: false`（判据走 load_vector_index）。"""
+    from jikuai.ai import embed_client, retrieval
+    monkeypatch.setattr(embed_client, 'resolve_command', lambda: ['python', 'x.py'])
+    monkeypatch.setattr(retrieval, 'load_vector_index', lambda *a, **k: None)
+    状态, data = _JSON(服务, 'GET', '/api/能力')
+    assert 状态 == 200
+    assert data['神经可用'] is False
+
+
+# ---- 静态资源与目录穿越 -----------------------------------------------
+
+def test_根路径给单页(服务):
+    """`GET /` → `static/index.html`，Content-Type 是 HTML。"""
+    状态, 原文, resp = _请求(服务, 'GET', '/')
+    assert 状态 == 200
+    assert 'text/html' in resp.getheader('Content-Type', '')
+    正文 = 原文.decode('utf-8')
+    assert '<html' in 正文.lower()
+    assert 'app.js' in 正文
+
+
+def test_静态js可取(服务):
+    状态, 原文, resp = _请求(服务, 'GET', '/app.js')
+    assert 状态 == 200
+    assert 'javascript' in resp.getheader('Content-Type', '')
+    assert b'fetch' in 原文
+
+
+@pytest.mark.parametrize('路径', [
+    '/../server.py',
+    '/../../pyproject.toml',
+    '/%2e%2e/server.py',
+    '/..%2f..%2fpyproject.toml',
+    '/....//server.py',
+    '/subdir/../../server.py',
+])
+def test_目录穿越被拒(服务, 路径):
+    """`..` 各种编码变体都不能读到 `static/` 之外的文件。
+
+    判据不是「返回码是几」而是「拿不到内容」：403（越界）与 404（归一化后
+    确实不存在）都算拒绝，泄露文件内容才算失守。
+    """
+    状态, 原文, _ = _请求(服务, 'GET', 路径)
+    assert 状态 in (403, 404), '路径 %s 竟然返回了 %d' % (路径, 状态)
+    assert b'JiKuaiHandler' not in 原文
+    assert b'[tool.pytest' not in 原文
+
+
+def test_绝对路径被拒(服务):
+    """`GET //etc/passwd` 这类绝对路径要在 join 之前就拦掉。"""
+    状态, _原文, _ = _请求(服务, 'GET', '//etc/passwd')
+    assert 状态 in (403, 404)
+
+
+# ---- 传输层错误分层 ---------------------------------------------------
+
+def test_坏JSON_400(服务):
+    状态, data = _JSON(服务, 'POST', '/api/选',
+                     原始body='{这不是合法JSON'.encode('utf-8'))
+    assert 状态 == 400
+    assert '合法 JSON' in data['错误']
+
+
+def test_body非对象_400(服务):
+    状态, data = _JSON(服务, 'POST', '/api/选', 原始body=b'[1,2,3]')
+    assert 状态 == 400
+    assert '对象' in data['错误']
+
+
+def test_空body_400(服务):
+    """`http.client` 不带 body 时会自动补 `Content-Length: 0` —— 落到「空 body」这条。"""
+    状态, data = _JSON(服务, 'POST', '/api/选')
+    assert 状态 == 400
+    assert '对象' in data['错误']
+
+
+def test_缺ContentLength_400(服务):
+    """真正**不带** Content-Length 头 → 400。
+
+    这条必须裸 socket 发：`http.client` 会替你补上 `Content-Length: 0`，
+    用它压根构造不出这个请求。
+    """
+    报文 = ('POST /api/%E9%80%89 HTTP/1.1\r\n'
+          'Host: 127.0.0.1\r\n'
+          'Content-Type: application/json\r\n'
+          'Connection: close\r\n\r\n').encode('ascii')
+    原文 = _裸请求(服务, 报文)
+    头, _, body = 原文.partition(b'\r\n\r\n')
+    assert b'400' in 头.split(b'\r\n')[0]
+    assert 'Content-Length' in json.loads(body.decode('utf-8'))['错误']
+
+
+def test_body超限_413(服务):
+    """超过 `MAX_BODY` 直接 413，不把 body 读进内存。"""
+    大 = ('{"需求":"' + 'x' * (server.MAX_BODY + 64) + '"}').encode('utf-8')
+    状态, data = _JSON(服务, 'POST', '/api/选', 原始body=大)
+    assert 状态 == 413
+    assert '上限' in data['错误']
+
+
+def test_未知端点_404(服务):
+    状态, data = _JSON(服务, 'POST', '/api/不存在', {'x': 1})
+    assert 状态 == 404
+    assert '未知端点' in data['错误']
+    状态, data = _JSON(服务, 'GET', '/api/不存在')
+    assert 状态 == 404
+
+
+def test_响应头有防护(服务):
+    _状态, _原文, resp = _请求(服务, 'GET', '/api/blocks')
+    assert resp.getheader('X-Content-Type-Options') == 'nosniff'
+    assert resp.getheader('X-Frame-Options') == 'DENY'
+
+
+# ---- 静态目录解析的单元级校验 -----------------------------------------
+
+def test_静态根在tools_web_static下():
+    根 = server.static_root()
+    assert 根.endswith(os.path.join('tools', 'web', 'static'))
+    assert os.path.isdir(根)
+
+
+def test_安全提示文案含关键风险():
+    """启动横幅必须点明「无鉴权」「执行任意代码」「别绑 0.0.0.0」三件事。"""
+    for 关键 in ('无鉴权', '执行', '0.0.0.0', '本地'):
+        assert 关键 in server.SAFETY_NOTICE

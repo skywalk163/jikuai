@@ -1,7 +1,7 @@
 [project]
 name = "jikuai-lsp"
-version = "0.5.0"
-description = "极快语言 LSP 桩 - Language Server Protocol 实现（M4 桩阶段）"
+version = "0.15.0"
+description = "极快语言 LSP 服务器 - Language Server Protocol 实现（completion / hover / definition / executeCommand）"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

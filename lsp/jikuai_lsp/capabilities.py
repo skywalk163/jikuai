@@ -1,26 +1,34 @@
-﻿# -*- coding: utf-8 -*-
-"""极快语言 · LSP 服务器能力声明（v0.6.0 · M5 · T-M5-L07 · F3 冻结点）。
+# -*- coding: utf-8 -*-
+"""极快语言 · LSP 服务器能力声明（v0.15.0 · 契约唯一真源）。
 
 能力被定义为**可被测试直接断言的纯数据结构**（module-level dict），
 避免测试反射运行期对象。
 
-M5（F3 冻结）声明：
-    - textDocumentSync：openClose + Full change
+当前声明：
+    - textDocumentSync：openClose + Incremental change（W14 起）
     - completionProvider：文本补全（触发字符 `.` 与 `，`）
     - hoverProvider：悬浮说明
+    - definitionProvider：`导入` 点分块路径 → 块目录（W14）
+    - executeCommandProvider：命令 `极快.选块`（W15）
     - publishDiagnostics 走服务端 push，故 diagnosticProvider 显式为 False
       （表示不提供 pull-based 诊断）
 
 `positionEncoding` 显式声明 utf-16：与 `diagnostics.adapters` 及
 `service.position` 的 UTF-16 单元口径保持一致。
 
-`freeze_signature()` 是 **F3 冻结契约**：返回按 key 排序的规范化 dict，
-QA 与协议消费者以此判定契约是否稳定；一经发布只增不改不复用。
+`freeze_signature()` 是**对外契约判据**：返回按 key 排序的规范化 dict，
+QA 与协议消费者以此判定契约是否稳定。变更必须同步
+`tests/test_lsp_capabilities_freeze.py`，让改动在 code review 里显形。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List
+
+#: 服务端标识。`serverInfo` 与包 `__version__` 共用这一份，避免三处版本各自漂移
+#: （v0.15.0 W13 之前 pyproject=0.5.0 / __init__=0.5.0 / serverInfo=0.6.0 三不一致）。
+SERVER_NAME = 'jikuai-lsp'
+SERVER_VERSION = '0.15.0'
 
 # LSP TextDocumentSyncKind：0=None / 1=Full / 2=Incremental
 TEXT_DOCUMENT_SYNC_FULL = 1
@@ -29,17 +37,37 @@ TEXT_DOCUMENT_SYNC_INCREMENTAL = 2
 #: 补全触发字符：`.` 用于 `模块.成员`，`，` 用于管道后候选。
 COMPLETION_TRIGGER_CHARACTERS: List[str] = ['.', '，']
 
+#: 极快 LSP 命令名（v0.15.0 W15）。命名规则：`极快.<动作>`——
+#: `极快` 前缀避免与其它 LSP 服务器命名空间冲突（例如 Python 是 `python.`）。
+COMMAND_SELECT_BLOCK = '极快.选块'
+
 #: 纯数据能力声明；测试可直接断言 SERVER_CAPABILITIES['completionProvider']。
+#:
+#: 契约变更历史（改这里 = 改对外契约，必须过 freeze 测试）：
+#:   v0.6.0  M5 F3 冻结点：textDocumentSync(Full) + completion + hover
+#:   v0.15.0 W14：新增 definitionProvider；textDocumentSync.change 1 → 2
+#:                （Incremental sync，配合 TextDocumentStore._apply_change）
+#:   v0.15.0 W15：新增 executeCommandProvider（命令 `极快.选块`）
 SERVER_CAPABILITIES: Dict[str, Any] = {
     'textDocumentSync': {
         'openClose': True,
-        'change': TEXT_DOCUMENT_SYNC_FULL,
+        # W14 起走增量同步。TextDocumentStore.did_change 对无 range 的 change
+        # 会兜底为全文替换，因此声明 2 仍兼容规范里「客户端可发送 Full」的写法。
+        'change': TEXT_DOCUMENT_SYNC_INCREMENTAL,
     },
     'completionProvider': {
         'resolveProvider': False,
         'triggerCharacters': list(COMPLETION_TRIGGER_CHARACTERS),
     },
     'hoverProvider': True,
+    # W14：跳转到定义。只支持 `导入`/`从 … 导入` 语句里的点分块路径 → 块目录，
+    # 用户符号跳转依赖 workspace 索引，留到后续版本。
+    'definitionProvider': True,
+    # W15：workspace/executeCommand。当前只暴露 `极快.选块`；未声明的 command
+    # 由 server 层回 -32601 MethodNotFound，不静默返回 null。
+    'executeCommandProvider': {
+        'commands': [COMMAND_SELECT_BLOCK],
+    },
     'diagnosticProvider': False,
     'positionEncoding': 'utf-16',
 }

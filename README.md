@@ -259,6 +259,32 @@ python -m jikuai.main examples/hello.jk
 
 无参数时均进入交互式 REPL；`-h` 显示帮助；`-v` 显示版本。
 
+### v0.15.0 三通道 quickstart（选块 → 组代码 → 跑）
+
+同一套「三段式设计语言」`[需求]→[候选]→[产出]`，三条通道共享同一 JSON 协议
+（`docs/协议-三通道.md`）。
+
+**CLI** —— 管道式一条龙：
+```bash
+jk 块 选 "月薪两万个税多少"      # 语义选块，出候选（--json 走机读协议）
+jk 块 组 方案.json               # 候选拼成方案 → 生成 .jk 源码
+jk 块 跑 方案.json --json        # 执行，出 {源码, 执行结果:{stdout,返回值,...}}
+```
+
+**LSP** —— 编辑器语言服务（stdio JSON-RPC，零第三方依赖）：
+```powershell
+$env:PYTHONPATH = "src;lsp"       # 或先 pip install -e . 与 lsp/
+python -m jikuai_lsp               # completion/hover/definition/极快.选块
+# VS Code 扩展 .vsix 打包与安装见 W16（待做）
+```
+
+**Web** —— 本地只读单页（标准库 `http.server`，不引框架）：
+```bash
+python tools/web/server.py         # 默认 http://127.0.0.1:5000/
+# 浏览器打开上述地址：需求框 → 候选卡片 → 代码+运行结果
+```
+
+
 ## 项目结构
 
 ```

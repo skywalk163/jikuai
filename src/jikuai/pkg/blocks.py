@@ -41,7 +41,9 @@ __all__ = [
     'SCALAR_TYPES', 'CONTAINER_TYPE_NAMES', 'UNION_TYPE_NAME',
     'VECTOR_INDEX_NAME', 'VECTOR_INDEX_META_NAME',
     'BlockError', 'BlockMetadata',
-    'blocks_root', 'index_path', 'load_block_metadata', 'find_block_files',
+    'NAMESPACE_KEY', 'BUILTIN_NAMESPACE', 'PKG_ROOTS_ENV',
+    'blocks_root', 'extra_roots', 'index_path', 'load_block_metadata',
+    'find_block_files',
     'scan_blocks', 'generate_index', 'render_index', 'load_index',
     'save_index', 'index_differs',
     'blocks_content_hash', 'vector_index_meta_path', 'check_vector_index',
@@ -110,7 +112,26 @@ _SKIP_DIRS = frozenset({
 #: W7 起带上 `导出`：AI 桥接选块后要立刻拼出 `从 blocks.X.Y 导入 Z。`，
 #: 没有它就得为每个候选块再读一次 `.jk`。`兼容` **不进索引**——它是安装期
 #: 字段，检索期用不上，进索引只会白涨 token。
-_INDEX_ENTRY_KEYS = ('名称', '领域', '层级', '描述', '输入', '输出', '导出', '稳定性')
+#: W22（ADR-27）起追加 `命名空间`：第三方块的完整引用是
+#: `<命名空间>.<领域>.<块名>`，内置块为空串。**刻意追加在末尾**——旧条目
+#: 只多一个尾字段，已有 7 个字段的行位不动，`索引.json` 的 git diff 最小。
+_INDEX_ENTRY_KEYS = ('名称', '领域', '层级', '描述', '输入', '输出', '导出',
+                     '稳定性', '命名空间')
+
+#: 索引条目 / `BlockMetadata._data` 里承载命名空间的键名。
+#: **不进 `块.json` schema**——命名空间由目录布局决定，不该让发布者手填
+#: （手填必然与目录漂移，且 `_validate` 也没法交叉验证）。扫描时注入。
+NAMESPACE_KEY = '命名空间'
+
+#: 内置块（`stdlib/blocks/`）的命名空间。空串，保证 `blocks.数据.求和`
+#: 这类既有引用形态一字不变（ADR-27 §2.2）。
+BUILTIN_NAMESPACE = ''
+
+#: 第三方块根的环境变量名（ADR-27 §2.1）。语义是**块目录根**，即与
+#: `blocks_root()` 同层级、直接指向 `blocks/` 那一级；多路径按 `os.pathsep`
+#: 分隔（Windows `;`，POSIX `:`），与 `PYTHONPATH` 的习惯一致。
+PKG_ROOTS_ENV = 'JIKUAI_PKG_ROOTS'
+
 
 
 class BlockError(Exception):
@@ -184,7 +205,29 @@ class BlockMetadata:
         """`兼容` 字段（W7）。环境兼容性约束表，如 `{"极快": ">=0.13"}`。缺省 `{}`。"""
         return dict(self._data.get('兼容') or {})
 
+    @property
+    def namespace(self) -> str:
+        """命名空间（ADR-27 §2.2）。内置块为空串，第三方块为其注册表目录名。
+
+        **不是 `块.json` 的字段**——由 `scan_blocks` 按目录布局注入，见
+        `_infer_namespace`。单独 `load_block_metadata` 出来的块拿不到路径
+        上下文，因此落到缺省空串（等同"当内置块看"）。
+        """
+        return self._data.get(NAMESPACE_KEY) or BUILTIN_NAMESPACE
+
+    @property
+    def qualified_name(self) -> str:
+        """完整引用名 `<命名空间>.<领域>.<块名>`（内置块省掉命名空间段）。
+
+        领域取 `领域[0]`——多领域块的物理目录只可能落在一个领域下，第一个
+        就是它的所属目录（`scan_blocks` 的名称/路径一致性已经保证）。
+        """
+        域 = self.domains[0] if self.domains else ''
+        段 = [s for s in (self.namespace, 域, self.name) if s]
+        return '.'.join(段)
+
     # ---- 派生 ------------------------------------------------------------
+
     @property
     def root(self) -> str:
         """块所在目录（元数据文件所在目录）。"""
@@ -206,11 +249,16 @@ class BlockMetadata:
             '输出': self.output,
             '导出': self.exports,
             '稳定性': self.stability,
+            NAMESPACE_KEY: self.namespace,
         }
         return {k: entry[k] for k in _INDEX_ENTRY_KEYS}
 
     def __repr__(self):
+        if self.namespace:
+            return '<块 %s/%s 层级%s %s>' % (self.namespace, self.name,
+                                           self.level, self.stability)
         return '<块 %s 层级%s %s>' % (self.name, self.level, self.stability)
+
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +274,56 @@ def blocks_root() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.normpath(os.path.join(here, '..', '..', '..'))
     return os.path.join(repo_root, 'stdlib', 'blocks')
+
+
+def extra_roots() -> List[str]:
+    """第三方块根列表（ADR-27 §2.1），读自环境变量 `JIKUAI_PKG_ROOTS`。
+
+    语义与 `blocks_root()` 同层级——**每条路径直接指向 `blocks/` 那一级**，
+    其下第一级子目录即命名空间。多路径按 `os.pathsep` 分隔（Windows `;`，
+    POSIX `:`），与 `PYTHONPATH` 习惯一致。
+
+    过滤规则：空串跳过；不是已存在目录的跳过（配错路径不该让整个块生态崩，
+    只是那个根不生效）；去重但保序（先出现的优先，与合并规则的"先到先得"
+    一致）。返回绝对路径列表。
+    """
+    raw = os.environ.get(PKG_ROOTS_ENV, '')
+    结果: List[str] = []
+    见过 = set()
+    for 段 in raw.split(os.pathsep):
+        段 = 段.strip()
+        if not 段:
+            continue
+        abs_p = os.path.abspath(段)
+        if abs_p in 见过:
+            continue
+        见过.add(abs_p)
+        if os.path.isdir(abs_p):
+            结果.append(abs_p)
+    return 结果
+
+
+def _infer_namespace(meta_path: str, root: str, is_builtin: bool) -> str:
+    """按目录布局推断一个块的命名空间（ADR-27 §2.2）。
+
+    - 内置根（`is_builtin=True`）：一律空串，`blocks.数据.求和` 形态不变。
+    - 第三方根：相对 `root` 的**第一段目录名**即命名空间
+      （`<root>/<命名空间>/<领域>/<块名>/块.json`）。
+
+    第三方块若没套命名空间目录（元数据直接躺在 root 下），相对路径只有文件名
+    一段，此时视为空命名空间——它会和内置块一起参与"同命名空间唯一"检查，
+    等于要求它别和内置块重名，属合理兜底。
+    """
+    if is_builtin:
+        return BUILTIN_NAMESPACE
+    rel = os.path.relpath(os.path.abspath(meta_path), os.path.abspath(root))
+    段 = [s for s in rel.split(os.sep) if s and s != os.pardir]
+    # 至少要有 命名空间/.../块.json 两段才谈得上命名空间；只有一段说明块元数据
+    # 直接躺在 root 下，没有命名空间目录。
+    if len(段) < 2:
+        return BUILTIN_NAMESPACE
+    return 段[0]
+
 
 
 def index_path(root: Optional[str] = None) -> str:
@@ -473,31 +571,78 @@ def find_block_files(root: Optional[str] = None) -> List[str]:
     return sorted(found)
 
 
-def scan_blocks(root: Optional[str] = None) -> List[BlockMetadata]:
-    """扫描 `root`（默认内置 `stdlib/blocks/`），返回按「名称」排序的块列表。
+def scan_blocks(root: Optional[str] = None,
+                roots: Optional[List[str]] = None) -> List[BlockMetadata]:
+    """扫描块目录，返回按（命名空间, 名称）排序的块列表。
 
-    三重一致性保证，任一不满足直接抛 `BlockError`：
-    1. 每份元数据都通过 `_validate` 字段校验
-    2. `名称` 与所在目录名（或 `<名>.块.json` 前缀）一致
-    3. 全局块名唯一——重名会让 `jk 块 详情 X` 无法定位，也会让索引条目二义
+    三种调用形态（ADR-27 §3.1）：
+
+    1. ``scan_blocks()``           扫内置 `blocks_root()` + `extra_roots()`。
+       默认合并规则：内置在前，第三方按 `JIKUAI_PKG_ROOTS` 顺序追加。
+    2. ``scan_blocks(root=X)``     单根扫描，命名空间一律为空
+       （**向后兼容**：v0.14.0 及以前的调用者与既有测试用例都走这里）。
+    3. ``scan_blocks(roots=[...])``  显式多根扫描；**第一个视为内置根**
+       （命名空间空串），其余为第三方根（按目录布局推断命名空间）。
+
+    一致性保证：
+
+    - 每份元数据都通过 `_validate` 字段校验（`load_block_metadata`）。
+    - `名称` 与所在目录名（或 `<名>.块.json` 前缀）一致。
+    - **同一命名空间内块名唯一**（内置块也算同一"空命名空间"）；跨命名空间
+      允许同名——`blocks.数据.求和` 与 `blocks.社区.数据.求和` 是两个块。
+    - 合并规则（ADR-27 §2.3）：先扫内置、再追加第三方；第三方块若与已扫入的
+      任一块**同（命名空间, 名称）**冲突则跳过（内置优先）。跨命名空间同名
+      共存，不视为冲突。
     """
+    if root is not None and roots is not None:
+        raise BlockError('scan_blocks: `root` 与 `roots` 不可同时指定')
+
+    # 组装扫描目标：(绝对路径, 是否内置)
+    if root is not None:
+        targets = [(os.path.abspath(root), True)]
+    elif roots is not None:
+        if not roots:
+            targets = []
+        else:
+            targets = [(os.path.abspath(roots[0]), True)]
+            targets += [(os.path.abspath(r), False) for r in roots[1:]]
+    else:
+        targets = [(os.path.abspath(blocks_root()), True)]
+        targets += [(r, False) for r in extra_roots()]
+
     blocks: List[BlockMetadata] = []
-    seen: Dict[str, str] = {}
+    # 键是 (命名空间, 名称)：同一命名空间内不允许重名；跨命名空间可以同名。
+    seen: Dict[tuple, str] = {}
 
-    for path in find_block_files(root):
-        meta = load_block_metadata(path)
-        expected = _expected_name(path)
-        if meta.name != expected:
-            raise BlockError('块「名称」%r 与路径不一致（应为 %r）：%s'
-                             % (meta.name, expected, path))
-        if meta.name in seen:
-            raise BlockError('块名重复：%r 同时出现在 %s 与 %s'
-                             % (meta.name, seen[meta.name], path))
-        seen[meta.name] = path
-        blocks.append(meta)
+    for base, is_builtin in targets:
+        for path in find_block_files(base):
+            meta = load_block_metadata(path)
+            expected = _expected_name(path)
+            if meta.name != expected:
+                raise BlockError('块「名称」%r 与路径不一致（应为 %r）：%s'
+                                 % (meta.name, expected, path))
+            ns = _infer_namespace(path, base, is_builtin)
+            # 命名空间不进 `块.json` schema，扫描时按路径注入；`_validate` 已
+            # 过，此处直接改 `_data` 让 `to_index_entry` / `qualified_name`
+            # 拿得到。
+            meta._data[NAMESPACE_KEY] = ns
+            key = (ns, meta.name)
+            if key in seen:
+                if is_builtin:
+                    # 内置扫描阶段的重名是硬错误（stdlib 自己不该出重名块）。
+                    raise BlockError(
+                        '块名重复（命名空间 %r 内）：%r 同时出现在 %s 与 %s'
+                        % (ns, meta.name, seen[key], path))
+                # 第三方阶段的同（命名空间, 名称）冲突：内置优先，静默跳过。
+                # ADR-27 §2.3 明确"同名冲突警告不失败"——这里选择"跳过"这条
+                # 具体策略，避免让 `jk 块 列表` 出现二义条目。
+                continue
+            seen[key] = path
+            blocks.append(meta)
 
-    # 按名称字典序（Unicode 码点序）排序——确定性排序保证索引 git diff 稳定
-    blocks.sort(key=lambda b: b.name)
+    # 排序键：(命名空间, 名称)。内置块命名空间为空串一律排在最前，保持既有
+    # 索引里的字典序不变（避免让 stdlib 的 `索引.json` 因排序变化整体翻动）。
+    blocks.sort(key=lambda b: (b.namespace, b.name))
     return blocks
 
 
@@ -507,18 +652,24 @@ def scan_blocks(root: Optional[str] = None) -> List[BlockMetadata]:
 
 def generate_index(root: Optional[str] = None,
                    version: str = BLOCK_INDEX_VERSION,
-                   timestamp: Optional[str] = None) -> dict:
-    """扫描块目录并构造索引结构（ADR-15 §3.4）。
+                   timestamp: Optional[str] = None,
+                   roots: Optional[List[str]] = None) -> dict:
+    """扫描块目录并构造索引结构（ADR-15 §3.4 / ADR-27 §2.4）。
 
     `timestamp` 省略时取本地当前时间，秒级精度的 ISO 8601（不带微秒——
     微秒对人没用，只会让 diff 更吵）。
+
+    `root` / `roots` 与 `scan_blocks` 同义：单根或多根。二者都不传时按
+    `scan_blocks()` 的缺省合并内置 + `JIKUAI_PKG_ROOTS`。**内置 stdlib 索引
+    刻意只传 `root=blocks_root()`**（见 `scripts/generate_block_index.py`），
+    避免把某台机器上配的第三方块写进版本控制的 `索引.json`。
     """
     if timestamp is None:
         timestamp = datetime.now().replace(microsecond=0).isoformat()
     return {
         '版本': version,
         '生成时间': timestamp,
-        '块': [b.to_index_entry() for b in scan_blocks(root)],
+        '块': [b.to_index_entry() for b in scan_blocks(root, roots)],
     }
 
 
@@ -573,6 +724,16 @@ def index_differs(existing: Optional[dict], fresh: dict) -> bool:
 # 向量索引一致性（G12，ADR-25 §3.3）
 # ---------------------------------------------------------------------------
 
+#: G12 内容哈希**刻意排除**的索引条目字段。
+#:
+#: 哈希的用途只有一个：回答「embedding 需不需要重生成」。
+#: `generate_embeddings.py::_build_texts` 的嵌入语料是 `名称 + 领域 + 描述`，
+#: `命名空间` 一个字都没进去——它是**注册表位置**属性，不是语义内容。把它算进
+#: 哈希会让「块换个命名空间目录」这种零语义变更也逼着重跑一次 GPU 编码
+#: （本机还未必连得上模型仓库），纯属自找麻烦。
+_HASH_EXCLUDED_KEYS = frozenset({NAMESPACE_KEY})
+
+
 def blocks_content_hash(blocks: List[Dict[str, Any]]) -> str:
     """对索引条目列表算内容哈希，用于 G12 比对。
 
@@ -581,10 +742,15 @@ def blocks_content_hash(blocks: List[Dict[str, Any]]) -> str:
 
     生成端（`tools/ai-bridge/generate_embeddings.py`）与校验端（`scripts/
     check_stdlib_contract.py`）都调本函数，避免两处各写一遍算法后悄悄漂移。
+
+    `_HASH_EXCLUDED_KEYS` 里的字段（W22 起的 `命名空间`）不参与哈希：它们不进
+    嵌入语料，改了也不影响向量，没有触发重生成的必要。
     """
     h = hashlib.sha256()
     for b in sorted(blocks, key=lambda x: x.get('名称', '')):
-        h.update(json.dumps(b, ensure_ascii=False, sort_keys=True).encode('utf-8'))
+        参与 = {k: v for k, v in b.items() if k not in _HASH_EXCLUDED_KEYS}
+        h.update(json.dumps(参与, ensure_ascii=False,
+                            sort_keys=True).encode('utf-8'))
     return 'sha256:%s' % h.hexdigest()
 
 
@@ -728,10 +894,18 @@ def check_type_annotation(block):
     return 问题
 
 
-def check_stdlib_type_annotations(root=None):
-    """G14 全量入口：扫描块库，汇总所有精度问题。空列表 = 门禁绿。"""
+def check_stdlib_type_annotations(root=None, roots=None):
+    """G14 全量入口：扫描块库，汇总所有精度问题。空列表 = 门禁绿。
+
+    缺省只扫**内置**块库（`root=None, roots=None` → `scan_blocks(None, None)`
+    会带上 `JIKUAI_PKG_ROOTS`，所以这里显式传 `blocks_root()`）。G14 是
+    stdlib 的精度政策，第三方块走 `_validate` 的宽松兼容路径，不该因为本机
+    配了个第三方块根就让内置门禁变红。要跨命名空间查时显式传 `roots`。
+    """
     问题 = []
-    for meta in scan_blocks(root):
+    if root is None and roots is None:
+        root = blocks_root()
+    for meta in scan_blocks(root, roots):
         问题 += check_type_annotation(meta)
     return 问题
 
@@ -746,11 +920,15 @@ def check_stdlib_type_annotations(root=None):
 # 冲突当**门禁失败**，逼贡献者在 PR 阶段改名，而不是等 dogfooding 才发现。
 
 def check_export_globally_unique(index=None):
-    """G13：扫描块索引里的 `导出` 字段，找出所有跨块重名。
+    """G13：扫描块索引里的 `导出` 字段，找出所有跨块重名（ADR-27：跨命名空间）。
 
     `index` 缺省时读盘的 `stdlib/blocks/索引.json`。返回 `[(名, [块1, 块2, ...])]`
     冲突列表，空列表表示门禁通过。**只看有 `导出` 字段的条目**——W7 之前生成的
     索引没这个字段，本门禁自然静默通过（与 G14 的向后兼容策略一致）。
+
+    ADR-27 §2.3 规定：**无论哪个命名空间，导出名全局不重名**——AI 桥接选块时
+    把「导出名」当唯一键，跨命名空间碰撞一样会让候选合并指错块。冲突报告里
+    带命名空间前缀以方便定位。
     """
     if index is None:
         index = load_index()
@@ -759,8 +937,11 @@ def check_export_globally_unique(index=None):
     反向 = {}
     for entry in index.get('块') or []:
         名 = entry.get('名称')
+        ns = entry.get(NAMESPACE_KEY) or BUILTIN_NAMESPACE
+        # 报告格式：有命名空间时显示 `命名空间/块名`，内置块只显示块名。
+        display = ('%s/%s' % (ns, 名)) if ns else 名
         for e in (entry.get('导出') or []):
-            反向.setdefault(e, []).append(名)
+            反向.setdefault(e, []).append(display)
     冲突 = [(k, sorted(v)) for k, v in 反向.items() if len(v) > 1]
     冲突.sort()
     return 冲突

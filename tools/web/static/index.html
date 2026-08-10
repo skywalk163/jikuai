@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>极快 · 块工坊</title>
+  <style>
+    :root{
+      --bg:#1e1f26; --panel:#26272f; --line:#34363f; --fg:#e6e6ea;
+      --dim:#a2a3ae; --accent:#7fd1b9; --warn:#e0a45e; --err:#e88a8a;
+      --kw:#c98fe0; --str:#e0c07f; --num:#8fb8e0;
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;height:100%}
+    body{
+      background:var(--bg); color:var(--fg);
+      font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    }
+    /* 三段式：需求 / 候选 / 方案+结果，CSS Grid 手写竖向三段 */
+    .grid{
+      height:100vh; display:grid; gap:10px; padding:10px;
+      grid-template-rows:auto minmax(120px,1fr) minmax(220px,1.6fr);
+    }
+    .panel{
+      background:var(--panel); border:1px solid var(--line);
+      border-radius:8px; padding:12px; overflow:auto; min-height:0;
+    }
+    h1{font-size:15px;margin:0 0 8px}
+    h2{font-size:13px;margin:0 0 8px;color:var(--dim);font-weight:600}
+    .row{display:flex;gap:8px;align-items:center}
+    input[type=text],textarea{
+      background:var(--bg); color:var(--fg);
+      border:1px solid var(--line); border-radius:6px; padding:8px 10px;
+      font:inherit; width:100%;
+    }
+    button{
+      background:var(--accent); color:#12211c; border:0; border-radius:6px;
+      padding:8px 16px; font:inherit; font-weight:600; cursor:pointer;
+      white-space:nowrap;
+    }
+    button:disabled{opacity:.5;cursor:default}
+    button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+    button.sm{padding:4px 10px;font-size:12px}
+    /* 键盘可达性：焦点环必须看得见 */
+    :focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+    label.chk{color:var(--fg);display:flex;gap:4px;align-items:center;cursor:pointer;white-space:nowrap}
+    label.chk input:disabled{cursor:default}
+    .hint{color:var(--dim);font-size:12px;white-space:nowrap}
+    .grow{flex:1}
+    .muted{color:var(--dim)}
+    .tools{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+
+    /* ---- 候选卡片（<button>，天生可键盘操作）---- */
+    .cards{display:flex;flex-direction:column;gap:6px}
+    .card{
+      border:1px solid var(--line); border-radius:6px; padding:8px 10px;
+      cursor:pointer; background:var(--bg); color:var(--fg); width:100%;
+      display:flex; gap:8px; align-items:baseline; flex-wrap:wrap;
+      font:inherit; font-weight:400; text-align:left;
+    }
+    .card:hover{border-color:var(--accent)}
+    .card[aria-pressed="true"]{border-color:var(--accent);background:#2b3a34}
+    .card .nm{font-weight:600}
+    .card .sc{margin-left:auto;color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+    .card .ds{color:var(--dim);font-size:12px;flex-basis:100%;margin-top:2px}
+    .badge{
+      font-size:11px;padding:1px 7px;border-radius:999px;
+      border:1px solid var(--line);color:var(--dim);white-space:nowrap;
+    }
+    .badge.b-nn{border-color:var(--kw);color:var(--kw)}
+    .badge.b-he{border-color:var(--accent);color:var(--accent)}
+
+    /* ---- 段三：源码 + 结果 ---- */
+    .split{display:grid;grid-template-columns:1fr 1fr;gap:10px;min-height:0;height:100%}
+    .col{display:flex;flex-direction:column;gap:8px;min-height:0}
+    pre{
+      margin:0; padding:10px; background:var(--bg); border:1px solid var(--line);
+      border-radius:6px; overflow:auto; flex:1; min-height:80px;
+      font-family:"Consolas","Menlo",monospace; white-space:pre-wrap; word-break:break-word;
+    }
+    /* 编辑器 = 行号槽 + （高亮层 <pre> 垫在透明字 <textarea> 底下）。
+       两层的 font / padding / border / white-space 必须逐项一致，否则串行。 */
+    .editor{
+      flex:1; min-height:140px; display:grid; grid-template-columns:auto 1fr;
+      background:var(--bg); border:1px solid var(--line); border-radius:6px; overflow:hidden;
+    }
+    .gutter{
+      padding:8px 6px; overflow:hidden; text-align:right; min-width:2.6em;
+      color:var(--dim); background:#22232a; border-right:1px solid var(--line);
+      font:13px/1.5 "Consolas","Menlo",monospace; user-select:none;
+    }
+    .gutter div{white-space:pre}
+    .gutter div.bad{color:var(--err);font-weight:700}
+    .gutter div.warn{color:var(--warn);font-weight:700}
+    .ebody{position:relative;min-width:0}
+    #hl,#src{
+      position:absolute; inset:0; margin:0; padding:8px 10px; border:0;
+      border-radius:0; background:transparent; tab-size:4; min-height:0;
+      font:13px/1.5 "Consolas","Menlo",monospace; white-space:pre;
+      word-break:normal; overflow-wrap:normal;
+    }
+    /* 高亮层不吃鼠标、不自己滚（滚动位置由 JS 从 textarea 同步过来，
+       否则两层各有一条滚动条，宽度不同就会错行）。 */
+    #hl{pointer-events:none;color:var(--fg);overflow:hidden}
+    #src{color:transparent;caret-color:var(--fg);resize:none;overflow:auto;width:100%;height:100%}
+    #src::placeholder{color:var(--dim)}
+    #src::selection{background:#3d5f57;color:transparent}
+    /* 诊断标记：行底色 + 出错列的波浪下划线 */
+    .ln-bad{background:rgba(232,138,138,.16);border-radius:2px}
+    .ln-bad.lv-warn{background:rgba(224,164,94,.16)}
+    .ln-bad.lv-info{background:rgba(127,209,185,.14)}
+    .col-mark{
+      background:rgba(232,138,138,.34);
+      text-decoration:underline wavy var(--err); text-underline-offset:2px;
+    }
+    .lv-warn .col-mark{background:rgba(224,164,94,.34);text-decoration-color:var(--warn)}
+    .lv-info .col-mark{background:rgba(127,209,185,.3);text-decoration-color:var(--accent)}
+    /* 极快语法着色 */
+    .tok-kw{color:var(--kw)}
+    .tok-str{color:var(--str)}
+    .tok-num{color:var(--num)}
+    .tok-cm{color:var(--dim);font-style:italic}
+
+    /* ---- 诊断清单 ---- */
+    .diag{display:flex;flex-direction:column;gap:4px;max-height:38%;overflow:auto;flex:none}
+    .diag-h{color:var(--dim);font-size:12px}
+    .diag-item{
+      display:flex;gap:8px;align-items:baseline;width:100%;text-align:left;
+      background:var(--bg);color:var(--fg);border:1px solid var(--line);
+      border-left:3px solid var(--err);font-size:12px;font-weight:400;padding:4px 8px;
+    }
+    .diag-item.lv-warn{border-left-color:var(--warn)}
+    .diag-item.lv-info{border-left-color:var(--accent)}
+    .diag-item.stale{opacity:.6}
+    .diag-item .pos{color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+    .diag-item .lv{white-space:nowrap}
+    .diag-item .msg{flex:1}
+
+    /* ---- 提示条 / 备注 ---- */
+    .note{color:var(--warn);font-size:12px;margin:6px 0 0}
+    .note.err{color:var(--err)}
+    .banner{
+      background:#3a2e26;border:1px solid var(--warn);color:#f0c98e;
+      border-radius:6px;padding:6px 10px;font-size:12px;margin-bottom:8px;
+    }
+    .bar{
+      display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;
+      background:#33302a;border:1px solid var(--warn);color:#f0c98e;
+      border-radius:6px;padding:6px 10px;font-size:12px;
+    }
+    .bar button.x{
+      background:transparent;color:inherit;border:0;margin-left:auto;
+      padding:0 4px;font-size:15px;line-height:1;cursor:pointer;
+    }
+    .sec{color:var(--dim);font-size:12px;margin-top:6px}
+    .sec:first-child{margin-top:0}
+    .body{white-space:pre-wrap;word-break:break-word;font-family:"Consolas","Menlo",monospace}
+    .body.err{color:var(--err)}
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <!-- 段一：需求 -->
+    <section class="panel" style="overflow:visible">
+      <div class="banner">本服务无鉴权、会在本机执行你提交的极快代码，仅供本地开发使用。</div>
+      <h1>极快 · 块工坊 <span class="muted" style="font-weight:400">选 → 组 → 跑　·　Ctrl+Enter 跑，Esc 清空</span></h1>
+      <div class="row">
+        <label class="hint" for="q">需求</label>
+        <input type="text" id="q" class="grow" autocomplete="off"
+               placeholder="你想干什么？例如：把一批数求和再算平均">
+        <label class="chk" id="neural-label" for="neural">
+          <input type="checkbox" id="neural" disabled aria-describedby="cap-hint"> 神经检索
+        </label>
+        <span class="hint" id="cap-hint">探测中…</span>
+        <button id="btn-sel">选块</button>
+      </div>
+      <p class="note" id="sel-note" hidden></p>
+    </section>
+
+    <!-- 段二：候选 -->
+    <section class="panel">
+      <div class="bar" id="degrade" role="status" hidden></div>
+      <h2>候选块 <span class="muted" id="cand-hint">（点选一个或多个，然后「组装方案」）</span></h2>
+      <div class="cards" id="cands"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-asm" disabled>组装方案 ↓</button>
+        <label class="hint" for="feed">喂数据</label>
+        <input type="text" id="feed" class="grow" autocomplete="off"
+               placeholder="喂给第一步的数据（可选），如：列 10 20 30 —— 会变成方案里的共享量「赵料」">
+      </div>
+      <p class="note" id="asm-note" hidden></p>
+    </section>
+
+    <!-- 段三：方案（源码）+ 结果 -->
+    <section class="panel">
+      <div class="split">
+        <div class="col">
+          <div class="row">
+            <h2 style="margin:0">合成源码 <span class="muted">（可编辑）</span></h2>
+            <div class="tools">
+              <button id="btn-copy-plan" class="ghost sm" disabled>复制方案 JSON</button>
+              <button id="btn-copy-src" class="ghost sm" disabled>复制源码</button>
+              <button id="btn-dl" class="ghost sm" disabled>下载 .jk</button>
+              <button id="btn-run" class="ghost sm" disabled title="Ctrl+Enter">跑 ▶</button>
+            </div>
+          </div>
+          <div class="editor">
+            <div class="gutter" id="gutter" aria-hidden="true"></div>
+            <div class="ebody">
+              <pre id="hl" aria-hidden="true"></pre>
+              <textarea id="src" spellcheck="false" aria-label="极快源码（可编辑）"
+                        placeholder="选块并组装后，这里出现可运行的极快源码…"></textarea>
+            </div>
+          </div>
+          <div class="diag" id="diag" role="region" aria-label="诊断清单" hidden></div>
+          <p class="note" id="run-note" hidden></p>
+        </div>
+        <div class="col">
+          <h2>运行结果</h2>
+          <pre id="out" role="log" aria-label="运行结果"><span class="muted">跑一下看看。</span></pre>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

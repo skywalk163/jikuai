@@ -1,5 +1,43 @@
 # 极快 JiKuai · 变更日志
 
+## v0.15.0（2026-08-10）· LSP 深化 + Web UI 零依赖 + 生态开放
+
+### LSP 补齐
+
+- `completion`/`hover` 补 16 条测试（此前零覆盖）；`capabilities.py` 冻结 8 条契约测试
+- `textDocument/definition`：F12 跳转到块目录对应的 `.jk` 文件（从直接跳目录改为跳文件）
+- `textDocument/didChange` 切换为 incremental sync（`TextDocumentSyncKind.Incremental`）
+- `workspace/executeCommand: 极快.选块` 接入 `retrieval`；JSON 返回与 CLI `jk 块 选 --json` 完全一致（schema 唯一真源 `service/schema.py`）
+- 三类测试文件：协议级（`test_lsp_protocol.py`）、能力级（`test_lsp_capabilities.py`）、集成级（`test_lsp_e2e.py`）
+
+### Web UI 零依赖
+
+- `tools/web/server.py`：基于 `http.server` 的本地只读服务，五端点——`GET /api/blocks`、`POST /api/选`、`POST /api/组`、`POST /api/跑`、`GET /api/能力`
+- `tools/web/static/` 单页应用（`index.html` + `app.js`），gzip 13.55 KB（上限 15 KB），含语法高亮/诊断行列高亮/神经检索开关/复制下载/快捷键
+- 33 条 `http.client` 测试（`tests/test_web_server.py`）覆盖端点、错误路径、gzip 上限
+
+### 生态开放
+
+- `jk 块 新建` 脚手架：一步出三件套 + 形参词法原子性预检（块名/导出名/形参三层）
+- ADR-27 第三方块注册表：`JIKUAI_PKG_ROOTS` 环境变量 + 命名空间 + 索引合并策略
+- G13 门禁上线：导出名全局唯一（含跨命名空间）；串在 `check_stdlib_contract.py` 内
+- `docs/贡献指南.md`：六坑覆盖 + PR 模板 + 一分钟速通清单
+
+### 三通道统一协议（Breaking Change）
+
+- **`跑 --json` 信封结构变更**：从 `{"结果": [行], "返回值": ...}` 改为 `{"源码": "...", "执行结果": {"stdout", "stderr", "返回值", "耗时毫秒", "错误"?, "诊断"?}}`。`schema.make_run_envelope` / `schema.validate_result` 是唯一构造/校验入口
+- **候选新增 `层级` 字段**（必需，int）：取自 `索引.json`，不是启发式推断；消费者解析 `选` 响应时需读此字段
+- 三边收敛到 `src/jikuai/service/schema.py`：CLI/LSP/Web 不再自行发明协议字段；通道里出现手写字面量视为违约
+- 降级说明收进 schema（`降级说明` 可选字段，仅候选无神经路径时出现）
+
+### 迁移建议
+
+- 消费 `jk 块 选 --json` / `executeCommand` / `POST /api/选` 的工具需适配新增的 `层级` 字段
+- 消费 `跑 --json` 的工具需按 `docs/协议-三通道.md` 更新解析：外层 `源码` + 内嵌 `执行结果`
+- 第三方块接入方参考 `docs/贡献指南.md` 与 ADR-27
+
+---
+
 ## v0.14.0（2026-08-10）· 类型系统细化 + 粘合器 + L2 块 + 三段式 CLI
 
 ### W12 · 10 个端到端 demo + 压缩比基准 + 发布

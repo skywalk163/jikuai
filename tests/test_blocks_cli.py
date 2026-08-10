@@ -16,6 +16,8 @@
 - validate_block 对非原子依赖块名只给警告（1 条）
 - validate_block 对依赖块不一致报错（1 条）
 - CLI 列表/查找/详情/校验/索引 各 1 条（capsys 捕获输出，断言返回码）
+- W21 `新建` 脚手架 6 条（3 正：最小参数过校验 / 完整参数字段 / 默认导出名；
+  3 反：坏形参名 `赵次` / 目标目录已存在 / 领域不在白名单）
 """
 
 import json
@@ -317,14 +319,16 @@ def test_cli_select_口语需求命中(capsys):
 
 
 def test_cli_select_json输出(capsys):
-    """`--json` 出结构化候选，含 名称/领域/描述/分数/路径 五字段。"""
+    """`--json` 出结构化候选，含 名称/领域/层级/描述/分数/路径 六字段（W20 收敛）。"""
     rc = blocks_cli.run(['选', '求和', '--top', '2', '--json'])
     out = capsys.readouterr().out
     assert rc == 0
     data = json.loads(out)
     assert data['需求'] == '求和'
     assert data['候选']
-    assert set(data['候选'][0]) >= {'名称', '领域', '描述', '分数', '路径'}
+    # 新契约：候选必须含 `层级`（W20 breaking change）
+    assert set(data['候选'][0]) >= {'名称', '领域', '层级', '描述', '分数', '路径'}
+    assert isinstance(data['候选'][0]['层级'], int)
 
 
 def test_cli_select_缺需求返1(capsys):
@@ -641,6 +645,335 @@ def test_cli_select_神经_sidecar超时时降级(monkeypatch, capsys):
     assert rc == 0
     assert '[启发式]' in captured.out
     assert '超时' in captured.err
+
+
+# ---------------------------------------------------------------------------
+# W20：三通道统一 JSON 协议收敛（docs/协议-三通道.md）
+# ---------------------------------------------------------------------------
+# 这一段断言的是**有意的契约变更**，不是回归：v0.15.0 W20 把 CLI `--json`
+# 输出从手写字典换成 `service.schema` 的构造器，`选` 的候选因此新增 `层级`，
+# `跑` 的响应从 `{需求,源码,结果[],返回值}` 换成 `跑响应` 信封。项目禁止
+# backwards-compat 双写，所以旧字段是**真的没了**。
+
+def test_cli_select_json过选响应校验(capsys):
+    """`选 --json` 的整份输出过 `schema.validate_select_envelope` 零错误。
+
+    比逐字段断言更硬：`validate_*` 会连未知字段一起拒——通道私自加字段
+    这条测试就红，正是 W20 硬门槛要守的东西。
+    """
+    from jikuai.service import schema
+    rc = blocks_cli.run(['选', '求和', '--top', '3', '--json'])
+    out = capsys.readouterr().out
+    assert rc == 0
+    信封 = json.loads(out)
+    assert schema.validate_select_envelope(信封) == [], 信封
+
+
+def test_cli_select_json神经降级带降级说明(monkeypatch, capsys):
+    """`--神经` 拿不到向量 → JSON 里带 `降级说明`，同时 stderr 仍有提示。
+
+    W20 之前降级原因只打 stderr，`--json` 的调用方（前端 / 脚本）看不到。
+    """
+    from jikuai.ai import embed_client
+    from jikuai.service import schema
+    monkeypatch.setattr(embed_client, 'fetch_query_vector',
+                        lambda *a, **k: (None, '测试注入：sidecar 不存在'))
+    rc = blocks_cli.run(['选', '求和', '--top', '2', '--神经', '--json'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    信封 = json.loads(captured.out)
+    assert schema.validate_select_envelope(信封) == [], 信封
+    assert '测试注入' in 信封['降级说明']
+    assert '启发式' in 信封['降级说明']
+    assert '神经检索不可用' in captured.err        # stderr 提示保留
+
+
+def test_cli_select_json不用神经时无降级说明(capsys):
+    """没勾神经就不该出现 `降级说明`——可选字段不该无条件冒出来。"""
+    rc = blocks_cli.run(['选', '求和', '--top', '2', '--json'])
+    信封 = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert '降级说明' not in 信封
+
+
+def test_cli_跑_json是跑响应信封(tmp_path, capsys):
+    """`跑 --json` 出 `跑响应`：`{源码, 执行结果[, 需求]}`，过 schema 校验。
+
+    与旧契约的差异（有意）：`结果` 数组没了，stdout 改成原始字符串塞进
+    `执行结果.stdout`；`返回值` 从顶层下沉到 `执行结果` 里。
+    """
+    from jikuai.service import schema
+    plan = {
+        '需求': '求和',
+        '共享': [{'名': '赵料', '值': '列 10 20 30'}],
+        '步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']}],
+        '打印': ['赵果1'],
+    }
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p), '--json'])
+    out = capsys.readouterr().out
+    assert rc == 0
+    信封 = json.loads(out)
+    assert schema.validate_run_envelope(信封) == [], 信封
+    assert 信封['需求'] == '求和'
+    assert '从 blocks.数据.求和 导入 汇总' in 信封['源码']
+    结果 = 信封['执行结果']
+    assert '60' in 结果['stdout']            # 原始字符串，不是按行切的数组
+    assert isinstance(结果['stdout'], str)
+    assert 结果['stderr'] == ''
+    assert 结果['耗时毫秒'] >= 0
+    assert '错误' not in 结果                # 成功时 `错误` 不出现（而非空串）
+    # 旧契约的顶层字段确实没了（禁止 backwards-compat 双写）
+    assert '结果' not in 信封
+    assert '返回值' not in 信封
+
+
+def test_cli_跑_json执行失败也走信封(tmp_path, capsys):
+    """解释器报错 → 仍是 `跑响应` 信封，只是 `执行结果.错误` 有值，rc=2。
+
+    旧契约失败时是另一套形状 `{需求,错误,源码}`；W20 起成功/失败同一套。
+    """
+    from jikuai.service import schema
+    plan = {'步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总',
+                    '参数': ['赵没定义过的东西']}]}
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p), '--json'])
+    out = capsys.readouterr().out
+    assert rc == 2                            # 执行期错误 → 退出码 2
+    信封 = json.loads(out)
+    assert schema.validate_run_envelope(信封) == [], 信封
+    assert 信封['执行结果']['错误']
+    assert 'Traceback' not in 信封['执行结果']['错误']
+    assert 信封['执行结果']['返回值'] == ''
+
+
+def test_cli_跑_json占位符未填也走信封(tmp_path, capsys):
+    """参数填不上 → `跑响应` 信封 + `执行结果.错误`，rc=1（输入错误）。"""
+    from jikuai.service import schema
+    plan = {'步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总'}]}
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p), '--json'])
+    out = capsys.readouterr().out
+    assert rc == 1
+    信封 = json.loads(out)
+    assert schema.validate_run_envelope(信封) == [], 信封
+    assert '需人工填参' in 信封['执行结果']['错误']
+
+
+def test_cli_跑_人读模式格式不变(tmp_path, capsys):
+    """非 `--json` 的人读输出仍是「程序打印什么就直出什么」，rc=0。
+
+    W20 加了 `redirect_stderr`，但人读模式要把拦下的 stderr 转发回真 stderr，
+    否则诊断会凭空消失。
+    """
+    plan = {
+        '共享': [{'名': '赵料', '值': '列 10 20 30'}],
+        '步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']}],
+        '打印': ['赵果1'],
+    }
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == '60'
+
+
+def test_cli_选组跑管道端到端(monkeypatch, capsys):
+    """`选 --json` 的输出能直接喂给 `跑 -`：候选信封 → 方案 → 执行。
+
+    W20 改了 `选 --json` 的形状（候选多了 `层级`），这条守住管道没被打断：
+    `_候选转方案` 必须把 `候选`/`降级说明` 这些非方案字段丢掉，否则 glue
+    入口的 `schema.ensure_plan` 会以「未知字段」拒收。
+    """
+    import io
+    rc = blocks_cli.run(['选', '求和', '--top', '1', '--json'])
+    选出 = capsys.readouterr().out
+    assert rc == 0
+    monkeypatch.setattr('sys.stdin', io.StringIO(选出))
+    rc = blocks_cli.run(['组', '-'])
+    源码 = capsys.readouterr().out
+    assert rc == 0, 源码
+    assert '从 blocks.数据.求和 导入' in 源码
+
+
+def test_cli_选人读输出能喂给组(monkeypatch, capsys):
+    """人读候选清单（没有 `--json`）→ `组 -` 仍能接上（DoD 的管道用例）。"""
+    import io
+    rc = blocks_cli.run(['选', '求和', '--top', '1'])
+    人读 = capsys.readouterr().out
+    assert rc == 0
+    monkeypatch.setattr('sys.stdin', io.StringIO(人读))
+    rc = blocks_cli.run(['组', '-'])
+    源码 = capsys.readouterr().out
+    assert rc == 0, 源码
+    assert '导入' in 源码
+
+
+# ---------------------------------------------------------------------------
+# W21：`jk 块 新建` 脚手架（3 正 + 3 反）
+# ---------------------------------------------------------------------------
+# 全部在 tmp_path 造的假 `blocks_root()` 上跑——`新建` 是**会写盘**的命令，
+# 指着真 `stdlib/blocks/` 测一次就往仓库里拉一个垃圾块进来。
+# monkeypatch 打的是 `jikuai.pkg.blocks.blocks_root` 这个模块属性：
+# `blocks_cli._块目录` 与 `blocks.find_block_files`/`index_path` 都在调用时
+# 才查这个名字，所以一处替换全链路生效。
+
+def _假块根(monkeypatch, tmp_path):
+    """把 `blocks_root()` 指到 tmp_path，返回那个路径。"""
+    root = tmp_path / 'blocks'
+    root.mkdir()
+    monkeypatch.setattr(blocks, 'blocks_root', lambda: str(root))
+    return root
+
+
+def test_cli_新建_最小参数出三件套并过校验(monkeypatch, tmp_path, capsys):
+    """WBS DoD：`--领域 工具 --名 测试块` 一步出三件套，且 `jk 块 校验` 全绿。
+
+    这条是整个 W21 的验收核心：脚手架落地的块**当场就合规**，不需要贡献者
+    先补几个字段才敢跑校验。
+    """
+    root = _假块根(monkeypatch, tmp_path)
+    rc = blocks_cli.run(['新建', '--领域', '工具', '--名', '测试块'])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert '✓ 已创建块 工具.测试块' in out
+
+    目录 = root / '工具' / '测试块'
+    assert (目录 / '块.json').is_file()
+    assert (目录 / '测试块.jk').is_file()
+    assert (目录 / '测试.jk').is_file()
+    # `.py` 背衬默认不生成（WBS 标注可选）
+    assert not (目录 / '测试块.py').exists()
+
+    # 元数据能过 `_validate` 的全部字段校验
+    meta = blocks.load_block_metadata(str(目录))
+    assert meta.name == '测试块'
+    assert meta.version == '0.1.0'
+    assert meta.level == 0
+    assert meta.domains == ['工具']
+    assert meta.stability == 'experimental'      # 未给 --稳定性 时的最保守档
+    assert meta.exports == ['测试块']            # 默认导出名 = 块名
+    assert meta.inputs == []                     # 没给 --参 → 省略 输入
+
+    # 过 `jk 块 校验 <块目录>`：零 error（缺 测试.jk 那条 warning 也不该出现）
+    errors, warnings = blocks.validate_block(str(目录))
+    assert errors == [], errors
+    assert '缺少 测试.jk' not in '；'.join(warnings)
+    rc = blocks_cli.run(['校验', str(目录)])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.out + captured.err
+    assert '✓ 测试块' in captured.out
+
+
+def test_cli_新建_完整参数字段正确(monkeypatch, tmp_path, capsys):
+    """`--导出 --参 --层级 --稳定性` 全给：三个文件的内容逐项对齐。"""
+    root = _假块根(monkeypatch, tmp_path)
+    rc = blocks_cli.run(['新建', '--领域', '数据', '--名', '融合',
+                         '--导出', '合计', '--参', '赵文', '赵数',
+                         '--层级', '1', '--稳定性', 'stable'])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+
+    目录 = root / '数据' / '融合'
+    元数据 = json.loads((目录 / '块.json').read_text(encoding='utf-8'))
+    assert 元数据['名称'] == '融合'
+    assert 元数据['版本'] == '0.1.0'
+    assert 元数据['层级'] == 1
+    assert 元数据['领域'] == ['数据']
+    assert 元数据['稳定性'] == 'stable'
+    assert 元数据['导出'] == ['合计']            # 导出名 ≠ 块名，刻意分离
+    # 输入 的 `名` 去掉百家姓首字：赵文 → 文
+    assert 元数据['输入'] == [{'名': '文', '类型': '任意'},
+                          {'名': '数', '类型': '任意'}]
+    assert 元数据['输出'] == {'类型': '任意'}
+
+    主源码 = (目录 / '融合.jk').read_text(encoding='utf-8')
+    assert '函数 合计 接收 赵文 赵数：' in 主源码
+    assert '导出 合计。' in 主源码
+    assert '\r' not in 主源码                    # newline='\n'，跨平台字节一致
+
+    测试源码 = (目录 / '测试.jk').read_text(encoding='utf-8')
+    assert '从 blocks.数据.融合 导入 合计。' in 测试源码
+    assert '定义赵结果=合计(空 空)。' in 测试源码
+
+    errors, _ = blocks.validate_block(str(目录))
+    assert errors == [], errors
+
+
+def test_cli_新建_默认导出名等于块名(monkeypatch, tmp_path, capsys):
+    """不给 `--导出` 时导出名默认取块名，元数据与 `.jk` 两侧都要一致。"""
+    root = _假块根(monkeypatch, tmp_path)
+    rc = blocks_cli.run(['新建', '--领域', '工具', '--名', '整合'])
+    assert rc == 0, capsys.readouterr().out
+
+    目录 = root / '工具' / '整合'
+    元数据 = json.loads((目录 / '块.json').read_text(encoding='utf-8'))
+    assert 元数据['导出'] == ['整合']
+    主源码 = (目录 / '整合.jk').read_text(encoding='utf-8')
+    assert '函数 整合：' in 主源码               # 无形参 → 不带 `接收`
+    assert '导出 整合。' in 主源码
+    # 元数据 `导出` 与 `.jk` 实际导出对账（validate_block 步骤 5.5）
+    assert blocks.extract_exports(str(目录 / '整合.jk')) == {'整合'}
+
+
+def test_cli_新建_坏形参名被拒且带切分信息(monkeypatch, tmp_path, capsys):
+    """WBS DoD：`--参 赵次` → 拒绝 + 可读理由带被切碎的 token。
+
+    `次` 是关键字，`赵次` 会被切成 `赵`(IDENT)+`次`(KEYWORD)。报错必须把这个
+    切分摆出来——只说「不是原子」用户猜不到是哪个字招的祸（坑 #4）。
+    另外断言**一个字节都没落盘**：预检全在 makedirs 之前。
+    """
+    root = _假块根(monkeypatch, tmp_path)
+    rc = blocks_cli.run(['新建', '--领域', '工具', '--名', '测试块',
+                         '--参', '赵文', '赵次'])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert '形参名「赵次」' in captured.err
+    assert '非词法原子' in captured.err
+    assert '赵(IDENT)' in captured.err          # 切分结果里的每个 token
+    assert '次(KEYWORD)' in captured.err
+    assert '百家姓' in captured.err              # 给出可操作的改法
+    assert not (root / '工具').exists()          # 失败不留半个块
+
+
+def test_cli_新建_目标目录已存在被拒(monkeypatch, tmp_path, capsys):
+    """目标目录已存在 → 拒绝，绝不覆盖别人写好的块。"""
+    root = _假块根(monkeypatch, tmp_path)
+    已有 = root / '工具' / '测试块'
+    已有.mkdir(parents=True)
+    (已有 / '别动我.txt').write_text('原有内容', encoding='utf-8')
+
+    rc = blocks_cli.run(['新建', '--领域', '工具', '--名', '测试块'])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert '已存在' in err
+    assert '测试块' in err
+    # 原有内容原封不动，且没顺手写进三件套
+    assert (已有 / '别动我.txt').read_text(encoding='utf-8') == '原有内容'
+    assert not (已有 / '块.json').exists()
+
+
+def test_cli_新建_领域不在白名单被拒(monkeypatch, tmp_path, capsys):
+    """`--领域` 不在 ALLOWED_DOMAINS → 拒绝 + 列出允许值。
+
+    领域白名单是 CLI `--领域` 过滤的地基（blocks.py §ALLOWED_DOMAINS 注释）；
+    脚手架放水会让白名单退化成自由文本。
+    """
+    root = _假块根(monkeypatch, tmp_path)
+    rc = blocks_cli.run(['新建', '--领域', '玄学', '--名', '测试块'])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert '未知领域' in err
+    assert '玄学' in err
+    for d in sorted(blocks.ALLOWED_DOMAINS):    # 报错要把合法取值全列出来
+        assert d in err
+    assert not (root / '玄学').exists()
+    assert not (root / '工具').exists()
+
 
 
 

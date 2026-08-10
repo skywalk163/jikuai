@@ -225,8 +225,13 @@ def _cached_resolve(loader, module: str, file: Optional[str]) -> Optional[str]:
 
 
 def _cached_exports(path: str) -> frozenset:
-    """读取模块导出名，按 (mtime, size) 指纹缓存。指纹取不到就当无导出。"""
-    from .pkg.blocks import extract_exports
+    """读取模块导出名，按 (mtime, size) 指纹缓存。指纹取不到就当无导出。
+
+    v0.14.0 W7：改走 `block_exports`——同目录有 `块.json` 且带 `导出` 字段就
+    直接读元数据，省掉整文件 `.jk` 读 + 正则扫描；没有元数据时它内部回退到
+    `extract_exports(path)`，行为与 v0.13.0 完全一致。
+    """
+    from .pkg.blocks import block_exports
     try:
         st = os.stat(path)
         fingerprint = (st.st_mtime_ns, st.st_size)
@@ -236,7 +241,7 @@ def _cached_exports(path: str) -> frozenset:
     if hit is not None and hit[0] == fingerprint:
         return hit[1]
     try:
-        exports = frozenset(extract_exports(path))
+        exports = frozenset(block_exports(path))
     except Exception:
         exports = frozenset()
     _EXPORTS_CACHE[path] = (fingerprint, exports)

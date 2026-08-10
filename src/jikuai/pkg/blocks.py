@@ -38,6 +38,7 @@ __all__ = [
     'BLOCK_METADATA_NAME', 'BLOCK_METADATA_SUFFIX', 'BLOCK_INDEX_NAME',
     'BLOCK_INDEX_VERSION', 'ALLOWED_DOMAINS', 'STABILITY_LEVELS',
     'DEFAULT_STABILITY',
+    'SCALAR_TYPES', 'CONTAINER_TYPE_NAMES', 'UNION_TYPE_NAME',
     'VECTOR_INDEX_NAME', 'VECTOR_INDEX_META_NAME',
     'BlockError', 'BlockMetadata',
     'blocks_root', 'index_path', 'load_block_metadata', 'find_block_files',
@@ -46,7 +47,9 @@ __all__ = [
     'blocks_content_hash', 'vector_index_meta_path', 'check_vector_index',
     'vector_index_bin_path',
     'check_export_atomicity', 'check_module_segment_atomicity',
-    'extract_exports', 'validate_block',
+    'extract_exports', 'block_exports', 'validate_block',
+    'check_type_annotation', 'check_stdlib_type_annotations',
+    'check_export_globally_unique',
 ]
 
 #: 目录形态的元数据文件名。
@@ -78,6 +81,17 @@ ALLOWED_DOMAINS = frozenset({'数据', '中文', '网络', '工具', '财务', '
 #: 稳定性等级。CLI 默认只推荐 `stable`。
 STABILITY_LEVELS = frozenset({'experimental', 'stable', 'deprecated'})
 
+#: 类型词表（ADR-26）。标量类型：可直接作为 `类型` 字段的字符串值。
+SCALAR_TYPES = frozenset({'数', '字符串', '布尔', '函数', '任意'})
+
+#: 容器类型名。作为结构化 `类型` 对象的 `类型` 字段值，或作为向后兼容的裸
+#: 字符串（裸 `列表` 视为 `列表<任意>`，裸 `字典` 视为 `字典<字符串,任意>`）。
+CONTAINER_TYPE_NAMES = frozenset({'列表', '字典', '元组'})
+
+#: 联合类型名。只有结构化形态：`{"类型": "联合", "候选": [...]}`。
+#: 裸 `联合` 无意义（等同 `任意`），故不进 `CONTAINER_TYPE_NAMES`。
+UNION_TYPE_NAME = '联合'
+
 #: 未声明 `稳定性` 时的默认值。取最保守的一档：没表态的块不该被 CLI 推荐。
 DEFAULT_STABILITY = 'experimental'
 
@@ -93,7 +107,10 @@ _SKIP_DIRS = frozenset({
 })
 
 #: 索引条目字段顺序。固定顺序 + 按名称排序 = git diff 稳定。
-_INDEX_ENTRY_KEYS = ('名称', '领域', '层级', '描述', '输入', '输出', '稳定性')
+#: W7 起带上 `导出`：AI 桥接选块后要立刻拼出 `从 blocks.X.Y 导入 Z。`，
+#: 没有它就得为每个候选块再读一次 `.jk`。`兼容` **不进索引**——它是安装期
+#: 字段，检索期用不上，进索引只会白涨 token。
+_INDEX_ENTRY_KEYS = ('名称', '领域', '层级', '描述', '输入', '输出', '导出', '稳定性')
 
 
 class BlockError(Exception):
@@ -157,6 +174,16 @@ class BlockMetadata:
     def stability(self) -> str:
         return self._data.get('稳定性', DEFAULT_STABILITY)
 
+    @property
+    def exports(self) -> List[str]:
+        """`导出` 字段（ADR-24 §5 / W7）。缺省 `[]`——回退读 `.jk` 由 `extract_exports` 负责。"""
+        return list(self._data.get('导出') or [])
+
+    @property
+    def compat(self) -> dict:
+        """`兼容` 字段（W7）。环境兼容性约束表，如 `{"极快": ">=0.13"}`。缺省 `{}`。"""
+        return dict(self._data.get('兼容') or {})
+
     # ---- 派生 ------------------------------------------------------------
     @property
     def root(self) -> str:
@@ -177,6 +204,7 @@ class BlockMetadata:
             '描述': self.description,
             '输入': self.inputs,
             '输出': self.output,
+            '导出': self.exports,
             '稳定性': self.stability,
         }
         return {k: entry[k] for k in _INDEX_ENTRY_KEYS}
@@ -212,6 +240,61 @@ def index_path(root: Optional[str] = None) -> str:
 def _fail(msg: str, path: Optional[str]) -> None:
     where = '（%s）' % path if path else ''
     raise BlockError('%s%s' % (msg, where))
+
+
+def _validate_type_annotation(value: Any, where: str, path: Optional[str]) -> None:
+    """校验一个类型标注（ADR-26 类型词表）。不合规抛 `BlockError`。
+
+    合法形态：
+    - 标量字符串：`SCALAR_TYPES` 之一（数/字符串/布尔/函数/任意）
+    - 容器裸字符串：`列表`/`字典`/`元组`（向后兼容，未标细化视为通配元素）
+    - 结构化容器对象：
+      - `{"类型": "列表", "元素类型": <类型>}`
+      - `{"类型": "字典", "键类型": <类型>, "值类型": <类型>}`
+      - `{"类型": "元组", "元数": [<类型>, ...]}`
+      - `{"类型": "联合", "候选": [<类型>, <类型>, ...]}`
+
+    `where` 是给报错用的上下文串（如 `块「输出」的类型`）。
+    """
+    if isinstance(value, str):
+        if value in SCALAR_TYPES or value in CONTAINER_TYPE_NAMES:
+            return
+        _fail('%s「%s」不是合法类型（标量取 %s，容器取 %s，或用结构化对象细化）'
+              % (where, value, '/'.join(sorted(SCALAR_TYPES)),
+                 '/'.join(sorted(CONTAINER_TYPE_NAMES))), path)
+
+    if not isinstance(value, dict):
+        _fail('%s必须是类型字符串或结构化类型对象，得到 %r' % (where, value), path)
+
+    kind = value.get('类型')
+    if not isinstance(kind, str) or not kind.strip():
+        _fail('%s的结构化类型对象缺少合法「类型」字段：%r' % (where, value), path)
+    if kind not in CONTAINER_TYPE_NAMES and kind != UNION_TYPE_NAME:
+        _fail('%s的结构化类型「%s」只能是容器或联合（%s/%s）；标量请用字符串'
+              % (where, kind, '/'.join(sorted(CONTAINER_TYPE_NAMES)),
+                 UNION_TYPE_NAME), path)
+
+    if kind == '列表':
+        if '元素类型' not in value:
+            _fail('%s的 列表 缺少「元素类型」' % where, path)
+        _validate_type_annotation(value['元素类型'], '%s→元素类型' % where, path)
+    elif kind == '字典':
+        for k in ('键类型', '值类型'):
+            if k not in value:
+                _fail('%s的 字典 缺少「%s」' % (where, k), path)
+            _validate_type_annotation(value[k], '%s→%s' % (where, k), path)
+    elif kind == '元组':
+        元数 = value.get('元数')
+        if not isinstance(元数, list) or not 元数:
+            _fail('%s的 元组 的「元数」必须是非空数组' % where, path)
+        for i, item in enumerate(元数):
+            _validate_type_annotation(item, '%s→元数[%d]' % (where, i), path)
+    else:
+        候选 = value.get('候选')
+        if not isinstance(候选, list) or len(候选) < 2:
+            _fail('%s的 联合 的「候选」必须是至少 2 项的数组' % where, path)
+        for i, item in enumerate(候选):
+            _validate_type_annotation(item, '%s→候选[%d]' % (where, i), path)
 
 
 def _validate(data: Any, path: Optional[str]) -> None:
@@ -264,15 +347,20 @@ def _validate(data: Any, path: Optional[str]) -> None:
             for key in ('名', '类型'):
                 if key not in item:
                     _fail('块「输入」的项缺少「%s」：%r' % (key, item), path)
-                if not isinstance(item[key], str) or not item[key].strip():
-                    _fail('块「输入」的「%s」必须是非空字符串：%r' % (key, item), path)
+            if not isinstance(item['名'], str) or not item['名'].strip():
+                _fail('块「输入」的「名」必须是非空字符串：%r' % (item,), path)
+            _validate_type_annotation(item['类型'],
+                                      '块「输入」的项 %r 的类型' % item.get('名'),
+                                      path)
 
     output = data.get('输出')
     if output is not None:
         if not isinstance(output, dict):
             _fail('块「输出」必须是对象 {"类型": ...}', path)
-        if output and '类型' not in output:
-            _fail('块「输出」缺少「类型」', path)
+        if output:
+            if '类型' not in output:
+                _fail('块「输出」缺少「类型」', path)
+            _validate_type_annotation(output['类型'], '块「输出」的类型', path)
 
     deps = data.get('依赖块')
     if deps is not None:
@@ -297,6 +385,40 @@ def _validate(data: Any, path: Optional[str]) -> None:
     if stability is not None and stability not in STABILITY_LEVELS:
         _fail('块「稳定性」必须是 %s 之一，得到 %r'
               % ('/'.join(sorted(STABILITY_LEVELS)), stability), path)
+
+    # `导出`（选填，ADR-24 §5 / W7）：与 `.jk` 里的 `导出 X。` 一致的名字数组。
+    # 有了它，反哺白名单与 AI 桥接都不必再读 `.jk` 源码。逐项过原子性校验——
+    # 非原子导出名在调用方一侧必被切碎（ADR-15 §3.7），写进元数据也救不回来。
+    exports = data.get('导出')
+    if exports is not None:
+        if not isinstance(exports, list) or not exports:
+            _fail('块「导出」必须是非空数组', path)
+        for name in exports:
+            if not isinstance(name, str) or not name.strip():
+                _fail('块「导出」的每一项必须是非空字符串，得到 %r' % (name,), path)
+            atomic, pieces = check_export_atomicity(name)
+            if not atomic:
+                frag = '+'.join('%s(%s)' % (v, t) for t, v in pieces)
+                _fail('块「导出」项「%s」非词法原子，切分为 %s' % (name, frag), path)
+        if len(set(exports)) != len(exports):
+            _fail('块「导出」有重复项：%r' % (exports,), path)
+
+    # `兼容`（选填，W7）：环境兼容性约束表，如 {"极快": ">=0.13"}。
+    # 与 `极快版本` 的分工：后者是**安装期**的解释器版本门槛（单一约束串）；
+    # `兼容` 是**可扩展**的多维声明，未来可加 Python/OS 维度而不动 schema。
+    compat = data.get('兼容')
+    if compat is not None:
+        if not isinstance(compat, dict) or not compat:
+            _fail('块「兼容」必须是非空对象，如 {"极快": ">=0.13"}', path)
+        for k, v in compat.items():
+            if not isinstance(k, str) or not k.strip():
+                _fail('块「兼容」的键必须是非空字符串，得到 %r' % (k,), path)
+            if not isinstance(v, str) or not v.strip():
+                _fail('块「兼容」的「%s」必须是非空版本约束串' % (k,), path)
+            try:
+                semver.parse_constraint(v)
+            except (semver.InvalidConstraint, semver.InvalidVersion) as e:
+                _fail('块「兼容」的「%s」不是合法版本约束：%s' % (k, e), path)
 
 
 def load_block_metadata(path: str) -> BlockMetadata:
@@ -534,6 +656,117 @@ def check_vector_index(root: Optional[str] = None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# 类型标注精度（G14，ADR-26 §4.3）
+# ---------------------------------------------------------------------------
+#
+# `_validate` 与 G14 分工：
+#   `_validate` —— schema 合法性。裸 `列表`/`字典`/`元组` 通过（向后兼容，
+#                  第三方块库不该因为 v0.14.0 收紧词表而整体失效）。
+#   G14         —— **内置 stdlib 块库的精度政策**。裸容器一律拒，逼着每个块
+#                  把元素类型/元数写清楚，否则 W3-W4 的类型图粘合器只能拿到
+#                  `列表<任意>`，推不出任何有效传参链。
+
+def _bare_container_issues(value, where):
+    """递归找出类型标注里所有裸容器。返回人类可读的问题串列表。"""
+    if isinstance(value, str):
+        if value in CONTAINER_TYPE_NAMES:
+            提示 = {
+                '列表': '补 {"类型": "列表", "元素类型": ...}',
+                '字典': '补 {"类型": "字典", "键类型": ..., "值类型": ...}',
+                '元组': '补 {"类型": "元组", "元数": [...]}',
+            }[value]
+            return ['%s 是裸「%s」，缺细化：%s' % (where, value, 提示)]
+        return []
+    if not isinstance(value, dict):
+        return []
+
+    kind = value.get('类型')
+    if kind == '列表':
+        return _bare_container_issues(value.get('元素类型'), '%s→元素类型' % where)
+    if kind == '字典':
+        问题 = []
+        for k in ('键类型', '值类型'):
+            问题 += _bare_container_issues(value.get(k), '%s→%s' % (where, k))
+        return 问题
+    if kind == '元组':
+        问题 = []
+        for i, item in enumerate(value.get('元数') or []):
+            问题 += _bare_container_issues(item, '%s→元数[%d]' % (where, i))
+        return 问题
+    if kind == UNION_TYPE_NAME:
+        问题 = []
+        for i, item in enumerate(value.get('候选') or []):
+            问题 += _bare_container_issues(item, '%s→候选[%d]' % (where, i))
+        return 问题
+    return []
+
+
+def check_type_annotation(block):
+    """G14：校验一个块的类型标注是否达到 ADR-26 精度。
+
+    `block` 接受 `BlockMetadata` 或索引条目 `dict`（两者都有 `输入`/`输出`）。
+    返回问题列表，空列表表示通过。
+
+    只查精度、不查合法性——后者是 `_validate` 的职责，走 `load_block_metadata`
+    时已经过了。
+    """
+    if isinstance(block, BlockMetadata):
+        名, inputs, output = block.name, block.inputs, block.output
+    else:
+        名 = block.get('名称', '?')
+        inputs = block.get('输入') or []
+        output = block.get('输出') or {}
+
+    问题 = []
+    for item in inputs:
+        if not isinstance(item, dict) or '类型' not in item:
+            continue
+        问题 += _bare_container_issues(
+            item['类型'], '块「%s」输入「%s」' % (名, item.get('名')))
+    if output and '类型' in output:
+        问题 += _bare_container_issues(output['类型'], '块「%s」输出' % 名)
+    return 问题
+
+
+def check_stdlib_type_annotations(root=None):
+    """G14 全量入口：扫描块库，汇总所有精度问题。空列表 = 门禁绿。"""
+    问题 = []
+    for meta in scan_blocks(root):
+        问题 += check_type_annotation(meta)
+    return 问题
+
+
+# ---------------------------------------------------------------------------
+# 导出名全局唯一（G13，W8）
+# ---------------------------------------------------------------------------
+#
+# 短名跨块碰撞是块生态的隐雷：`转义编码→转义` 和 `环境值→环境` 这类导出名很容易
+# 撞车。运行时不会崩（各块自己的 `_exports` 独立隔离），但 AI 桥接选块时会把
+# 「导出名」当唯一键——一旦冲突，候选合并、代码生成会指错块。G13 的做法是把
+# 冲突当**门禁失败**，逼贡献者在 PR 阶段改名，而不是等 dogfooding 才发现。
+
+def check_export_globally_unique(index=None):
+    """G13：扫描块索引里的 `导出` 字段，找出所有跨块重名。
+
+    `index` 缺省时读盘的 `stdlib/blocks/索引.json`。返回 `[(名, [块1, 块2, ...])]`
+    冲突列表，空列表表示门禁通过。**只看有 `导出` 字段的条目**——W7 之前生成的
+    索引没这个字段，本门禁自然静默通过（与 G14 的向后兼容策略一致）。
+    """
+    if index is None:
+        index = load_index()
+    if index is None:
+        return []
+    反向 = {}
+    for entry in index.get('块') or []:
+        名 = entry.get('名称')
+        for e in (entry.get('导出') or []):
+            反向.setdefault(e, []).append(名)
+    冲突 = [(k, sorted(v)) for k, v in 反向.items() if len(v) > 1]
+    冲突.sort()
+    return 冲突
+
+
+# ---------------------------------------------------------------------------
 # 词法原子性校验 / 块目录全面校验（ADR-15 §3.7）
 # ---------------------------------------------------------------------------
 #
@@ -636,6 +869,32 @@ def extract_exports(jk_path):
     return names
 
 
+def block_exports(jk_path):
+    """读取一个块的导出名集合，**优先走元数据**（ADR-24 §5 / W7）。
+
+    与 `extract_exports` 的分工：
+
+    - `extract_exports(jk_path)` —— 永远读 `.jk` 源码，是**唯一事实源**。
+      `validate_block` 用它跟 `块.json.导出` 对账，保证元数据不会悄悄漂移。
+    - `block_exports(jk_path)`   —— 热路径快通道。同目录有 `块.json` 且带
+      `导出` 字段就直接用（省一次整文件读 + 正则扫描），否则回退读 `.jk`。
+
+    调用方是 `frontend._cached_exports`（每次编译对每个 `导入` 都要问一次）
+    与 AI 桥接选块器。返回 `set[str]`。
+    """
+    meta_path = os.path.join(os.path.dirname(os.path.abspath(jk_path)),
+                             BLOCK_METADATA_NAME)
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                declared = (json.load(f) or {}).get('导出')
+            if isinstance(declared, list) and declared:
+                return {n for n in declared if isinstance(n, str) and n.strip()}
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            pass                    # 元数据坏了不该阻断编译，回退读 .jk
+    return extract_exports(jk_path)
+
+
 def _extract_import_deps(source):
     """从 `.jk` 源码提取所有 `blocks.X.Y...` 导入引用的**叶段名**。
 
@@ -721,6 +980,21 @@ def validate_block(block_dir):
             errors.append(
                 '导出名「%s」非词法原子，切分为 %s，'
                 '建议改用 汇总/合计/聚合' % (name, frag))
+
+    # 5.5 `块.json.导出` 若存在，必须与 `.jk` 实际导出**完全一致**（W7）
+    # 允许缺省——缺省时热路径回退读 `.jk`；一旦声明就必须对账，否则会让
+    # 反哺白名单读到陈旧的导出名。
+    declared = set(meta.exports)
+    if declared and declared != exports:
+        缺 = declared - exports
+        多 = exports - declared
+        detail = []
+        if 缺:
+            detail.append('声明有但 .jk 没：%s' % '、'.join(sorted(缺)))
+        if 多:
+            detail.append('.jk 有但 元数据 没：%s' % '、'.join(sorted(多)))
+        errors.append('块.json 的「导出」字段与 %s 不一致（%s）'
+                      % (os.path.basename(jk_path), '；'.join(detail)))
 
     # 6. 依赖块 与 import 一致
     imported = _extract_import_deps(source)

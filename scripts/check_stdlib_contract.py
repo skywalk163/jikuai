@@ -162,6 +162,36 @@ def main(argv):
         # 不阻塞 G10/G11：v0.12.0 老分支上没有 check_vector_index
         print("G12 跳过（%s）" % e)
 
+    # G14：块类型标注精度（ADR-26 §4.3）。stdlib 块库不允许光秃秃 `列表`/
+    # `字典`/`元组`——W3-W4 类型图粘合器只有拿到细化后的类型才能推链，裸容器
+    # 等同 `任意`，会让自动组装退化到无差别硬塞。此门禁对内置 stdlib 强制，
+    # 对第三方块库不生效（第三方走 `_validate` 的宽松兼容路径）。
+    try:
+        from jikuai.pkg.blocks import check_stdlib_type_annotations
+        问题列表 = check_stdlib_type_annotations()
+        if 问题列表:
+            print("G14 类型标注精度不足（%d 处）：" % len(问题列表))
+            for 条 in 问题列表:
+                print("  - %s" % 条)
+            exit_code = exit_code or 1
+    except Exception as e:
+        # 不阻塞已有门禁：老分支没有 check_stdlib_type_annotations
+        print("G14 跳过（%s）" % e)
+
+    # G13：导出名全局唯一（W8）。短名跨块碰撞会让 AI 桥接的候选合并/代码生成
+    # 指错块——运行时不崩（各块 `_exports` 独立），但会静默走偏，只有在 PR 阶段
+    # 逼贡献者改名才能防住。老索引没有 `导出` 字段时本门禁静默通过。
+    try:
+        from jikuai.pkg.blocks import check_export_globally_unique
+        冲突 = check_export_globally_unique()
+        if 冲突:
+            print("G13 导出名跨块重复（%d 个）：" % len(冲突))
+            for 名, 块列 in 冲突:
+                print("  - 「%s」在 %s 中同时出现" % (名, '、'.join(块列)))
+            exit_code = exit_code or 1
+    except Exception as e:
+        print("G13 跳过（%s）" % e)
+
     return exit_code
 
 

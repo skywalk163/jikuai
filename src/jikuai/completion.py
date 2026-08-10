@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Optional, Set
 from .keywords import ADVERBS, ALL_KEYWORDS, VERB_ARITY
 
 HELP_WORD = '帮助'
+REQUIREMENT_WORD = '需求'
 
 CATEGORY_KEYWORD = '关键字'
 CATEGORY_VERB = '内建动词'
@@ -263,7 +264,8 @@ def complete_lsp(source: str, cursor_line: int, cursor_column: int) -> List[Dict
     return [it.to_lsp() for it in complete(source, cursor_line, cursor_column)]
 
 
-REPL_STATIC_POOL: Set[str] = set(ALL_KEYWORDS) | set(VERB_ARITY.keys()) | {HELP_WORD}
+REPL_STATIC_POOL: Set[str] = (set(ALL_KEYWORDS) | set(VERB_ARITY.keys())
+                              | {HELP_WORD, REQUIREMENT_WORD})
 
 
 def repl_candidates(prefix: str, extra_names: Optional[Iterable[str]] = None) -> List[str]:

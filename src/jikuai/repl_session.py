@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
-"""极快语言 - REPL 增强（M2-2 / ADR-03、ADR-05）。
+"""极快语言 - REPL 增强（M2-2 / ADR-03、ADR-05；W10 补 `需求` 元命令）。
 
-四块能力：
-  1. 多行续行状态机（IDLE / CONTINUE）
+五块能力：
+  1. 多行续行状态机（IDLE / CONTINUE / SELECTING）
   2. 历史持久化（~/.jikuai_history，readline 或 pyreadline3，缺失则静默降级）
-  3. Tab 补全（关键字 ∪ 动词 ∪ 全局变量名，startswith 匹配）
+  3. Tab 补全（关键字 ∪ 动词 ∪ 全局变量名 ∪ 元命令，startswith 匹配）
   4. `帮助` 命令（REPL 内特殊识别，不进求值器）
+  5. `需求` 命令（W10 / ADR-25：自然语言检索块 → 数字选中 → 把导入行与调用行
+     追加到当前编辑缓冲；生成口径与《块选择协议 v0》一致）
 
 设计要点：所有判定逻辑都做成不依赖 stdin 的纯函数/纯方法，
-便于测试直接调用（见 tests/test_jikuai.py 的 M2-2 用例）。
+便于测试直接调用（见 tests/test_jikuai.py 的 M2-2 用例、
+tests/test_repl_需求.py 的 W10 用例）。
 """
 
 import atexit
+import os
 import sys
 from pathlib import Path
 
@@ -31,13 +35,44 @@ HISTORY_LENGTH = 2000
 
 PROMPT_IDLE = '极快> '
 PROMPT_CONTINUE = '...   '
+PROMPT_SELECT = '选块> '
 
 EXIT_WORDS = ('退出', 'exit', 'quit')
 HELP_WORD = '帮助'
+REQUIREMENT_WORD = '需求'
+
+#: `需求` 一次展示的候选数上限（W10 / ADR-25）。
+REQUIREMENT_TOP_K = 5
+
+#: 无实参时调用行写的占位符。与《块选择协议 v0》「粘合器生成规则」第 4 条
+#: 同一口径（`tools/ai-bridge/glue.py`）——W9 要跨通道复用同一份 schema，
+#: 这里绝不另造一套占位约定。
+REQUIREMENT_ARG_PLACEHOLDER = '?'
+
+#: 调用行的结果变量名。沿用桥接的 `赵果N` 命名。
+REQUIREMENT_RESULT_VAR = '赵果1'
+
+#: 选块态下取消本次选择的输入（与空行等价）。
+REQUIREMENT_CANCEL = '0'
+
+#: 打开 REPL 神经检索路径的环境变量（W11 / ADR-25 §3.1）。
+#: 不设默认走启发式——REPL 第一次跑不该等 10s 冷启动。
+#: 与 `jikuai.ai.embed_client.ENV_NEURAL` 保持同名字面量，避免两处漂移。
+REQUIREMENT_NEURAL_ENV = 'JIKUAI_AI_NEURAL'
+_NEURAL_TRUTHY = frozenset({'1', 'true', 'yes', 'on', '开', 'neural', '神经'})
+
+
+def _neural_enabled():
+    """REPL 神经路径是否打开。刻意在这里就地判读环境变量（而不是每次都 import
+    `embed_client` 去问），神经开关关着的 90% 情况下能跳过整个 subprocess 模块
+    的 import，把 REPL 冷启动开销压到最低。"""
+    return os.environ.get(REQUIREMENT_NEURAL_ENV, '').strip().lower() in _NEURAL_TRUTHY
+
 
 # 状态机状态
 STATE_IDLE = 'IDLE'
 STATE_CONTINUE = 'CONTINUE'
+STATE_SELECTING = 'SELECTING'
 
 # 动词分类（用于 `帮助` 的分类简介）
 VERB_CATEGORIES = [
@@ -83,6 +118,26 @@ def verb_usage(name):
     return '\n'.join(lines)
 
 
+def requirement_usage():
+    """`帮助 需求` 的用法说明（W10）。"""
+    return '\n'.join([
+        f"用法：{REQUIREMENT_WORD} <自然语言需求>",
+        f"说明：{REQUIREMENT_WORD} 是 REPL 元命令（不进求值器），把一句自然语言",
+        f"      需求映射为语义块候选清单（最多 {REQUIREMENT_TOP_K} 条）。",
+        "流程：",
+        f"  1. `{REQUIREMENT_WORD} 求个平均` → 列出候选（编号 · 块名 · 领域 · 描述）",
+        "  2. 再输入编号 → 把下面两行追加到当前编辑缓冲：",
+        "       从 blocks.<领域>.<块名> 导入 <导出名>。",
+        f"       定义{REQUIREMENT_RESULT_VAR}=<导出名>(<实参>)。",
+        f"     编号后可直接带实参，如 `1 列 1 2 3`；不带则写占位 "
+        f"{REQUIREMENT_ARG_PLACEHOLDER}（需人工填参）。",
+        f"  3. 输入 `{REQUIREMENT_CANCEL}` 或空行取消本次选块",
+        f"示例：{REQUIREMENT_WORD} 求个平均",
+        f"神经检索：设环境变量 {REQUIREMENT_NEURAL_ENV}=1 开启（默认走启发式，",
+        "        避免首次检索等模型冷启动；sidecar 失败自动降级启发式）。",
+    ])
+
+
 def help_text(arg=None):
     """`帮助` / `帮助 <名字>` 的输出文本。"""
     if not arg:
@@ -95,14 +150,70 @@ def help_text(arg=None):
         lines.append(f"  副词：" + ' '.join(sorted(ADVERBS)))
         lines.append('')
         lines.append('输入 `帮助 <动词名>` 查看单个动词用法，例如：帮助 加')
+        lines.append(f'输入 `{REQUIREMENT_WORD} <自然语言>` 按需求检索块，例如：'
+                     f'{REQUIREMENT_WORD} 求个平均'
+                     f'（`帮助 {REQUIREMENT_WORD}` 看详细用法）')
         lines.append('输入 退出 / exit / quit 结束会话')
         return '\n'.join(lines)
+    if arg == REQUIREMENT_WORD:
+        return requirement_usage()
     usage = verb_usage(arg)
     if usage is not None:
         return usage
     if arg in ALL_KEYWORDS:
         return f'"{arg}" 是关键字。输入 帮助 查看关键字总览。'
     return f'未找到 "{arg}"，试试 "帮助"'
+
+
+# ---------------------------------------------------------------------------
+# 需求命令：块候选 → 极快源码片段
+# ---------------------------------------------------------------------------
+
+def block_export_name(name, domain):
+    """查一个块的导出名（W10）。查不到返回 None。
+
+    走 `pkg.blocks.block_exports`——W7 引入的热路径快通道：同目录 `块.json`
+    带 `导出` 就读元数据，否则回退正则扫 `.jk`。多导出时取字典序首个，与
+    `tools/ai-bridge/select.resolve_export` 同一口径（现有 stdlib 块都是单导出）。
+    """
+    from .pkg.blocks import blocks_root, block_exports
+    base = os.path.join(blocks_root(), domain, name)
+    for jk in (os.path.join(base, name + '.jk'), os.path.join(base, 'main.jk')):
+        if os.path.isfile(jk):
+            exports = block_exports(jk)
+            if exports:
+                return sorted(exports)[0]
+    return None
+
+
+def requirement_snippet(hit, args=None):
+    """把一条检索命中渲染成 `(导入行, 调用行)`。
+
+    ADR-15 §3.7「导入用目录名、调用用导出名」，与《块选择协议 v0》的
+    `步骤[].块` / `步骤[].导出名` 两字段一一对应::
+
+        从 blocks.数据.均值 导入 中位。
+        定义赵果1=中位(?)。
+
+    `args` 为空时实参写占位符（协议：缺省则生成 `?` 并提示需人工填参）。
+    导出名查不到时降级用块名——总比不给代码好，用户一眼看得出要改哪儿。
+    """
+    export = block_export_name(hit.name, hit.domain) or hit.name
+    import_line = f'从 blocks.{hit.domain}.{hit.name} 导入 {export}。'
+    actual = args.strip() if args and args.strip() else REQUIREMENT_ARG_PLACEHOLDER
+    call_line = f'定义{REQUIREMENT_RESULT_VAR}={export}({actual})。'
+    return import_line, call_line
+
+
+def requirement_candidates_text(query, hits):
+    """候选清单展示文本。编号从 1 起，版式对齐 `jk 块 search`。"""
+    lines = [f'需求：{query}    {hits[0].path}']
+    for i, h in enumerate(hits, 1):
+        lines.append(f'  {i}. {h.name}（{h.domain}）  分数 {h.score:.4f}')
+        lines.append(f'     {h.description}')
+    lines.append(f'输入编号 1-{len(hits)} 选块，'
+                 f'`{REQUIREMENT_CANCEL}` 或空行取消。')
+    return '\n'.join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +224,14 @@ class CompletionEngine:
     """按前缀提供补全候选。
 
     候选源 = ALL_KEYWORDS ∪ VERB_ARITY.keys() ∪ evaluator.global_env.vars.keys()
+    ∪ REPL 元命令（帮助 / 需求）。
     每次 candidates() 都重新读全局变量，保证 REPL 中新定义的名字立即可补全。
     """
 
     def __init__(self, evaluator=None):
         self.evaluator = evaluator
-        self._static = set(ALL_KEYWORDS) | set(VERB_ARITY.keys()) | {HELP_WORD}
+        self._static = (set(ALL_KEYWORDS) | set(VERB_ARITY.keys())
+                        | {HELP_WORD, REQUIREMENT_WORD})
 
     def candidates(self, prefix):
         # M5 / T-M5-L04：候选计算下移到 jikuai.completion.repl_candidates。
@@ -235,11 +348,16 @@ class ReplSession:
         # 在下一次分词时不被提升为会话全域（顶层仍走内建动词语义），而仅在 `.成员`
         # 松弛路径可命中。
         self._session_defs = set()
+        # W10：`需求` 检索出的候选；选块态下等待用户输入编号
+        self.pending_hits = []
+        self.pending_query = ''
 
     # ---------- 纯逻辑：判定与解析 ----------
 
     @property
     def prompt(self):
+        if self.state == STATE_SELECTING:
+            return PROMPT_SELECT
         return PROMPT_CONTINUE if self.state == STATE_CONTINUE else PROMPT_IDLE
 
     def source(self):
@@ -248,6 +366,8 @@ class ReplSession:
     def reset(self):
         self.buffer = []
         self.state = STATE_IDLE
+        self.pending_hits = []
+        self.pending_query = ''
 
     @staticmethod
     def parse_help(line):
@@ -260,6 +380,47 @@ class ReplSession:
             if rest:
                 return True, rest
         return False, None
+
+    @staticmethod
+    def parse_requirement(line):
+        """识别 `需求` / `需求 <自然语言>`（W10，骨架照 `parse_help`）。
+
+        命中返回 `(True, query)`；只写 `需求` 时 query 为 None（打用法）。
+        不是需求命令返回 `(False, None)`。
+        """
+        stripped = line.strip().rstrip('。')
+        if stripped == REQUIREMENT_WORD:
+            return True, None
+        if stripped.startswith(REQUIREMENT_WORD):
+            rest = stripped[len(REQUIREMENT_WORD):].strip()
+            return True, (rest or None)
+        return False, None
+
+    @staticmethod
+    def parse_selection(line, total):
+        """解析选块态的一行输入，返回 `(种类, 序号, 实参)`。
+
+        种类：
+          'cancel'  空行 / `0` —— 取消本次选块
+          'ok'      合法编号 1..total（实参可能为 None）
+          'bad'     不是数字
+          'range'   是数字但越界
+        """
+        stripped = line.strip()
+        if not stripped or stripped == REQUIREMENT_CANCEL:
+            return 'cancel', None, None
+        parts = stripped.split(None, 1)
+        head = parts[0].rstrip('。')
+        args = parts[1].strip() if len(parts) > 1 else None
+        try:
+            index = int(head)
+        except ValueError:
+            return 'bad', None, None
+        if index == 0:
+            return 'cancel', None, None
+        if index < 1 or index > total:
+            return 'range', index, None
+        return 'ok', index, (args or None)
 
     def needs_continuation(self, source):
         """R-1（ADR-03 修正）：**parser 权威**判定 source 是否"尚未写完"。
@@ -299,8 +460,11 @@ class ReplSession:
           'exit'      —— 用户要求退出
           'idle'      —— 本行处理完毕（可能已求值/已报错），回到 IDLE
           'continue'  —— 需要续行
+          'select'    —— 已列出块候选，等待输入编号（W10）
           'skip'      —— 空行、无动作
         """
+        if self.state == STATE_SELECTING:
+            return self._feed_selecting(line)
         if self.state == STATE_IDLE:
             return self._feed_idle(line)
         return self._feed_continue(line)
@@ -315,8 +479,87 @@ class ReplSession:
         if hit:
             print(help_text(arg), file=self.out)
             return 'idle'
+        # W10：`需求` 与 `帮助` 同层，都是元命令，不进求值器
+        req, query = self.parse_requirement(stripped)
+        if req:
+            return self._feed_requirement(query)
         self.buffer = [line]
         return self._try_run()
+
+    def _feed_requirement(self, query):
+        """`需求 <query>`：检索 top-K 候选并进入选块态（W10 / W11）。
+
+        默认走启发式（不传 query_vector）——REPL 冷启动不该为一个可选元命令
+        去加载几百 MB 的模型（模型冷启动实测 ~10s）。用户显式打开
+        `JIKUAI_AI_NEURAL=1` 才 subprocess 拉一次 sidecar。
+
+        任何 sidecar 失败都降级到启发式 + 一行 stderr 提示（W11 · ADR-25
+        §3.1 分层兜底）——REPL 不会因为神经路径挂了就吐不出候选。
+        """
+        if not query:
+            print(requirement_usage(), file=self.out)
+            return 'idle'
+        from .ai import retrieval
+        # W11：`JIKUAI_AI_NEURAL=1` 打开神经路径。刻意用环境变量而非新元命令：
+        # 「需求」已经是 REPL 里 CLI 味最重的入口了，再加 `神经` 元命令会把
+        # 会话状态机膨胀一档；env var 也方便脚本化调用（IDE 里预置一次即可）。
+        query_vector = None
+        if _neural_enabled():
+            from .ai import embed_client
+            expected = embed_client.index_dim()
+            vec, why = embed_client.fetch_query_vector(query, expected_dim=expected)
+            if vec is None:
+                print(f'神经检索不可用，降级到启发式：{why}', file=self.err)
+            else:
+                query_vector = vec
+        try:
+            hits = retrieval.retrieve(query, top=REQUIREMENT_TOP_K,
+                                      query_vector=query_vector)
+        except retrieval.RetrievalError as e:
+            print(f'检索失败：{e}', file=self.err)
+            return 'idle'
+        if not hits:
+            print(f'没有匹配「{query}」的块。换个说法，或用 `帮助` 看内建动词。',
+                  file=self.out)
+            return 'idle'
+        self.pending_hits = list(hits)
+        self.pending_query = query
+        self.state = STATE_SELECTING
+        print(requirement_candidates_text(query, hits), file=self.out)
+        return 'select'
+
+    def _feed_selecting(self, line):
+        """选块态：数字选中 → 把导入行与调用行追加到 buffer（W10）。"""
+        total = len(self.pending_hits)
+        kind, index, args = self.parse_selection(line, total)
+        if kind == 'cancel':
+            print('已取消选块', file=self.out)
+            self.reset()
+            return 'idle'
+        if kind == 'bad':
+            print(f'请输入 1-{total} 的编号（`{REQUIREMENT_CANCEL}` 或空行取消）',
+                  file=self.err)
+            return 'select'
+        if kind == 'range':
+            print(f'编号 {index} 超出范围，可选 1-{total}'
+                  f'（`{REQUIREMENT_CANCEL}` 或空行取消）', file=self.err)
+            return 'select'
+        hit = self.pending_hits[index - 1]
+        import_line, call_line = requirement_snippet(hit, args)
+        # 追加到当前编辑缓冲，转续行态让用户接着写（本轮不求值）
+        self.buffer.append(import_line)
+        self.buffer.append(call_line)
+        self.pending_hits = []
+        self.pending_query = ''
+        self.state = STATE_CONTINUE
+        print(import_line, file=self.out)
+        print(call_line, file=self.out)
+        if REQUIREMENT_ARG_PLACEHOLDER in call_line:
+            print(f'已追加到编辑缓冲；`{REQUIREMENT_ARG_PLACEHOLDER}` 是占位实参，'
+                  f'需人工填参（空行放弃本次缓冲）', file=self.out)
+        else:
+            print('已追加到编辑缓冲（空行放弃本次缓冲）', file=self.out)
+        return 'continue'
 
     def _feed_continue(self, line):
         if not line.strip():
@@ -383,6 +626,10 @@ class ReplSession:
                 # Ctrl+C：放弃当前缓冲，不退出会话
                 if self.state == STATE_CONTINUE:
                     print('\n已取消多行输入', file=self.out)
+                    self.reset()
+                    continue
+                if self.state == STATE_SELECTING:
+                    print('\n已取消选块', file=self.out)
                     self.reset()
                     continue
                 print('\n再见！', file=self.out)

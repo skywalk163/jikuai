@@ -331,5 +331,44 @@ class BlocksContentHashTest(unittest.TestCase):
                             blocks.blocks_content_hash(改))
 
 
+# ---- G14：类型标注精度（ADR-26 §4.3） --------------------------------
+
+class TypeAnnotationGateTest(unittest.TestCase):
+    """`check_type_annotation` 拒裸容器、放行细化类型。"""
+
+    def _entry(self, 输入=None, 输出=None):
+        return {'名称': 'X', '输入': 输入 or [], '输出': 输出 or {}}
+
+    def test_裸列表输出被拒(self):
+        问题 = blocks.check_type_annotation(self._entry(输出={'类型': '列表'}))
+        self.assertEqual(len(问题), 1)
+        self.assertIn('裸', 问题[0])
+
+    def test_裸字典输入被拒(self):
+        问题 = blocks.check_type_annotation(
+            self._entry(输入=[{'名': '表', '类型': '字典'}]))
+        self.assertEqual(len(问题), 1)
+        self.assertIn('字典', 问题[0])
+
+    def test_细化列表放行(self):
+        问题 = blocks.check_type_annotation(
+            self._entry(输出={'类型': {'类型': '列表', '元素类型': '数'}}))
+        self.assertEqual(问题, [])
+
+    def test_元组元数里的裸容器也被抓(self):
+        输出 = {'类型': {'类型': '元组', '元数': ['数', '列表']}}
+        问题 = blocks.check_type_annotation(self._entry(输出=输出))
+        self.assertEqual(len(问题), 1)
+        self.assertIn('元数[1]', 问题[0])
+
+    def test_标量输出放行(self):
+        self.assertEqual(
+            blocks.check_type_annotation(self._entry(输出={'类型': '数'})), [])
+
+    def test_内置块库全绿(self):
+        """G14 对当前 stdlib 块库应零问题（W2 回填后的硬门槛）。"""
+        self.assertEqual(blocks.check_stdlib_type_annotations(), [])
+
+
 if __name__ == '__main__':
     unittest.main()

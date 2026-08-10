@@ -388,3 +388,259 @@ def test_cli_index(tmp_path, capsys):
 if __name__ == '__main__':
     unittest.main()
 
+
+# ---------------------------------------------------------------------------
+# CLI 三段式：组 / 跑（v0.14.0 W9）
+# ---------------------------------------------------------------------------
+
+def test_cli_组_合法方案出源码(tmp_path, capsys):
+    """合法方案 JSON → 组 → stdout 有极快源码，rc=0。"""
+    plan = {
+        '需求': '求和',
+        '共享': [{'名': '赵料', '值': '列 1 2 3'}],
+        '步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']}],
+    }
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['组', str(p)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '从 blocks.数据.求和 导入 汇总' in out
+    assert '汇总(赵料)' in out
+
+
+def test_cli_组_坏JSON报错非0(tmp_path, capsys):
+    """不合法 JSON 输入 → rc=1 + stderr 含提示。"""
+    p = tmp_path / 'bad.json'
+    p.write_text('{这不是合法JSON', encoding='utf-8')
+    rc = blocks_cli.run(['组', str(p)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert '不是合法 JSON' in err
+
+
+def test_cli_组_缺步骤报错非0(tmp_path, capsys):
+    """有 JSON 对象但缺 `步骤` 字段 → rc=1。"""
+    p = tmp_path / 'no_steps.json'
+    p.write_text('{"需求":"空"}', encoding='utf-8')
+    rc = blocks_cli.run(['组', str(p)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert '步骤' in err
+
+
+def test_cli_跑_合法方案端到端出结果(tmp_path, capsys):
+    """合法方案 → 跑 → stdout 有计算结果，rc=0。"""
+    plan = {
+        '需求': '求和',
+        '共享': [{'名': '赵料', '值': '列 10 20 30'}],
+        '步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']}],
+        '打印': ['赵果1'],
+    }
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '60' in out
+
+
+def test_cli_跑_块不存在报错非0(tmp_path, capsys):
+    """方案里写了不存在的块名 → rc=1 + 人读提示。"""
+    plan = {
+        '步骤': [{'块': '不存在的块XYZ', '领域': '数据', '导出名': 'x'}],
+    }
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert '不存在' in err
+
+
+def test_cli_组_stdin路径(monkeypatch, capsys):
+    """stdin `-` 输入路径：从 stdin 读方案 JSON。"""
+    import io
+    plan = json.dumps({
+        '需求': '求和',
+        '共享': [{'名': '赵料', '值': '列 5 5'}],
+        '步骤': [{'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']}],
+    }, ensure_ascii=False)
+    monkeypatch.setattr('sys.stdin', io.StringIO(plan))
+    rc = blocks_cli.run(['组', '-'])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '汇总(赵料)' in out
+
+
+def test_cli_跑_多步链式端到端(tmp_path, capsys):
+    """两步方案（求和+均值）→ 跑 → 两行结果。"""
+    plan = {
+        '需求': '求和再算平均',
+        '共享': [{'名': '赵料', '值': '列 100 200 300'}],
+        '步骤': [
+            {'块': '求和', '领域': '数据', '导出名': '汇总', '参数': ['赵料']},
+            {'块': '均值', '领域': '数据', '导出名': '中位', '参数': ['赵料']},
+        ],
+        '打印': ['赵果1', '赵果2'],
+    }
+    p = tmp_path / '方案.json'
+    p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
+    rc = blocks_cli.run(['跑', str(p)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '600' in out
+    assert '200' in out
+
+
+# ---------------------------------------------------------------------------
+# W11：`--神经` 神经检索的降级链路（sidecar 缺失/坏输出/维度不符）
+# ---------------------------------------------------------------------------
+# 关键约束（v0.14.0 WBS）：这一段所有测试都 mock subprocess，**绝不真跑模型**。
+# 否则 CI 常规 job（无 torch）会挂——W11 sidecar 的整个卖点就是「神经能力可选，
+# 不装 torch 也能测」。
+
+def _fake_run_factory(returncode=0, stdout='', stderr='', exc=None):
+    """造一个假的 subprocess.run。走 monkeypatch 打进 embed_client 模块。"""
+    def _fake(cmd, **kwargs):
+        if exc is not None:
+            raise exc
+        import types
+        return types.SimpleNamespace(
+            args=cmd, returncode=returncode, stdout=stdout, stderr=stderr,
+        )
+    return _fake
+
+
+def test_cli_select_神经_sidecar缺失时降级到启发式(monkeypatch, capsys):
+    """`--神经` 但 sidecar 命令返回非零 → 降级到启发式 + stderr 提示，rc=0。
+
+    模拟场景：sidecar 依赖缺失（比如 torch 没装）返回退出码 2。CLI 应该：
+    1. 不报错（rc=0 —— 降级不是失败）
+    2. stderr 打一行「神经检索不可用，降级到启发式」提示
+    3. 输出里带 `[启发式]` 标签，且真实召回相关块
+    """
+    from jikuai.ai import embed_client
+    monkeypatch.setattr(
+        embed_client.subprocess, 'run',
+        _fake_run_factory(returncode=2, stderr='embed_query: 缺少依赖\n'),
+    )
+    rc = blocks_cli.run(['选', '把一串数字加起来', '--top', '3', '--神经'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '[启发式]' in captured.out
+    assert '求和' in captured.out
+    assert '神经检索不可用，降级到启发式' in captured.err
+
+
+def test_cli_select_神经_sidecar坏JSON时降级(monkeypatch, capsys):
+    """sidecar 退出码 0 但 stdout 不是合法 JSON 数组 → 降级到启发式。"""
+    from jikuai.ai import embed_client
+    monkeypatch.setattr(
+        embed_client.subprocess, 'run',
+        _fake_run_factory(returncode=0, stdout='not a json list\n'),
+    )
+    rc = blocks_cli.run(['选', '求和', '--top', '2', '--神经'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '[启发式]' in captured.out
+    assert '神经检索不可用' in captured.err
+    assert '不是合法 JSON' in captured.err
+
+
+def test_cli_select_神经_sidecar输出非数组时降级(monkeypatch, capsys):
+    """sidecar 吐 JSON 对象（不是数组）时降级。"""
+    from jikuai.ai import embed_client
+    monkeypatch.setattr(
+        embed_client.subprocess, 'run',
+        _fake_run_factory(returncode=0, stdout='{"vec": [1, 2, 3]}\n'),
+    )
+    rc = blocks_cli.run(['选', '求和', '--神经'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '[启发式]' in captured.out
+    assert '不是非空 JSON 数组' in captured.err
+
+
+def test_cli_select_神经_命令找不到时降级(monkeypatch, capsys):
+    """subprocess.run 抛 FileNotFoundError → 降级到启发式。
+
+    JIKUAI_AI_EMBED_CMD 指了个不存在的程序时会走这条。
+    """
+    from jikuai.ai import embed_client
+    monkeypatch.setenv(embed_client.ENV_CMD, 'definitely-not-a-real-cmd-xyz')
+    monkeypatch.setattr(
+        embed_client.subprocess, 'run',
+        _fake_run_factory(exc=FileNotFoundError('no such file')),
+    )
+    rc = blocks_cli.run(['选', '求和', '--神经'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '[启发式]' in captured.out
+    assert '找不到 sidecar' in captured.err
+
+
+def test_cli_select_神经_维度不符时降级(monkeypatch, capsys):
+    """sidecar 吐的向量维度与索引不符（模型换了没重生成）→ 降级。
+
+    stdlib/blocks 的实际维度是 768（见 向量索引.元信息.json）。这里假装
+    sidecar 用了 384 维模型，client 应该在维度校验阶段就把它挡下来，
+    避免抛给 retrieval._retrieve_neural 变成 RetrievalError。
+    """
+    from jikuai.ai import embed_client
+    fake_vec = [0.1] * 384
+    monkeypatch.setattr(
+        embed_client.subprocess, 'run',
+        _fake_run_factory(returncode=0, stdout=json.dumps(fake_vec) + '\n'),
+    )
+    rc = blocks_cli.run(['选', '求和', '--神经'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '[启发式]' in captured.out
+    # 只有索引真的存在（能读到 dim）才会走维度校验分支；stdlib 有索引所以必然
+    if '神经检索不可用' in captured.err:
+        assert '维度' in captured.err or '不符' in captured.err
+
+
+def test_cli_select_神经加向量_向量优先(monkeypatch, tmp_path, capsys):
+    """`--神经` 与 `--向量` 同时给：`--向量` 优先，`--神经` 让位并提示。
+
+    `subprocess.run` 挂一个「一调用就爆炸」的桩——真的走进 sidecar 分支就会
+    抛异常测试失败。这样断言「向量优先」路径完全绕过 subprocess。
+    """
+    from jikuai.ai import embed_client
+
+    def _boom(*args, **kwargs):
+        raise AssertionError('向量优先路径下不该跑 sidecar')
+    monkeypatch.setattr(embed_client.subprocess, 'run', _boom)
+
+    # 用一个合法维度的假向量（会被 retrieval 试着走神经，可能因为向量不真实
+    # 命中不到东西；但我们只关心 rc==0 且 stderr 里有优先提示）
+    dim = embed_client.index_dim() or 768
+    vec_file = tmp_path / 'q.json'
+    vec_file.write_text(json.dumps([0.0] * dim), encoding='utf-8')
+
+    rc = blocks_cli.run(['选', '求和', '--top', '2',
+                         '--神经', '--向量', str(vec_file)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '`--向量` 与 `--神经` 同时给出' in captured.err
+    assert '采用 `--向量`' in captured.err
+
+
+def test_cli_select_神经_sidecar超时时降级(monkeypatch, capsys):
+    """subprocess.TimeoutExpired → 降级到启发式（不是把用户挂到超时上）。"""
+    import subprocess as _sp
+    from jikuai.ai import embed_client
+    monkeypatch.setattr(
+        embed_client.subprocess, 'run',
+        _fake_run_factory(exc=_sp.TimeoutExpired(cmd='fake', timeout=1.0)),
+    )
+    rc = blocks_cli.run(['选', '求和', '--神经'])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert '[启发式]' in captured.out
+    assert '超时' in captured.err
+
+
+

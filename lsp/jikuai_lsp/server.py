@@ -389,6 +389,7 @@ class LspServer:
         「Unable to open: is a directory」。所以这里把 WBS 说的「块目录」
         落到该目录的入口 `.jk` 上，跳转才真正可用。
         """
+        # 与 blocks_cli._主jk 同源逻辑；W16 时可下沉到 jikuai.pkg.blocks 共享。
         d = Path(块目录)
         for 名 in (块名 + '.jk', 'main.jk'):
             p = d / 名

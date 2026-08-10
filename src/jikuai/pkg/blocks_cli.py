@@ -388,26 +388,6 @@ def _组装(方案: dict, 自动链式: bool = True) -> str:
 _占位记号 = '需人工填参'
 
 
-def _诊断条(e: Exception) -> Optional[List[dict]]:
-    """从异常里尽力提取结构化诊断（协议 `执行结果.诊断`）；拿不到返回 None。
-
-    只有 `JiKuaiError` 且带 `info`（`errors.ErrorInfo`，含 1-based 码点
-    行/列）时才有位置信息可填。拿不到就不伪造——协议里 `诊断` 是可选字段。
-    字段键走 `schema.DIAGNOSTIC_REQUIRED` 常量，不手写字面量。
-    """
-    info = getattr(e, 'info', None)
-    if info is None:
-        return None
-    行 = getattr(info, 'line', None)
-    列 = getattr(info, 'col', None)
-    if not isinstance(行, int) or not isinstance(列, int):
-        return None
-    级别 = getattr(getattr(info, 'category', None), 'value', '错误')
-    条 = dict(zip(schema.DIAGNOSTIC_REQUIRED,
-                 (行, 列, 级别, getattr(info, 'message', str(e)))))
-    return [条]
-
-
 def _执行源码(源码: str):
     """把源码落**临时** `.jk` 再交给解释器跑，返回 `schema.make_result`。
 
@@ -438,7 +418,7 @@ def _执行源码(源码: str):
                 结果 = run_source(源码, file=path)
         except Exception as e:                           # noqa: BLE001
             错误 = '%s：%s' % (type(e).__name__, e)
-            诊断 = _诊断条(e)
+            诊断 = schema.diagnostics_from_error(e)
         耗时 = (time.perf_counter() - 起) * 1000.0
         return schema.make_result(
             stdout=缓出.getvalue(), stderr=缓错.getvalue(),
@@ -707,7 +687,9 @@ def _cmd_select(args: List[str]) -> int:
         vec, why = embed_client.fetch_query_vector(需求, expected_dim=expected)
         if vec is None:
             # 降级原因既打 stderr（保留旧交互）也进 JSON `降级说明`（协议字段）。
-            降级说明 = f'神经检索不可用，降级到启发式：{why}'
+            # 文案前缀走 `embed_client.DEGRADE_PREFIX` 常量，三处（CLI/Web/REPL）同源。
+            from ..ai.embed_client import DEGRADE_PREFIX
+            降级说明 = DEGRADE_PREFIX + why
             print(降级说明, file=sys.stderr)
         else:
             查询向量 = vec
@@ -738,7 +720,9 @@ def _cmd_select(args: List[str]) -> int:
                         _F说明: h.description} for h in hits],
             })
             源码 = _glue().synthesize(方案, 自动链式=True)
-        except BlockError as e:
+        except (BlockError, ValueError) as e:
+            # glue.synthesize 的协议校验失败抛的是 ValueError（不是 BlockError），
+            # 只捕 BlockError 会让裸异常栈冒到用户脸上。
             return _err(str(e))
         sys.stdout.write(源码)
         return 0

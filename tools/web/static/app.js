@@ -20,7 +20,7 @@
 
 // ---- 小工具 -----------------------------------------------------------
 
-const $ = (id) => document.getElementById(id);
+const $ = id => document.getElementById(id);
 
 /** HTML 转义。高亮函数产 HTML 前必须先过这一层。 */
 function esc(s) {
@@ -35,7 +35,7 @@ async function postJSON(url, body) {
   try {
     resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      headers: {'Content-Type': 'application/json; charset=utf-8'},
       body: JSON.stringify(body),
     });
   } catch (e) {
@@ -43,8 +43,11 @@ async function postJSON(url, body) {
   }
   const text = await resp.text();
   let data;
-  try { data = text ? JSON.parse(text) : {}; }
-  catch (e) { throw new Error('响应不是合法 JSON（HTTP ' + resp.status + '）'); }
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error('响应不是合法 JSON（HTTP ' + resp.status + '）');
+  }
   if (!resp.ok) {
     throw new Error(data && data['错误'] ? data['错误'] : ('HTTP ' + resp.status));
   }
@@ -53,12 +56,18 @@ async function postJSON(url, body) {
 
 async function getJSON(url) {
   let resp;
-  try { resp = await fetch(url); }
-  catch (e) { throw new Error('网络请求失败：' + e.message); }
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    throw new Error('网络请求失败：' + e.message);
+  }
   const text = await resp.text();
   let data;
-  try { data = text ? JSON.parse(text) : {}; }
-  catch (e) { throw new Error('响应不是合法 JSON（HTTP ' + resp.status + '）'); }
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error('响应不是合法 JSON（HTTP ' + resp.status + '）');
+  }
   if (!resp.ok) {
     throw new Error(data && data['错误'] ? data['错误'] : ('HTTP ' + resp.status));
   }
@@ -66,7 +75,11 @@ async function getJSON(url) {
 }
 
 function note(el, msg, isErr) {
-  if (!msg) { el.hidden = true; el.textContent = ''; return; }
+  if (!msg) {
+    el.hidden = true;
+    el.textContent = '';
+    return;
+  }
   el.hidden = false;
   el.textContent = msg;              // textContent：msg 含服务端文案，绝不当 HTML
   el.classList.toggle('err', !!isErr);
@@ -85,8 +98,8 @@ function 码点(s) { return Array.from(String(s)); }
 function 列转UTF16(行文本, 列) {
   const cps = 码点(行文本);
   let n = Number(列);
-  if (!isFinite(n) || n < 1) n = 1;
-  if (n > cps.length + 1) n = cps.length + 1;
+  if (!isFinite(n) || n < 1) { n = 1; }
+  if (n > cps.length + 1) { n = cps.length + 1; }
   return cps.slice(0, n - 1).join('').length;
 }
 
@@ -94,10 +107,10 @@ function 列转UTF16(行文本, 列) {
 function 定位偏移(源码, 行, 列) {
   const 行数组 = String(源码).split('\n');
   let r = Number(行);
-  if (!isFinite(r) || r < 1) r = 1;
-  if (r > 行数组.length) r = 行数组.length;
+  if (!isFinite(r) || r < 1) { r = 1; }
+  if (r > 行数组.length) { r = 行数组.length; }
   let 偏移 = 0;
-  for (let i = 0; i < r - 1; i++) 偏移 += 行数组[i].length + 1;   // +1 是 '\n'
+  for (let i = 0; i < r - 1; i++) { 偏移 += 行数组[i].length + 1; }   // +1 是 '\n'
   return 偏移 + 列转UTF16(行数组[r - 1], 列);
 }
 
@@ -108,15 +121,20 @@ function 定位偏移(源码, 行, 列) {
 //   注释 `-- …` 到行尾 / 字符串 「…」 与 "…" / 关键字 / 数字。
 
 const 关键字 = ['从', '导入', '定义', '打印', '返回', '函数', '接收', '如果',
-  '否则', '循环', '每个', '在', '中', '为', '真', '假'];
+  '否则', '循环', '每个', '在', '中', '为', '真', '假',
+];
 
 /** 一行 → [{文, 类}]，同类相邻自动合并（也顺手把拆开的代理对拼回去）。 */
 function 分词(行) {
   const out = [];
   const 收 = (文, 类) => {
-    if (!文) return;
+    if (!文) { return; }
     const 末 = out.length ? out[out.length - 1] : null;
-    if (末 && 末.类 === 类) 末.文 += 文; else out.push({ 文: 文, 类: 类 });
+    if (末 && 末.类 === 类) {
+      末.文 += 文;
+    } else {
+      out.push({文: 文, 类: 类});
+    }
   };
   const s = String(行);
   const cm = s.indexOf('--');
@@ -130,21 +148,32 @@ function 分词(行) {
       const end = 代码.indexOf(闭, i + 1);
       const j = end < 0 ? 代码.length : end + 1;
       收(代码.slice(i, j), 'tok-str');
-      i = j; continue;
+      i = j;
+      continue;
     }
     if (ch >= '0' && ch <= '9') {
       let j = i;
-      while (j < 代码.length && (代码[j] === '.' || (代码[j] >= '0' && 代码[j] <= '9'))) j++;
+      while (j < 代码.length && (代码[j] === '.' || (代码[j] >= '0' && 代码[j] <= '9'))) { j++; }
       收(代码.slice(i, j), 'tok-num');
-      i = j; continue;
+      i = j;
+      continue;
     }
     let 命中 = null;
-    for (const k of 关键字) { if (代码.startsWith(k, i)) { 命中 = k; break; } }
-    if (命中) { 收(命中, 'tok-kw'); i += 命中.length; continue; }
+    for (const k of 关键字) {
+      if (代码.startsWith(k, i)) {
+        命中 = k;
+        break;
+      }
+    }
+    if (命中) {
+      收(命中, 'tok-kw');
+      i += 命中.length;
+      continue;
+    }
     收(ch, '');
     i += 1;
   }
-  if (注释) 收(注释, 'tok-cm');
+  if (注释) { 收(注释, 'tok-cm'); }
   return out;
 }
 
@@ -158,7 +187,7 @@ function 渲染行(行, 列集合) {
   const toks = 分词(行);
   let html = '', 缓 = '', 缓类 = '', 列号 = 0;
   const 冲 = () => {
-    if (!缓) return;
+    if (!缓) { return; }
     const 文 = esc(缓);                     // 先转义，再包标签，顺序不能反
     html += 缓类 ? '<span class="' + 缓类 + '">' + 文 + '</span>' : 文;
     缓 = '';
@@ -168,7 +197,10 @@ function 渲染行(行, 列集合) {
       列号 += 1;
       const 标 = !!(列集合 && 列集合.has(列号));
       const 类 = 标 ? (t.类 ? t.类 + ' col-mark' : 'col-mark') : t.类;
-      if (类 !== 缓类) { 冲(); 缓类 = 类; }
+      if (类 !== 缓类) {
+        冲();
+        缓类 = 类;
+      }
       缓 += ch;
     }
   }
@@ -177,7 +209,10 @@ function 渲染行(行, 列集合) {
   // 只看到一条空行、不知道错在哪。
   if (列集合) {
     for (const c of 列集合) {
-      if (c > 列号) { html += '<span class="col-mark"> </span>'; break; }
+      if (c > 列号) {
+        html += '<span class="col-mark"> </span>';
+        break;
+      }
     }
   }
   return html;
@@ -185,8 +220,8 @@ function 渲染行(行, 列集合) {
 
 /** 级别 → 白名单 CSS 类。外来字符串只用于查表，绝不拼进 class。 */
 function 级别类(级别) {
-  if (级别 === '警告') return 'lv-warn';
-  if (级别 === '提示') return 'lv-info';
+  if (级别 === '警告') { return 'lv-warn'; }
+  if (级别 === '提示') { return 'lv-info'; }
   return 'lv-err';
 }
 
@@ -196,18 +231,21 @@ function 级别类(级别) {
  */
 function 归并诊断(诊断) {
   const 表 = new Map();
-  const 重 = { '错误': 3, '警告': 2, '提示': 1 };
-  (诊断 || []).forEach((d) => {
-    if (!d) return;
+  const 重 = {'错误': 3, '警告': 2, '提示': 1};
+  (诊断 || []).forEach(d => {
+    if (!d) { return; }
     let 行 = Number(d['行']);
-    if (!isFinite(行) || 行 < 1) 行 = 1;
+    if (!isFinite(行) || 行 < 1) { 行 = 1; }
     let 列 = Number(d['列']);
-    if (!isFinite(列) || 列 < 1) 列 = 1;
+    if (!isFinite(列) || 列 < 1) { 列 = 1; }
     let 条 = 表.get(行);
-    if (!条) { 条 = { 列: new Set(), 级别: '提示' }; 表.set(行, 条); }
+    if (!条) {
+      条 = {列: new Set(), 级别: '提示'};
+      表.set(行, 条);
+    }
     条.列.add(列);
     const lv = String(d['级别'] || '错误');
-    if ((重[lv] || 3) >= (重[条.级别] || 0)) 条.级别 = (lv in 重) ? lv : '错误';
+    if ((重[lv] || 3) >= (重[条.级别] || 0)) { 条.级别 = (lv in 重) ? lv : '错误'; }
   });
   return 表;
 }
@@ -218,7 +256,7 @@ function 渲染代码(源码, 诊断) {
   return String(源码).split('\n').map((行, i) => {
     const 条 = 表.get(i + 1);
     const 内 = 渲染行(行, 条 ? 条.列 : null);
-    if (!条) return 内;
+    if (!条) { return 内; }
     return '<span class="ln-bad ' + 级别类(条.级别) + '">' + 内 + '</span>';
   }).join('\n');
 }
@@ -226,10 +264,10 @@ function 渲染代码(源码, 诊断) {
 /** 检索路径标签 → badge。取值见 ai/retrieval.py 的 PATH_NEURAL / PATH_HEURISTIC。 */
 function 路径标签(路径) {
   const p = String(路径 || '');
-  if (p === '[神经]') return { 文: '神经', 类: 'badge b-nn' };
-  if (p === '[启发式]') return { 文: '启发式', 类: 'badge b-he' };
-  if (!p) return null;
-  return { 文: p.replace(/^\[|\]$/g, ''), 类: 'badge' };   // 未知路径原样展示
+  if (p === '[神经]') { return {文: '神经', 类: 'badge b-nn'}; }
+  if (p === '[启发式]') { return {文: '启发式', 类: 'badge b-he'}; }
+  if (!p) { return null; }
+  return {文: p.replace(/^\[|\]$/g, ''), 类: 'badge'};   // 未知路径原样展示
 }
 
 // ---- 状态 -------------------------------------------------------------
@@ -260,7 +298,7 @@ function 渲染候选(cands) {
     p.textContent = '没有匹配的块，换个说法试试。';
     box.appendChild(p);
   }
-  cands.forEach((c) => box.appendChild(建卡片(c)));
+  cands.forEach(c => box.appendChild(建卡片(c)));
   刷新按钮();
 }
 
@@ -307,8 +345,13 @@ function 建卡片(c) {
 
 function 切换选中(名称, card) {
   const i = 选中.indexOf(名称);
-  if (i >= 0) { 选中.splice(i, 1); card.setAttribute('aria-pressed', 'false'); }
-  else { 选中.push(名称); card.setAttribute('aria-pressed', 'true'); }
+  if (i >= 0) {
+    选中.splice(i, 1);
+    card.setAttribute('aria-pressed', 'false');
+  } else {
+    选中.push(名称);
+    card.setAttribute('aria-pressed', 'true');
+  }
   刷新按钮();
 }
 
@@ -326,7 +369,10 @@ function 刷新按钮() {
 function 显示降级(说明) {
   const bar = $('degrade');
   bar.textContent = '';
-  if (!说明) { bar.hidden = true; return; }
+  if (!说明) {
+    bar.hidden = true;
+    return;
+  }
   bar.hidden = false;
   const s = document.createElement('span');
   s.textContent = '⚠ ' + 说明 + '（下面这批候选来自启发式检索）';
@@ -351,17 +397,17 @@ function 显示降级(说明) {
  * 「一列数据顺着流过几个块」用法；不填交给后端 --自动链式 的类型图去推。
  */
 function 组装方案() {
-  const 步骤 = 选中.map((名) => {
+  const 步骤 = 选中.map(名 => {
     const b = 块表.get(名) || {};
     const 领域 = (b['领域'] && b['领域'][0]) || '数据';
     const 导出 = (b['导出'] && b['导出'][0]) || 名;
-    return { '块': 名, '领域': 领域, '导出名': 导出 };
+    return {'块': 名, '领域': 领域, '导出名': 导出};
   });
-  const 方案 = { '需求': $('q').value.trim(), '步骤': 步骤 };
+  const 方案 = {'需求': $('q').value.trim(), '步骤': 步骤};
   const 料 = $('feed').value.trim();
   if (料) {
-    方案['共享'] = [{ '名': '赵料', '值': 料 }];
-    步骤.forEach((s) => { s['参数'] = ['赵料']; });
+    方案['共享'] = [{'名': '赵料', '值': 料}];
+    步骤.forEach(s => { s['参数'] = ['赵料']; });
   }
   return 方案;
 }
@@ -385,7 +431,7 @@ function 建行号(src) {
   for (let i = 1; i <= 行数; i++) {
     const d = document.createElement('div');
     const 条 = 表.get(i);
-    if (条) d.className = 条.级别 === '错误' ? 'bad' : 'warn';
+    if (条) { d.className = 条.级别 === '错误' ? 'bad' : 'warn'; }
     d.textContent = String(i);
     g.appendChild(d);
   }
@@ -402,7 +448,7 @@ function 同步滚动() {
 function 行像素高() {
   const cs = getComputedStyle($('src'));
   const lh = parseFloat(cs.lineHeight);
-  if (isFinite(lh) && lh > 0) return lh;
+  if (isFinite(lh) && lh > 0) { return lh; }
   const fs = parseFloat(cs.fontSize);
   return (isFinite(fs) && fs > 0) ? fs * 1.5 : 20;
 }
@@ -412,7 +458,10 @@ function 行像素高() {
 function 渲染诊断(诊断) {
   const box = $('diag');
   box.textContent = '';
-  if (!诊断 || !诊断.length) { box.hidden = true; return; }
+  if (!诊断 || !诊断.length) {
+    box.hidden = true;
+    return;
+  }
   box.hidden = false;
 
   const h = document.createElement('div');
@@ -421,7 +470,7 @@ function 渲染诊断(诊断) {
     + (诊断失效 ? '　（源码已改动，行列标记已失效，位置仅供参考）' : '　（点一条跳到出错位置）');
   box.appendChild(h);
 
-  诊断.forEach((d) => {
+  诊断.forEach(d => {
     const it = document.createElement('button');
     it.type = 'button';
     it.className = 'diag-item ' + 级别类(d && d['级别']) + (诊断失效 ? ' stale' : '');
@@ -453,7 +502,7 @@ function 跳到(d) {
   try { ta.setSelectionRange(起, Math.min(起 + 1, ta.value.length)); }
   catch (e) { /* 极端情况下（值刚被换掉）定位失败不该打断交互 */ }
   let 行 = Number(d['行']);
-  if (!isFinite(行) || 行 < 1) 行 = 1;
+  if (!isFinite(行) || 行 < 1) { 行 = 1; }
   ta.scrollTop = Math.max(0, (行 - 3) * 行像素高());
   同步滚动();
 }
@@ -465,7 +514,7 @@ function 展示执行(r) {
   const out = $('out');
   out.textContent = '';
   const 段 = (标题, 文本, cls) => {
-    if (文本 === undefined || 文本 === null || 文本 === '') return;
+    if (文本 === undefined || 文本 === null || 文本 === '') { return; }
     const h = document.createElement('div');
     h.className = 'sec';
     h.textContent = 标题;
@@ -474,9 +523,9 @@ function 展示执行(r) {
     b.textContent = String(文本);     // 执行结果一律 textContent，杜绝 XSS
     out.append(h, b);
   };
-  if (r['错误']) 段('错误', r['错误'], 'err');
+  if (r['错误']) { 段('错误', r['错误'], 'err'); }
   const 诊断 = Array.isArray(r['诊断']) ? r['诊断'] : [];
-  if (诊断.length) 段('诊断', 诊断.length + ' 条（见左侧代码框标记与清单）');
+  if (诊断.length) { 段('诊断', 诊断.length + ' 条（见左侧代码框标记与清单）'); }
   段('stdout', r['stdout']);
   段('stderr', r['stderr'], 'err');   // 诊断走 stderr，不显示等于瞎
   段('返回值', r['返回值']);
@@ -489,7 +538,7 @@ function 展示执行(r) {
 // ---- 分享：复制 / 下载 ------------------------------------------------
 
 async function 复制(文本, 什么) {
-  if (!文本) return;
+  if (!文本) { return; }
   try {
     if (!navigator.clipboard || !navigator.clipboard.writeText) {
       throw new Error('浏览器未提供剪贴板接口（非 https / 非 localhost？）');
@@ -504,8 +553,8 @@ async function 复制(文本, 什么) {
 /** 下载 `.jk`：纯前端 Blob + createObjectURL，不新增后端端点。 */
 function 下载jk() {
   const 源 = $('src').value;
-  if (!源.trim()) return;
-  const blob = new Blob([源], { type: 'text/plain;charset=utf-8' });
+  if (!源.trim()) { return; }
+  const blob = new Blob([源], {type: 'text/plain;charset=utf-8'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -529,13 +578,16 @@ function 文件名() {
 
 async function 选块() {
   const q = $('q').value.trim();
-  if (!q) { note($('sel-note'), '先说说你想干什么。', true); return; }
+  if (!q) {
+    note($('sel-note'), '先说说你想干什么。', true);
+    return;
+  }
   const btn = $('btn-sel');
   btn.disabled = true;
   note($('sel-note'), '检索中…');
   try {
-    const 请求 = { '需求': q, 'top': 8 };
-    if (神经可用 && $('neural').checked) 请求['神经'] = true;
+    const 请求 = {'需求': q, 'top': 8};
+    if (神经可用 && $('neural').checked) { 请求['神经'] = true; }
     const data = await postJSON('/api/选', 请求);
     渲染候选(data['候选'] || []);
     显示降级(data['降级说明'] || '');
@@ -548,12 +600,12 @@ async function 选块() {
 }
 
 async function 组装() {
-  if (!选中.length) return;
+  if (!选中.length) { return; }
   const btn = $('btn-asm');
   btn.disabled = true;
   note($('asm-note'), '组装中…');
   try {
-    const data = await postJSON('/api/组', { '方案': 组装方案() });
+    const data = await postJSON('/api/组', {'方案': 组装方案()});
     $('src').value = data['源码'] || '';
     当前诊断 = [];
     诊断失效 = false;
@@ -570,13 +622,13 @@ async function 组装() {
 }
 
 async function 跑() {
-  if ($('btn-run').disabled) return;
+  if ($('btn-run').disabled) { return; }
   const btn = $('btn-run');
   btn.disabled = true;
   $('out').textContent = '运行中…';
   try {
     // `/api/跑` 吃的是方案不是源码，所以这里仍送当前选中拼出的方案。
-    const data = await postJSON('/api/跑', { '方案': 组装方案() });
+    const data = await postJSON('/api/跑', {'方案': 组装方案()});
     const 结果 = data['执行结果'] || {};
     const 回源 = data['源码'];
     // 服务端返回它**实际执行**的源码。用它覆盖代码框，诊断的行列才对得上；
@@ -598,7 +650,7 @@ async function 跑() {
     当前诊断 = [];
     刷新代码视图();
     渲染诊断(当前诊断);
-    展示执行({ '错误': e.message, '耗时毫秒': 0 });
+    展示执行({'错误': e.message, '耗时毫秒': 0});
   } finally {
     刷新按钮();
   }
@@ -672,12 +724,18 @@ async function 探测能力() {
  * 老浏览器），否则中文用户按回车上字会被当成提交。
  */
 function 全局键(e) {
-  if (e.isComposing || e.keyCode === 229) return;
+  if (e.isComposing || e.keyCode === 229) { return; }
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-    if (!$('btn-run').disabled) { e.preventDefault(); 跑(); }
+    if (!$('btn-run').disabled) {
+      e.preventDefault();
+      跑();
+    }
     return;
   }
-  if (e.key === 'Escape') { e.preventDefault(); 清空(); }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    清空();
+  }
 }
 
 function 绑定() {
@@ -691,16 +749,22 @@ function 绑定() {
   $('btn-dl').addEventListener('click', 下载jk);
 
   // 需求框回车 = 选块，但组字中的回车不算
-  $('q').addEventListener('keydown', (e) => {
+  $('q').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229
-        && !e.ctrlKey && !e.metaKey) { e.preventDefault(); 选块(); }
+        && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      选块();
+    }
   });
 
   const ta = $('src');
   ta.addEventListener('input', () => {
     // 用户一改源码，之前那批诊断的行列就不再指向同一份文本了：标记撤掉，
     // 消息保留（正在照着它改），并在清单头上标明已失效。
-    if (当前诊断.length && !诊断失效) { 诊断失效 = true; 渲染诊断(当前诊断); }
+    if (当前诊断.length && !诊断失效) {
+      诊断失效 = true;
+      渲染诊断(当前诊断);
+    }
     刷新代码视图();
     刷新按钮();
   });
@@ -714,7 +778,7 @@ async function 启动() {
   探测能力();                          // 不 await：能力探测不该拖慢首屏
   try {
     const idx = await getJSON('/api/blocks');
-    (idx['块'] || []).forEach((b) => 块表.set(b['名称'], b));
+    (idx['块'] || []).forEach(b => 块表.set(b['名称'], b));
     $('cand-hint').textContent = '（已载入 ' + 块表.size + ' 个块；点选后组装方案）';
   } catch (e) {
     note($('sel-note'), '载入块索引失败：' + e.message, true);

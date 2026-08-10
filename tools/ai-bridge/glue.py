@@ -36,6 +36,17 @@ if _SRC not in sys.path:
 # 才能 `from jikuai.service import schema` 成功；`tools/ai-bridge/` 目录
 # 本身不做成包也不该做，那样会让「桥接工具」污染主发布包的命名空间。
 from jikuai.service import schema  # noqa: E402
+from jikuai.service.schema import (  # noqa: E402
+    STEP_REQUIRED, STEP_OPTIONAL, PLAN_REQUIRED, PLAN_OPTIONAL,
+)
+
+#: 协议字段名一律从 schema 常量取，本文件不写裸字面量（W20 硬门槛）。
+#: 整元组解包而不是硬编码下标：协议真加了字段这里会当场 ValueError。
+#: `PLAN_REQUIRED` 目前只有一个字段，解包写法保留尾逗号（`_F步骤, = ...`）。
+_F块, _F领域, _F导出名 = STEP_REQUIRED
+_F参数, _F说明 = STEP_OPTIONAL
+_F步骤, = PLAN_REQUIRED
+_F需求, _F共享, _F打印 = PLAN_OPTIONAL
 
 __all__ = ['synthesize', 'result_var', 'TypeGraph', 'type_feeds', 'normalize_type']
 
@@ -195,6 +206,7 @@ class TypeGraph:
         return normalize_type(info['输出'].get('类型'))
 
     def plan(self, steps, 共享=None):
+        """根据步骤列表与共享变量，推导实参方案。返回 (实参方案, 未匹配, 拒绝理由) 三元组。"""
         # 候选变量池：共享常量（类型未知 → 任意）先入池，随后每步产出追加
         池 = []          # list of (变量名, 归一类型)
         for c in (共享 or []):
@@ -206,13 +218,13 @@ class TypeGraph:
         拒绝理由 = []
 
         for i, s in enumerate(steps):
-            名 = s.get('块')
+            名 = s.get(_F块)
             inputs = self._block_inputs(名)
             这步实参 = []
             这步齐全 = True
 
             # 若方案已手写参数，尊重之（类型图只补缺失的），但仍校验可喂性
-            手写 = s.get('参数')
+            手写 = s.get(_F参数)
 
             for k, slot in enumerate(inputs):
                 形参类型 = normalize_type(slot.get('类型'))
@@ -264,7 +276,7 @@ def _导入行(steps):
     seen = set()
     lines = []
     for s in steps:
-        key = (s['领域'], s['块'], s['导出名'])
+        key = (s[_F领域], s[_F块], s[_F导出名])
         if key in seen:
             continue
         seen.add(key)
@@ -289,18 +301,18 @@ def synthesize(方案, 自动链式=False, root=None):
         schema.ensure_plan(方案)
     except schema.SchemaError as e:
         raise ValueError(str(e))
-    steps = 方案['步骤']
+    steps = 方案[_F步骤]
 
     自动实参 = None
     拒绝理由 = []
     if 自动链式:
         图 = TypeGraph(root=root)
-        自动实参, _未匹配, 拒绝理由 = 图.plan(steps, 方案.get('共享'))
+        自动实参, _未匹配, 拒绝理由 = 图.plan(steps, 方案.get(_F共享))
 
     lines = ['-- 由 极快 AI 桥接（选块 + 粘合%s）自动合成'
              % ('，类型图链式' if 自动链式 else '')]
-    if 方案.get('需求'):
-        lines.append('-- 需求：' + str(方案['需求']))
+    if 方案.get(_F需求):
+        lines.append('-- 需求：' + str(方案[_F需求]))
     if 拒绝理由:
         lines.append('--')
         lines.append('-- 类型图未能自动链上的传参（需人工处理）：')
@@ -312,7 +324,7 @@ def synthesize(方案, 自动链式=False, root=None):
     lines.extend(_导入行(steps))
 
     # 2) 共享常量 / 输入
-    共享 = 方案.get('共享') or []
+    共享 = 方案.get(_F共享) or []
     if 共享:
         lines.append('')
         for item in 共享:
@@ -326,23 +338,23 @@ def synthesize(方案, 自动链式=False, root=None):
     for i, s in enumerate(steps):
         var = result_var(i)
         结果变量.append(var)
-        if s.get('说明'):
-            lines.append('-- 步骤 %d：%s' % (i + 1, s['说明']))
+        if s.get(_F说明):
+            lines.append('-- 步骤 %d：%s' % (i + 1, s[_F说明]))
 
-        参数 = s.get('参数')
+        参数 = s.get(_F参数)
         if 参数 is not None:
             实参 = ' '.join(str(p) for p in 参数)
         elif 自动实参 is not None and 自动实参[i] is not None:
             实参 = ' '.join(自动实参[i])
         else:
             lines.append('-- 需人工填参：%s 的入参未指定（下一行的 %s 占位）'
-                         % (s['导出名'], _占位符))
+                         % (s[_F导出名], _占位符))
             实参 = _占位符
-        lines.append('定义%s=%s(%s)。' % (var, s['导出名'], 实参))
+        lines.append('定义%s=%s(%s)。' % (var, s[_F导出名], 实参))
 
     # 4) 打印
     lines.append('')
-    打印列表 = 方案.get('打印') or 结果变量
+    打印列表 = 方案.get(_F打印) or 结果变量
     for 名 in 打印列表:
         lines.append('打印 %s。' % 名)
 

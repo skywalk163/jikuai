@@ -23,7 +23,7 @@ import sys
 from typing import List, Optional, Sequence, Tuple
 
 __all__ = [
-    'ENV_CMD', 'ENV_NEURAL', 'DEFAULT_TIMEOUT',
+    'ENV_CMD', 'ENV_NEURAL', 'DEFAULT_TIMEOUT', 'DEGRADE_PREFIX',
     'sidecar_script_path', 'resolve_command', 'neural_enabled_by_env',
     'fetch_query_vector', 'index_dim',
 ]
@@ -41,6 +41,10 @@ DEFAULT_TIMEOUT = 120.0
 
 #: `ENV_NEURAL` 认作「开」的取值。
 _TRUTHY = frozenset({'1', 'true', 'yes', 'on', '开', 'neural', '神经'})
+
+#: 降级文案前缀。CLI / Web / REPL 三处都拼这句 + `fetch_query_vector` 的原因串，
+#: 措辞必须一字不差（协议 `降级说明` 字段与测试都按这句断言），故收在这里。
+DEGRADE_PREFIX = '神经检索不可用，降级到启发式：'
 
 
 def sidecar_script_path() -> str:

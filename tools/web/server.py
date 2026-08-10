@@ -107,6 +107,7 @@ _盘符 = re.compile(r'^[A-Za-z]:')
 
 #: 解释器执行是进程级的（`redirect_stdout` 换的是全局 `sys.stdout`），
 #: ThreadingHTTPServer 下必须串行化，否则并发两个 `跑` 会互相偷走对方的输出。
+# redirect_stdout/stderr 替换全局 sys.stdout/stderr，故其它 handler 禁止 print；添加中间件时须避免 sys.stdout.write。
 _执行锁 = threading.Lock()
 
 #: 粘合器模块缓存。
@@ -236,7 +237,9 @@ def 选(body: dict) -> dict:
         vec, why = embed_client.fetch_query_vector(
             需求, expected_dim=embed_client.index_dim())
         if vec is None:
-            降级说明 = '神经检索不可用，降级到启发式：%s' % why
+            # 文案前缀走常量，与 CLI（blocks_cli）/ REPL（repl_session）同源。
+            from jikuai.ai.embed_client import DEGRADE_PREFIX
+            降级说明 = DEGRADE_PREFIX + why
         else:
             查询向量 = vec
 
@@ -326,6 +329,7 @@ def 执行源码(源码: str) -> dict:
     是打到 stderr 的，CLI 让它直接落终端就行，Web 层要是不拦，这些中文诊断会
     跑到服务进程的控制台里、前端一个字都看不到。
     """
+    # 与 blocks_cli._执行源码 同源实现；不抽共享是因为 src/ 零第三方依赖约束禁止运行时包依赖 tools/。
     from jikuai.main import run_source
 
     fd, path = tempfile.mkstemp(prefix='jk_web跑_', suffix='.jk')
@@ -334,6 +338,7 @@ def 执行源码(源码: str) -> dict:
             f.write(源码)
         缓出, 缓错 = io.StringIO(), io.StringIO()
         错误 = None
+        诊断 = None
         结果 = None
         with _执行锁:
             起 = time.perf_counter()
@@ -345,11 +350,15 @@ def 执行源码(源码: str) -> dict:
                 # 只回异常类名 + 消息，不回 traceback：栈里带着服务端的绝对
                 # 路径与内部模块结构，对调用方没用，对攻击者有用。
                 错误 = '%s：%s' % (type(e).__name__, e)
+                # 带位置信息（JiKuaiError.info）时顺手填 `诊断`，前端才能把
+                # 出错的行/列高亮出来（W19）；拿不到就保持 None，不伪造。
+                # 提取逻辑下沉到 schema（CLI 与 Web 共用一份，不再各写一遍）。
+                诊断 = schema.diagnostics_from_error(e)
             耗时 = (time.perf_counter() - 起) * 1000.0
         return schema.make_result(
             stdout=缓出.getvalue(), stderr=缓错.getvalue(),
             返回值='' if 错误 else repr(结果),
-            耗时毫秒=耗时, 错误=错误,
+            耗时毫秒=耗时, 错误=错误, 诊断=诊断,
         )
     finally:
         try:
@@ -589,6 +598,7 @@ def build_server(host: str = DEFAULT_HOST,
 
 
 def main(argv=None) -> int:
+    """启动 Web UI 本地开发服务。返回退出码（0 正常 / 非 0 异常）。"""
     p = argparse.ArgumentParser(
         description='极快 Web UI 本地开发服务（无鉴权，仅限本机）')
     p.add_argument('--地址', '--host', dest='host', default=DEFAULT_HOST,
@@ -608,6 +618,20 @@ def main(argv=None) -> int:
     if args.host not in ('127.0.0.1', 'localhost', '::1'):
         print('⚠ 你把监听地址设成了 %s —— 这台机器所在网络里的任何人都能'
               '在你的机器上执行任意代码。确定要这样？' % args.host, file=sys.stderr)
+
+    # 预热：在 serve_forever 之前把惰性单例初始化完毕，消除首个请求的
+    # 竞态窗口（多线程 handler 同时触发 _glue / _cached_retriever / _LEVELS）。
+    # 预热失败不阻断启动——首请求自己再惰性初始化一次只是慢一点，比服务起不来好。
+    # `retrieval` 的 import 也放在 try 内：它同样可能失败（缺依赖 / 索引损坏），
+    # 而 import 炸在 try 外就变成裸崩，起不了服务。
+    try:
+        from jikuai.ai import retrieval
+        _glue()
+        retrieval.retrieve('预热', top=1)
+        schema.level_table()
+    except Exception as e:                                  # noqa: BLE001
+        _LOG.warning('预热失败，将退化为按需初始化：%s', e)
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

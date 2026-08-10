@@ -29,12 +29,12 @@ __all__ = [
     'CANDIDATE_REQUIRED', 'CANDIDATE_OPTIONAL',
     'PLAN_REQUIRED', 'PLAN_OPTIONAL', 'STEP_REQUIRED', 'STEP_OPTIONAL',
     'RESULT_REQUIRED', 'RESULT_OPTIONAL',
-    'DIAGNOSTIC_REQUIRED', 'DIAGNOSTIC_OPTIONAL',
+    'DIAGNOSTIC_REQUIRED', 'DIAGNOSTIC_OPTIONAL', 'DIAGNOSTIC_LEVELS',
     'SELECT_ENVELOPE_REQUIRED', 'SELECT_ENVELOPE_OPTIONAL',
     'RUN_ENVELOPE_REQUIRED', 'RUN_ENVELOPE_OPTIONAL',
     'make_candidate', 'make_step', 'make_plan', 'make_result',
     'make_select_envelope', 'make_run_envelope',
-    'candidate_from_hit', 'level_table',
+    'candidate_from_hit', 'level_table', 'diagnostics_from_error',
     'validate_candidate', 'validate_plan', 'validate_result',
     'validate_select_envelope', 'validate_run_envelope',
     'ensure_candidate', 'ensure_plan', 'ensure_result',
@@ -69,8 +69,17 @@ RESULT_OPTIONAL = ('错误', '诊断')
 #: `诊断` 条目字段。`行`/`列` 是 **1-based 码点**口径，与
 #: `diagnostics.model.Position` 一致（不是 UTF-16、不是字节）。
 #: LSP 那侧要的 0-based UTF-16 由 `service/position.py` 负责换算，本层不掺和。
+#: `级别` 取值域是 `DIAGNOSTIC_LEVELS`，与 `diagnostics.model.Severity` 同源——
+#: 前端 `app.js` 的 `级别类()`/`归并诊断()` 按严重度「错误/警告/提示」分档，
+#: 后端塞分类名（如「运行错误」）过来会全部掉到红色档，警告/提示分支形同虚设。
 DIAGNOSTIC_REQUIRED = ('行', '列', '级别', '消息')
 DIAGNOSTIC_OPTIONAL = ('代码',)
+
+#: `级别` 白名单。**必须**与 `src/jikuai/diagnostics/model.py` 的 `Severity`
+#: Literal 三档同源；前端 `app.js` 的 `归并诊断()` 也按这三档分色。分类信息
+#: （`ErrorCategory.value`，如「运行错误」「已知限制」）不进这里——那是**分类**
+#: 不是**严重度**，混用会让前端警告/提示分支成死代码（v0.15.0 复核轮教训）。
+DIAGNOSTIC_LEVELS = frozenset({'错误', '警告', '提示'})
 
 #: `选` 的响应信封（三通道共用）：CLI `jk 块 选 --json`、LSP `极快.选块`、
 #: Web `POST /api/选` 都吐这个形状。
@@ -157,6 +166,41 @@ def make_result(stdout: str = '', stderr: str = '', 返回值: str = '',
     if 诊断 is not None:
         结果['诊断'] = list(诊断)
     return 结果
+
+
+def diagnostics_from_error(exc: Any) -> Optional[List[Dict[str, Any]]]:
+    """从极快异常对象提取结构化 `诊断` 列表；拿不到位置信息返回 None。
+
+    用鸭子类型读 `exc.info`（`errors.ErrorInfo`），不 import diagnostics/errors
+    ——schema 是纯标准库层，不能反向依赖上层模块。
+
+    契约（与前端 `app.js` 的 `级别类()`/`归并诊断()` 对齐）：
+
+    - `级别` 固定填 `'错误'`。抛出来的 `JiKuaiError` 本质就是错误，不是警告/提示；
+      前端按**严重度**三档分色，塞分类名（`ErrorCategory.value` 如「运行错误」）
+      过来只会全掉红色档，让警告/提示分支成死代码——v0.15.0 复核轮的教训。
+    - 分类信息不丢：能读到 `info.category.value` 就当前缀塞进 `消息`，形如
+      `'[运行错误] 未定义的变量 赵x'`；读不到就不加前缀。
+
+    与旧 `_诊断条` 私有实现的差别：那个把 `category.value` 直接填进 `级别`，
+    与前端严重度口径不同源。本函数一并修掉，`blocks_cli` / `tools/web/server.py`
+    统一改调本函数（不再各写一份）。
+    """
+    info = getattr(exc, 'info', None)
+    if info is None:
+        return None
+    行 = getattr(info, 'line', None)
+    列 = getattr(info, 'col', None)
+    if not isinstance(行, int) or not isinstance(列, int):
+        return None
+    分类 = getattr(getattr(info, 'category', None), 'value', None)
+    消息原文 = getattr(info, 'message', str(exc))
+    if isinstance(分类, str) and 分类:
+        消息 = '[%s] %s' % (分类, 消息原文)
+    else:
+        消息 = 消息原文
+    条 = dict(zip(DIAGNOSTIC_REQUIRED, (行, 列, '错误', 消息)))
+    return [条]
 
 
 def make_select_envelope(需求: str, 候选: Sequence[Dict[str, Any]],
@@ -262,7 +306,8 @@ def validate_candidate(obj: Any, 位置: str = '候选') -> List[str]:
         return errs
     for 名 in ('名称', '领域', '描述', '路径', '命名空间'):
         _check_str(obj, 名, 位置, errs)
-    if '层级' in obj and not isinstance(obj['层级'], int):
+    if '层级' in obj and (isinstance(obj['层级'], bool)
+                         or not isinstance(obj['层级'], int)):
         errs.append('%s.层级 必须是整数' % 位置)
     if '分数' in obj and not isinstance(obj['分数'], (int, float)):
         errs.append('%s.分数 必须是数字' % 位置)
@@ -309,7 +354,8 @@ def validate_result(obj: Any, 位置: str = '执行结果') -> List[str]:
         return errs
     for 名 in ('stdout', 'stderr', '返回值', '错误'):
         _check_str(obj, 名, 位置, errs)
-    if '耗时毫秒' in obj and not isinstance(obj['耗时毫秒'], (int, float)):
+    if '耗时毫秒' in obj and (isinstance(obj['耗时毫秒'], bool)
+                            or not isinstance(obj['耗时毫秒'], (int, float))):
         errs.append('%s.耗时毫秒 必须是数字' % 位置)
     诊断 = obj.get('诊断')
     if 诊断 is not None:
@@ -323,8 +369,13 @@ def validate_result(obj: Any, 位置: str = '执行结果') -> List[str]:
                 if isinstance(条, dict):
                     for 名 in ('级别', '消息', '代码'):
                         _check_str(条, 名, where, errs)
+                    if isinstance(条.get('级别'), str) and 条['级别'] not in DIAGNOSTIC_LEVELS:
+                        errs.append('%s.级别 「%s」不在白名单（允许：%s）'
+                                    % (where, 条['级别'],
+                                       '/'.join(sorted(DIAGNOSTIC_LEVELS))))
                     for 名 in ('行', '列'):
-                        if 名 in 条 and not isinstance(条[名], int):
+                        if 名 in 条 and (isinstance(条[名], bool)
+                                       or not isinstance(条[名], int)):
                             errs.append('%s.%s 必须是整数（1-based 码点）'
                                         % (where, 名))
     return errs

@@ -509,7 +509,10 @@ class ReplSession:
             expected = embed_client.index_dim()
             vec, why = embed_client.fetch_query_vector(query, expected_dim=expected)
             if vec is None:
-                print(f'神经检索不可用，降级到启发式：{why}', file=self.err)
+                # 文案前缀走常量，与 CLI（blocks_cli）/ Web（tools/web/server.py）同源。
+                from .ai.embed_client import DEGRADE_PREFIX
+                降级说明 = DEGRADE_PREFIX + why
+                print(降级说明, file=self.err)
             else:
                 query_vector = vec
         try:

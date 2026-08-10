@@ -62,10 +62,11 @@ def _interpret(src):
         [sys.executable, '-c',
          'import sys; from jikuai.main import run_source; '
          'run_source(sys.stdin.read())'],
-        input=src, capture_output=True, text=True,
+        input=src, capture_output=True, text=True, encoding='utf-8',
         env={**os.environ, 'PYTHONPATH': os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'),
-            'JIKUAI_DIAGNOSTICS': 'off'},
+            'JIKUAI_DIAGNOSTICS': 'off',
+            'PYTHONUTF8': '1'},
     )
     assert proc.returncode == 0, f'解释器执行失败：{proc.stderr}'
     return proc.stdout

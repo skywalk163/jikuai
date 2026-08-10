@@ -151,24 +151,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
 
-      # Windows runner 通常无 gcc，AOT e2e 会 skip 属常态，无需装编译器。
-      # 仅记录编译器可见性供排查，不作断言（与 Linux job 的 gcc 守卫相反）。
+      # Windows runner 预装 MinGW gcc，AOT e2e 用例实际会运行（非 skip）。
+      # 此处仅打印可见性供排查，不作断言——与 Linux job 的 gcc 守卫互补。
       - name: Report C compiler visibility (informational)
         shell: pwsh
         run: python -c "import shutil; print('gcc ->', shutil.which('gcc'))"
 
-      # 全量用例 + skip 上限守卫。
-      # Windows 无 gcc：AOT 编译-运行比对用例会 skip——
-      #   test_v0_7_0_aot.py（1）+ test_v0_8_0_aot_controlflow.py（8）
-      #   + test_v0_9_0_aot_for.py（14）+ test_v0_9_0_aot_functions.py（8）= 31 条；
-      # 外加 POSIX-only 权限位用例 test_v0_11_0_aot_binary_mode.py（3）；
-      # 合计本机实测 34 skip。允许这些 skip，但设硬上限防大面积静默跳过
-      # （例如某个 import 崩了会让整文件被 collect-skip）。阈值 = 实测 34 + 6 余量 = 40，
-      # 超过即 fail。PowerShell 下 `&&` 无效，全用换行/`;`。
+      # Windows runner（windows-latest）预装了 MinGW gcc，AOT e2e 用例会真跑
+      # 而非 skip。仅 POSIX 权限位用例（test_v0_11_0_aot_binary_mode.py，3 条）
+      # 会 skip。因此 Windows 正常 skip 数约 3（与 Linux 的 0 几乎相当）。
+      # 阈值仍设 10 作为安全余量，兜住少量平台特异性偶发 skip（如 runner 环境
+      # 临时缺编译器时 AOT 31 条会 skip → 触发阈值告警让我们知道环境变了）。
       - name: Run full test suite (skip count guarded)
         shell: pwsh
         run: |
-          $threshold = 40
+          $threshold = 10
           $out = python -m pytest tests -q -rs 2>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out

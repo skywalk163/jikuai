@@ -39,6 +39,7 @@ W31 引入了**写端点**，因此又多了三条硬约束（细节见 `README.
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -72,6 +73,11 @@ _F源码, _F执行结果 = schema.RUN_ENVELOPE_REQUIRED
 #: `已存方案` 的字段名（W31）。`_F方案` 同时也是 `/api/组`、`/api/跑` 请求体
 #: 里那个信封键——存档项与请求信封用的是同一个字段名，取自同一处常量。
 _Fid, _F标题, _F时间戳, _F方案 = schema.SAVED_PLAN_REQUIRED
+#: PUT /api/方案/<id> 请求体的额外字段（乐观锁标记）。这两个是响应/请求契约字段
+#: 不是存档格式的一部分，所以**刻意**不进 `SAVED_PLAN_REQUIRED`——存档字节的
+#: 版本 = sha256(存档字节) 前 16 位，是派生值而非落盘字段（见 `_版本标记`）。
+_F版本 = '版本'
+_F期望版本 = '期望版本'
 
 __all__ = [
     'DEFAULT_HOST', 'DEFAULT_PORT', 'MAX_BODY', 'SAFETY_NOTICE',
@@ -619,7 +625,59 @@ def 方案_存(body: dict) -> dict:
                       状态=413)
 
     目标 = _方案文件路径(id)
-    # 原子写：先落临时文件同目录，再 replace 覆盖；防止半写状态被读到。
+    _原子写(_确保根目录(), 目标, 数据)
+    return schema.make_saved_plan_summary(id=id, 标题=标题, 时间戳=时间戳)
+
+
+def 方案_列() -> dict:
+    """`GET /api/方案/列`：返回 `{方案列表:[{id,标题,时间戳}, ...]}`（新在前）。"""
+    return schema.make_saved_plan_list(_列存档())
+
+
+def _版本标记(数据: bytes) -> str:
+    """存档字节的乐观锁标记（ETag 语义），取 sha256 前 16 位 hex。
+
+    **为什么不用 WBS 原文的「`修改时间` 做乐观锁」**：`_当前时间戳()` 是
+    **秒级**的（`microsecond=0`），同一秒内的两次更新会拿到相同时间戳，
+    时间戳比对会把「别人刚改过」误判成「没人改过」而静默丢失更新——
+    这正是乐观锁要防的那件事。内容摘要没有时钟粒度问题。
+
+    标记是**派生值不落盘**：`SAVED_PLAN_REQUIRED` 一个字段都不用动，
+    存档格式零 Breaking Change。代价是 `方案_取` 的响应比存档文件多一个
+    `版本` 字段（响应契约的加法，不是存储格式的改动）。
+    """
+    return hashlib.sha256(数据).hexdigest()[:16]
+
+
+def _读存档(id: str):
+    """读存档，返回 `(档dict, 原始字节)`。不存在 → 404，坏格式 → 500。"""
+    目标 = _方案文件路径(id)
+    try:
+        with open(目标, 'rb') as f:
+            原始 = f.read()
+    except FileNotFoundError:
+        raise _请求错误('方案不存在：%s' % id, 状态=404)
+    except OSError as e:
+        raise _请求错误('存档读取失败：%s' % e, 状态=500)
+    try:
+        档 = json.loads(原始.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise _请求错误('存档读取失败：%s' % e, 状态=500)
+    if not isinstance(档, dict) or _F方案 not in 档:
+        raise _请求错误('存档格式错误：缺少「方案」', 状态=500)
+    return 档, 原始
+
+
+def 方案_取(id: str) -> dict:
+    """`GET /api/方案/<id>`：取单个存档（含方案本体）+ 派生的 `版本` 乐观锁标记。"""
+    档, 原始 = _读存档(id)
+    档 = dict(档)
+    档[_F版本] = _版本标记(原始)
+    return 档
+
+
+def _原子写(根: str, 目标: str, 数据: bytes) -> None:
+    """先落同目录临时文件再 `os.replace` 覆盖，防止半写状态被读到。"""
     tmp_fd, tmp_path = tempfile.mkstemp(prefix='.tmp_', suffix='.json', dir=根)
     try:
         with os.fdopen(tmp_fd, 'wb') as f:
@@ -631,27 +689,72 @@ def 方案_存(body: dict) -> dict:
         except OSError:
             pass
         raise _请求错误('落盘失败：%s' % e, 状态=500)
-    return schema.make_saved_plan_summary(id=id, 标题=标题, 时间戳=时间戳)
 
 
-def 方案_列() -> dict:
-    """`GET /api/方案/列`：返回 `{方案列表:[{id,标题,时间戳}, ...]}`（新在前）。"""
-    return schema.make_saved_plan_list(_列存档())
+def 方案_更新(id: str, body: dict) -> dict:
+    """`PUT /api/方案/<id>`：覆盖式原地更新（W46）。
 
+    请求体::
 
-def 方案_取(id: str) -> dict:
-    """`GET /api/方案/<id>`：取单个存档（含方案本体）。"""
-    目标 = _方案文件路径(id)
-    if not os.path.isfile(目标):
-        raise _请求错误('方案不存在：%s' % id, 状态=404)
+        {"方案": {...}, "期望版本": "<GET 时拿到的版本>", "标题": "可选"}
+
+    **`期望版本` 是必需的**，缺了直接 400 而不是「没给就当无冲突」——
+    静默覆盖是这个端点唯一不能犯的错。版本不符回 **409**，响应里带
+    `当前版本` 与 `时间戳`，让前端能提示用户「别处改过了，要不要重载」。
+
+    id 白名单 + abspath 双重校验完全走 `_方案文件路径`（W31 安全基线，
+    一个字不放松）；PUT **不创建新存档**——id 不存在回 404，避免调用方
+    自造 id 往目录里塞文件。
+    """
+    if not isinstance(body, dict):
+        raise _请求错误('请求体必须是对象')
+    if _F期望版本 not in body:
+        raise _请求错误('缺少「%s」——原地更新必须带 GET 时拿到的版本，'
+                      '否则无法判断存档是否已被别处改过' % _F期望版本)
+    期望版本 = body.get(_F期望版本)
+    if not isinstance(期望版本, str) or not 期望版本:
+        raise _请求错误('「%s」必须是非空字符串' % _F期望版本)
+
+    方案原始 = body.get(_F方案)
+    if not isinstance(方案原始, dict):
+        raise _请求错误('「方案」必须是 JSON 对象')
     try:
-        with open(目标, 'r', encoding='utf-8') as f:
-            档 = json.load(f)
-    except (OSError, ValueError) as e:
-        raise _请求错误('存档读取失败：%s' % e, 状态=500)
-    if not isinstance(档, dict) or _F方案 not in 档:
-        raise _请求错误('存档格式错误：缺少「方案」', 状态=500)
-    return 档
+        schema.ensure_plan(方案原始)
+    except schema.SchemaError as e:
+        raise _请求错误(str(e))
+    方案 = _校验块存在(方案原始)
+
+    自定义标题 = body.get(_F标题)
+    if 自定义标题 is not None and not isinstance(自定义标题, str):
+        raise _请求错误('「标题」必须是字符串')
+
+    旧档, 旧原始 = _读存档(id)          # 不存在 → 404
+    当前版本 = _版本标记(旧原始)
+    if 当前版本 != 期望版本:
+        raise _请求错误(
+            '方案「%s」已被别处修改（期望版本 %s，当前 %s）——'
+            '请重新载入后再保存，或另存为新方案'
+            % (id, 期望版本, 当前版本), 状态=409)
+
+    标题 = (码点截断((自定义标题 or '').strip(), MAX_TITLE_CHARS)
+            or 旧档.get(_F标题) or _提标题(方案))
+    时间戳 = _当前时间戳()
+    存档 = schema.make_saved_plan(id=id, 标题=标题, 时间戳=时间戳, 方案=方案)
+    数据 = json.dumps(存档, ensure_ascii=False).encode('utf-8')
+    if len(数据) > MAX_PLAN_BYTES:
+        raise _请求错误('方案序列化后 %d 字节，超过单档上限 %d 字节'
+                      % (len(数据), MAX_PLAN_BYTES), 状态=413)
+    根 = _确保根目录()
+    # 更新不新增条数，总量按「减旧加新」算——照 `方案_存` 的口径会把旧档重复计一次
+    if _目录总字节数(根) - len(旧原始) + len(数据) > MAX_STORE_BYTES:
+        raise _请求错误('存档总量已达上限 %d 字节，请先删旧的' % MAX_STORE_BYTES,
+                      状态=413)
+
+    _原子写(根, _方案文件路径(id), 数据)
+    结果 = schema.make_saved_plan_summary(id=id, 标题=标题, 时间戳=时间戳)
+    结果 = dict(结果)
+    结果[_F版本] = _版本标记(数据)      # 回新版本，前端可继续连续更新
+    return 结果
 
 
 def 方案_删(id: str) -> dict:
@@ -829,6 +932,9 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._分发(self._POST)
 
+    def do_PUT(self) -> None:
+        self._分发(self._PUT)
+
     def do_DELETE(self) -> None:
         self._分发(self._DELETE)
 
@@ -875,6 +981,14 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
             raise _请求错误('未知端点 %s（DELETE 只有 %s<id>）'
                           % (路径, _方案id前缀), 状态=404)
         self._发JSON(200, 方案_删(self._取方案id(路径)))
+
+    def _PUT(self) -> None:
+        """PUT 只服务 `/api/方案/<id>`（W46 原地更新）。其余 404。"""
+        路径 = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        if 路径 == _方案列路径 or not 路径.startswith(_方案id前缀):
+            raise _请求错误('未知端点 %s（PUT 只有 %s<id>）'
+                          % (路径, _方案id前缀), 状态=404)
+        self._发JSON(200, 方案_更新(self._取方案id(路径), self._读body()))
 
     def _分发(self, 处理) -> None:
         """统一的异常边界：调用方的错 → 4xx，我们的错 → 500。

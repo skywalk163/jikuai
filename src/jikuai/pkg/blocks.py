@@ -1150,40 +1150,44 @@ def check_level_consistency(root=None, roots=None, blocks=None) -> List[str]:
 
 
 def check_stability_propagation(root=None, roots=None, blocks=None) -> List[str]:
-    """G13 扩展：stable L3 不得依赖 experimental L2/L3（ADR-28 §3.2）。
+    """G13 扩展：stable 的**聚合块（L2+）不得依赖任何非 stable 块**（ADR-28 §3.2）。
 
-    这是 ADR-27 §2.5「stable 不得依赖 experimental」的**向上扩展**：那条规则
-    当时只写了规范没落校验，本函数把它在**聚合层**落地。返回问题串列表，
-    空 = 门禁绿。
+    这是 ADR-27 §2.5「stable 不得依赖 experimental」的落地。v0.17.0 W44 把
+    ADR-28 原先刻意收窄的两处一并放开（原规则只查「依赖方是 L3 且被依赖方是
+    L2+」，见下方历史说明）：
 
-    刻意收窄的两处，都是为了不追溯存量（见 ADR-28 §5 已知欠账）：
-
-    - 只查**依赖方是 L3** 的情形。stable L2 依赖 experimental L1 是 v0.14.0
-      就有的既有形态（`工资条`→`税单`、`用户档案`→`姓名拆分`/`地址剖解`），
-      本轮不追溯，否则门禁一上线就是红的。
-    - 只查**被依赖方是 L2+** 的情形。stdlib 现有 26 个 experimental 的
-      L0/L1 原子块，跨域 L3 几乎不可能完全避开它们；聚合层的真风险来自
-      场景块之间的传递，不是叶子。
+    - **依赖方**从「恰好 L3」放宽到 `层级 >= AGGREGATE_LEVEL`（L2 与 L3）
+    - **被依赖方**从「L2+」放宽到**任意层级**（含 L0/L1 叶子块）
 
     `deprecated` 依赖同样拒——它比 experimental 更糟（承诺要移除的东西，
-    stable 块不该压在上面）。
+    stable 块不该压在上面）。返回问题串列表，空 = 门禁绿。
+
+    **为什么 W44 敢放开**：ADR-28 §3.2 当年收窄的唯一理由是「门禁上线即红」——
+    存量有 3 处违规（`工资条`→`税单`、`用户档案`→`姓名拆分`/`地址剖解`），
+    会逼着 W29 做无关的存量治理。W44 的任务本身就是清这笔账：三个被依赖块的
+    接口形状（元组元数）已定型不打算再改，`稳定性` 字段承诺的是**接口兼容**
+    而不是「解析准确率」，故一并提为 stable，规则随之放开到全量强度。
+
+    **依赖方仍只查 L2+**：叶子块之间（stable L0 依赖 experimental L0）不查。
+    `稳定性` 对叶子的意义是「这个工具函数的签名会不会变」，把传递性一路压到
+    L0 会让 83 个原子块互相绑死，收益远小于代价。要收这一层得另立 ADR。
     """
     blocks = _resolve_blocks(root, roots, blocks)
     by_name = {b.name: b for b in blocks}
     问题 = []
     for b in blocks:
-        if b.level != L3_LEVEL or b.stability != 'stable':
+        if b.level < AGGREGATE_LEVEL or b.stability != 'stable':
             continue
         for dep in sorted(b.dep_blocks):
             meta = by_name.get(dep)
-            if meta is None or meta.level < AGGREGATE_LEVEL:
+            if meta is None:
                 continue
             if meta.stability != 'stable':
                 问题.append(
-                    'stable 的 L3 块「%s」依赖 %s 的 L%d 块「%s」'
-                    '（稳定性传递违规，ADR-28 §3.2：stable L3 的 L2+ 依赖'
+                    'stable 的 L%d 块「%s」依赖 %s 的 L%d 块「%s」'
+                    '（稳定性传递违规，ADR-28 §3.2：stable 聚合块的依赖'
                     '必须也是 stable）'
-                    % (b.name, meta.stability, meta.level, dep))
+                    % (b.level, b.name, meta.stability, meta.level, dep))
     return 问题
 
 

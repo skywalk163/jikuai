@@ -216,7 +216,11 @@ class TestL3层级一致性:
 # ---------------------------------------------------------------------------
 
 class Test稳定性传递:
-    """`check_stability_propagation`：stable L3 的 L2+ 依赖必须也是 stable。"""
+    """`check_stability_propagation`：stable 聚合块（L2+）的全部依赖必须也是 stable。
+
+    v0.17.0 W44 把 ADR-28 §3.2 原先刻意收窄的两处放开到全量强度：
+    依赖方从「恰好 L3」放宽到 L2+，被依赖方从「L2+」放宽到任意层级。
+    """
 
     def test_stable_L3依赖experimental_L2_被拒(self, tmp_path):
         """核心违规形态。"""
@@ -250,18 +254,36 @@ class Test稳定性传递:
                  依赖块=['稳L2甲', '稳L2乙']))
         assert check_stability_propagation(root=str(tmp_path)) == []
 
-    def test_experimental_L1依赖不追溯(self, tmp_path):
-        """ADR-28 §3.2 明确不管 stable L3 → experimental L1。"""
+    def test_stable_L3依赖experimental_L1_也被拒(self, tmp_path):
+        """W44 起被依赖方放宽到任意层级——叶子块也算（原先此形态放行）。"""
         _put(tmp_path, '数据', _mk('实验L1', 1, '数据', 稳定性='experimental'))
         _put(tmp_path, '财务', _mk('稳L2甲', 2, '财务', 稳定性='stable'))
         _put(tmp_path, '财务', _mk('稳L2乙', 2, '财务', 稳定性='stable'))
         _put(tmp_path, '财务',
              _mk('稳L3', 3, '财务', 稳定性='stable',
                  依赖块=['稳L2甲', '稳L2乙', '实验L1']))
+        问题 = check_stability_propagation(root=str(tmp_path))
+        assert len(问题) == 1
+        assert '稳L3' in 问题[0] and '实验L1' in 问题[0]
+
+    def test_stable_L2依赖experimental_L1_被拒(self, tmp_path):
+        """W44 新覆盖形态：依赖方放宽到 L2+，这正是存量 `工资条`→`税单` 的形状。"""
+        _put(tmp_path, '财务', _mk('实验L1', 1, '财务', 稳定性='experimental'))
+        _put(tmp_path, '财务',
+             _mk('稳L2', 2, '财务', 稳定性='stable', 依赖块=['实验L1']))
+        问题 = check_stability_propagation(root=str(tmp_path))
+        assert len(问题) == 1
+        assert '稳L2' in 问题[0] and '实验L1' in 问题[0]
+
+    def test_stable_L1叶子依赖experimental_不查(self, tmp_path):
+        """依赖方仍只查 L2+：叶子之间不互相绑死（要收这层得另立 ADR）。"""
+        _put(tmp_path, '数据', _mk('实验L0', 0, '数据', 稳定性='experimental'))
+        _put(tmp_path, '数据',
+             _mk('稳L1', 1, '数据', 稳定性='stable', 依赖块=['实验L0']))
         assert check_stability_propagation(root=str(tmp_path)) == []
 
     def test_experimental_L3自身不受本规则约束(self, tmp_path):
-        """规则只压 stable L3；experimental L3 依赖谁都随意。"""
+        """规则只压 stable 聚合块；experimental 的依赖谁都随意。"""
         _put(tmp_path, '财务',
              _mk('实L2', 2, '财务', 稳定性='experimental'))
         _put(tmp_path, '财务', _mk('稳L2', 2, '财务', 稳定性='stable'))
@@ -269,6 +291,10 @@ class Test稳定性传递:
              _mk('实L3', 3, '财务', 稳定性='experimental',
                  依赖块=['实L2', '稳L2']))
         assert check_stability_propagation(root=str(tmp_path)) == []
+
+    def test_内置块库零违规(self):
+        """W44 收账后的实况钉板：stdlib 稳定性传递违规必须为 0。"""
+        assert check_stability_propagation() == []
 
 
 # ---------------------------------------------------------------------------

@@ -197,7 +197,7 @@ def main(argv):
     # 老分支没有这些函数就静默跳过，不阻塞既有门禁。
     #   1) 依赖环检测——依赖成环让层级失去偏序、粘合器链式推导打转
     #   2) 层级一致性——声明 L3 但依赖够不上 L3 判定（如只依赖 L1）
-    #   3) 稳定性传递——stable L3 不得依赖 experimental/deprecated 的 L2/L3
+    #   3) 稳定性传递——stable 聚合块（L2+）不得依赖任何非 stable 块（W44 起全量强度）
     # 三者都只扫内置块库（第三方块不拖红内置门禁，同 G14 策略）。
     try:
         from jikuai.pkg.blocks import (
@@ -219,7 +219,7 @@ def main(argv):
             exit_code = exit_code or 1
         稳定性问题 = check_stability_propagation()
         if 稳定性问题:
-            print("G13+ L3 稳定性传递违规（%d 处）：" % len(稳定性问题))
+            print("G13+ 聚合块稳定性传递违规（%d 处）：" % len(稳定性问题))
             for 条 in 稳定性问题:
                 print("  - %s" % 条)
             exit_code = exit_code or 1

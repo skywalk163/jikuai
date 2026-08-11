@@ -7,9 +7,9 @@
   开发依赖被拍成快照）。相对路径以「引用它的清单」所在目录为基准。
 - `仓库`：git 仓库。用 `git clone --depth 1` 抓，指定标签时用 `--branch`。
   `git` 不在 PATH 时立即报错，不去尝试拼接 HTTP 或 hackish 降级。
-- `注册表`：预留占位，MVP 尚未部署中央仓库。触发时抛明确的「未实现」，
-  不要 silently 降级——中央仓库上线之前，用户被逼着显式声明来源，
-  这比装出一副能工作的样子更诚实。
+- `注册表`：已接本地/内网文件系统注册表（M11-1 落地）。`registry.lookup`
+  按 `JIKUAI_REGISTRY` → `~/.jikuai/注册表` 查找本地索引，装不到明确报错。
+  **HTTP 远程注册表分发待 v0.20.0**（需先接入 token 鉴权 + 包签名）。
 
 安全底线：所有磁盘写入路径都用 `_ensure_within(base, target)` 校验，
 杜绝路径穿越；`subprocess` 全部走 `shell=False` + 显式 argv 列表。

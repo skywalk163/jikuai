@@ -43,6 +43,16 @@ cd editors/vscode
 `build.ps1` 会：检查 node/npm → `npm install` → `npm run compile`（tsc）→
 `npx @vscode/vsce package` → 报告产出的 `.vsix` 路径。
 
+> **不用 `build.ps1` 而手工打包时，必须先 `npm install`**：
+> ```powershell
+> cd editors/vscode
+> npm install                    # 缺这一步下一行必失败
+> npx @vscode/vsce package
+> ```
+> `vsce package` 会触发 `vscode:prepublish → npm run compile → tsc`，本机
+> `node_modules/` 没装时报 `'tsc' 不是内部或外部命令`。`build.ps1` 已内建这一步，
+> 手工路径容易漏。
+
 > **需要 Node.js**：打包扩展是 Node 工具链（vsce）的活，LSP/DAP 侧是纯 Python
 > 不需要 Node。本机没装 Node 时 `build.ps1` 会明确报错并给安装指引
 > （`winget install OpenJS.NodeJS.LTS` 或 https://nodejs.org ）。
@@ -50,12 +60,18 @@ cd editors/vscode
 ### 第 3 步：VS Code「从 VSIX 安装」
 
 - 图形界面：扩展面板 → 右上角 `⋯` → **从 VSIX 安装…** → 选第 2 步产出的 `.vsix`。
-- 或命令行：
+- 或命令行（版本号跟随 `editors/vscode/package.json`）：
   ```powershell
-  code --install-extension jikuai-vscode-0.16.0.vsix
+  code --install-extension jikuai-vscode-0.18.0.vsix
   ```
 
 装完打开任意 `.jk` 文件即可激活。
+
+> **装完只有语法高亮、没有 hover / 补全？** 说明扩展启动 LSP 失败，几乎总是
+> 第 1 步没做：`jikuai` 与 `jikuai_lsp` 两个包都得装（`pip install -e .` +
+> `pip install -e lsp/`），然后 **Reload Window**。扩展起不来时会 catch 后
+> 静默降级并弹一条容易被忽略的 warning——排查看「极快 语言服务」输出通道
+> （见 Q4），或开发者工具 Console 搜 `[极快]`。
 
 ---
 

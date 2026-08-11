@@ -24,22 +24,29 @@
 并在最后清理，避免 Windows 上「目录非空无法替换」。
 """
 
+import json
 import os
 import shutil
 from typing import Dict, List, Optional, Tuple
 
 from .lockfile import Lockfile, save_lockfile
-from .manifest import Manifest
+from .manifest import Manifest, ManifestError, load_manifest
 from .resolver import ResolvedNode, resolve
 from .sources import FetchedSource, compute_checksum
 
 __all__ = [
-    'PACKAGES_DIR', 'InstallError', 'InstallReport',
+    'PACKAGES_DIR', 'BLOCK_ROOTS_INDEX', 'InstallError', 'InstallReport',
     'packages_dir', 'install', 'uninstall', 'installed_packages',
+    'read_block_roots_index',
 ]
 
 #: 依赖安装目录名。与 `包.json` / `包.锁` 同属中文命名族。
 PACKAGES_DIR = '极快_包'
+
+#: 已装块根索引文件名（ADR-32 §2.3）。装完后由 installer 维护，
+#: 供 `extra_roots()`（发现）与 `module_loader._search_paths()`（执行）双侧读取。
+BLOCK_ROOTS_INDEX = '.块根.json'
+BLOCK_ROOTS_INDEX_VERSION = 1
 
 #: 拷贝时跳过的目录：版本库元数据、Python 缓存、嵌套依赖目录。
 _SKIP_DIRS = frozenset({'.git', '.hg', '.svn', '__pycache__',
@@ -73,8 +80,6 @@ def packages_dir(project_root: str) -> str:
 
 def installed_packages(project_root: str) -> Dict[str, str]:
     """扫描 `极快_包/`，返回 `名称 -> 版本`。目录不存在时返回空字典。"""
-    from .manifest import load_manifest, ManifestError
-
     base = packages_dir(project_root)
     if not os.path.isdir(base):
         return {}
@@ -150,12 +155,104 @@ def _prune(base: str, keep: set) -> List[str]:
     return removed
 
 
+def _收集块根(base: str, names) -> List[dict]:
+    """遍历给定包名，收集其 `包.json` 声明且实际存在的块根，返回索引条目。
+
+    每条 `{"包": 名称, "路径": 相对极快_包的posix路径}`。路径按 `/` 分隔存放
+    （跨平台可读、可提交）；不存在的块根跳过（包声明了 `块` 但没带上对应目录
+    时不该让整个安装失败）。
+    """
+    条目: List[dict] = []
+    for name in sorted(names):
+        pkg_dir = os.path.join(base, name)
+        manifest_path = os.path.join(pkg_dir, '包.json')
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            roots = load_manifest(pkg_dir).block_roots
+        except ManifestError:
+            continue
+        for rel in roots:
+            块根 = os.path.normpath(os.path.join(pkg_dir, rel))
+            # 复用 manifest 的逃逸校验后这里再兜一层：必须落在包目录内
+            if os.path.commonpath([os.path.abspath(pkg_dir),
+                                   os.path.abspath(块根)]) \
+                    != os.path.abspath(pkg_dir):
+                continue
+            if not os.path.isdir(块根):
+                continue
+            相对 = os.path.relpath(块根, base).replace(os.sep, '/')
+            条目.append({'包': name, '路径': 相对})
+    return 条目
+
+
+def _写块根索引(base: str, names) -> None:
+    """按当前有效包集**重建**块根索引 `极快_包/.块根.json`（ADR-32 §2.3）。
+
+    重建而非增量改——`names` 是本次安装解析出的全量包集（`_prune` 的 keep），
+    是「当前有效块包」的真相源，据它重写可保证索引与磁盘一致、无卸载残留。
+    没有任何块根时删掉索引文件（让「没有块包」= 没有文件，语义干净）。
+    """
+    index_path = os.path.join(base, BLOCK_ROOTS_INDEX)
+    条目 = _收集块根(base, names)
+    if not 条目:
+        if os.path.isfile(index_path):
+            os.remove(index_path)
+        return
+    data = {'索引版本': BLOCK_ROOTS_INDEX_VERSION, '块根': 条目}
+    text = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
+    tmp = index_path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+    os.replace(tmp, index_path)
+
+
+def read_block_roots_index(base: str) -> List[str]:
+    """读 `极快_包/.块根.json`，返回块根**绝对路径**列表（ADR-32 §2.3）。
+
+    供 `blocks.extra_roots()`（发现侧，直接用这些路径）与
+    `module_loader._search_paths()`（执行侧，取每条的 dirname）共用。
+
+    `base` 是 `极快_包/` 目录。文件不存在返回空；版本不匹配拒读（返回空并
+    不报错——门禁不该因为一个可选索引文件挡住 `导入`，与 `包.锁` 版本拒读
+    的强硬程度区别对待）；只保留实际存在的目录。
+    """
+    index_path = os.path.join(base, BLOCK_ROOTS_INDEX)
+    if not os.path.isfile(index_path):
+        return []
+    try:
+        with open(index_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) \
+            or data.get('索引版本') != BLOCK_ROOTS_INDEX_VERSION:
+        return []
+    结果: List[str] = []
+    见过 = set()
+    for 条 in data.get('块根') or []:
+        if not isinstance(条, dict):
+            continue
+        rel = 条.get('路径')
+        if not isinstance(rel, str) or not rel:
+            continue
+        abs_p = os.path.normpath(os.path.join(base, rel))
+        if abs_p in 见过:
+            continue
+        见过.add(abs_p)
+        if os.path.isdir(abs_p):
+            结果.append(abs_p)
+    return 结果
+
+
 def install(root: Manifest, include_dev: bool = False,
             prune: bool = True) -> InstallReport:
     """解析并安装根清单的全部依赖，写回锁文件。
 
     `prune=True` 时会清掉 `极快_包/` 里已不再被依赖的包，
     使安装目录与清单保持严格一致（对齐 `npm ci` 而非 `npm install`）。
+    装完按当前有效包集重建块根索引（ADR-32 §2.3），让携带块的第三方包
+    能被 `scan_blocks`（发现）与 `导入`（执行）双侧看见。
     """
     project_root = root.root
     base = packages_dir(project_root)
@@ -190,6 +287,10 @@ def install(root: Manifest, include_dev: bool = False,
             report.removed = _prune(base, {n.name for n in nodes})
 
         report.lock_path = save_lockfile(lock)
+        # 按当前有效包集重建块根索引（ADR-32 §2.3）——放在 prune 之后，
+        # keep 集合即当前磁盘上应有的包，据它重写避免卸载残留。
+        if os.path.isdir(base):
+            _写块根索引(base, {n.name for n in nodes})
         return report
     finally:
         for src in cleanup:
@@ -198,7 +299,11 @@ def install(root: Manifest, include_dev: bool = False,
 
 
 def uninstall(project_root: str, name: str) -> bool:
-    """删除已安装的包目录。返回是否真的删掉了东西。"""
+    """删除已安装的包目录。返回是否真的删掉了东西。
+
+    删除后重建块根索引——如果被卸载的包携带块，它的块根条目要同步消失
+    （ADR-32 §2.3「重建而非增量改」纪律）。
+    """
     base = packages_dir(project_root)
     target = os.path.join(base, name)
     # 名称已由 validate_package_name 收敛，这里再兜一层：必须是直接子目录
@@ -207,4 +312,8 @@ def uninstall(project_root: str, name: str) -> bool:
     if not os.path.isdir(target):
         return False
     shutil.rmtree(target, ignore_errors=True)
+    # 重建索引：扫当前剩余包
+    剩余 = {entry for entry in os.listdir(base)
+            if not entry.startswith('.') and os.path.isdir(os.path.join(base, entry))}
+    _写块根索引(base, 剩余)
     return True

@@ -137,6 +137,13 @@ class ModuleLoader:
         pkg_dir = self._packages_dir(current_file)
         if pkg_dir:
             paths.append(pkg_dir)
+            # ADR-32 §2.3 执行侧：把已装块包的块根「父目录」加进搜索路径，
+            # 让 `从 blocks.<命名空间>.<领域>.<块> 导入 ...` 能解析到第三方
+            # 块包携带的块。块根语义是「blocks/ 那一级」，而 dotpath 解析要的
+            # 是它的父目录（`<父>/blocks/...`）。挂在 stdlib 之前——第三方块
+            # 可被内置块遮蔽，与发现侧「内置优先」一致。
+            for parent in self._block_root_parents(pkg_dir):
+                paths.append(parent)
         here = os.path.dirname(os.path.abspath(__file__))
         stdlib_dir = os.path.normpath(os.path.join(here, '..', '..', 'stdlib'))
         paths.append(stdlib_dir)
@@ -146,6 +153,47 @@ class ModuleLoader:
                 if p:
                     paths.append(p)
         return paths
+
+    #: 已装块根索引文件名。与 `jikuai.pkg.installer.BLOCK_ROOTS_INDEX` 一致；
+    #: 这里用字面量而非 import，避免核心加载路径依赖包管理子包（同 PACKAGES_DIR）。
+    _BLOCK_ROOTS_INDEX = '.块根.json'
+    _BLOCK_ROOTS_INDEX_VERSION = 1
+
+    def _block_root_parents(self, pkg_dir):
+        """读 `极快_包/.块根.json`，返回每个块根的**父目录**（供 dotpath 解析）。
+
+        直接读文件、不 import pkg——与 `PACKAGES_DIR` 字面量同理，核心加载
+        路径不该拉起包管理子包（含 git 的 sources）。文件缺失 / 版本不符
+        返回空。
+        """
+        import json
+        index_path = os.path.join(pkg_dir, self._BLOCK_ROOTS_INDEX)
+        if not os.path.isfile(index_path):
+            return []
+        try:
+            with open(index_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        if (not isinstance(data, dict)
+                or data.get('索引版本') != self._BLOCK_ROOTS_INDEX_VERSION):
+            return []
+        parents = []
+        seen = set()
+        for 条 in data.get('块根') or []:
+            if not isinstance(条, dict):
+                continue
+            rel = 条.get('路径')
+            if not isinstance(rel, str) or not rel:
+                continue
+            块根 = os.path.normpath(os.path.join(pkg_dir, rel))
+            parent = os.path.dirname(块根)
+            if parent in seen:
+                continue
+            seen.add(parent)
+            if os.path.isdir(parent):
+                parents.append(parent)
+        return parents
 
     def _packages_dir(self, current_file):
         """从当前文件所在目录向上找 `包.json`，返回其同级 `极快_包/`。

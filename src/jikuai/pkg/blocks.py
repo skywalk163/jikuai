@@ -310,29 +310,93 @@ def blocks_root() -> str:
 
 
 def extra_roots() -> List[str]:
-    """第三方块根列表（ADR-27 §2.1），读自环境变量 `JIKUAI_PKG_ROOTS`。
+    """第三方块根列表（ADR-27 §2.1 + ADR-32 §2.3），供 `scan_blocks` 发现。
 
-    语义与 `blocks_root()` 同层级——**每条路径直接指向 `blocks/` 那一级**，
-    其下第一级子目录即命名空间。多路径按 `os.pathsep` 分隔（Windows `;`，
-    POSIX `:`），与 `PYTHONPATH` 习惯一致。
+    两路来源合并（都指向「`blocks/` 那一级」，其下第一级子目录即命名空间）：
+
+    1. **环境变量 `JIKUAI_PKG_ROOTS`**（优先，保留原语义）——手工接入通道，
+       多路径按 `os.pathsep` 分隔（Windows `;`，POSIX `:`）。
+    2. **已装块根索引** `极快_包/.块根.json`（ADR-32）——从当前目录上溯找到的
+       项目根下由 installer 维护，让 `jk 包 装` 装进来的携带块的包被检索到。
 
     过滤规则：空串跳过；不是已存在目录的跳过（配错路径不该让整个块生态崩，
-    只是那个根不生效）；去重但保序（先出现的优先，与合并规则的"先到先得"
-    一致）。返回绝对路径列表。
+    只是那个根不生效）；去重但保序（环境变量在前，先出现的优先）。返回绝对
+    路径列表。
     """
-    raw = os.environ.get(PKG_ROOTS_ENV, '')
     结果: List[str] = []
     见过 = set()
-    for 段 in raw.split(os.pathsep):
-        段 = 段.strip()
-        if not 段:
-            continue
-        abs_p = os.path.abspath(段)
+
+    def _收(abs_p: str) -> None:
         if abs_p in 见过:
-            continue
+            return
         见过.add(abs_p)
         if os.path.isdir(abs_p):
             结果.append(abs_p)
+
+    raw = os.environ.get(PKG_ROOTS_ENV, '')
+    for 段 in raw.split(os.pathsep):
+        段 = 段.strip()
+        if 段:
+            _收(os.path.abspath(段))
+
+    # 已装块根索引（ADR-32 §2.3）。直接读文件、不 import installer——与
+    # module_loader 一样刻意不让块扫描路径依赖包管理安装链（含 git 的 sources）。
+    for abs_p in _读块根索引():
+        _收(abs_p)
+
+    return 结果
+
+
+#: 已装块根索引文件名。与 `installer.BLOCK_ROOTS_INDEX` 一致；此处用字面量
+#: 而非 import，避免块扫描依赖包管理安装链（沿用 module_loader 的做法）。
+_BLOCK_ROOTS_INDEX = '.块根.json'
+_BLOCK_ROOTS_INDEX_VERSION = 1
+
+
+def _find_project_root(start: Optional[str] = None) -> Optional[str]:
+    """从 `start`（默认当前目录）向上找含 `包.json` 的目录。找不到返回 None。
+
+    与 `module_loader._find_project_root` 同口径——项目根 = 第一个含清单的祖先。
+    """
+    here = os.path.abspath(start or os.getcwd())
+    if os.path.isfile(here):
+        here = os.path.dirname(here)
+    while True:
+        if os.path.isfile(os.path.join(here, '包.json')):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+
+
+def _读块根索引(project_root: Optional[str] = None) -> List[str]:
+    """读项目根下 `极快_包/.块根.json`，返回块根**绝对路径**列表（ADR-32 §2.3）。
+
+    没有项目根 / 文件 / 版本不符 都返回空——一个可选索引文件不该挡住块扫描。
+    """
+    root = _find_project_root() if project_root is None else project_root
+    if not root:
+        return []
+    index_path = os.path.join(root, '极快_包', _BLOCK_ROOTS_INDEX)
+    if not os.path.isfile(index_path):
+        return []
+    try:
+        with open(index_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) \
+            or data.get('索引版本') != _BLOCK_ROOTS_INDEX_VERSION:
+        return []
+    base = os.path.join(root, '极快_包')
+    结果: List[str] = []
+    for 条 in data.get('块根') or []:
+        if not isinstance(条, dict):
+            continue
+        rel = 条.get('路径')
+        if isinstance(rel, str) and rel:
+            结果.append(os.path.normpath(os.path.join(base, rel)))
     return 结果
 
 

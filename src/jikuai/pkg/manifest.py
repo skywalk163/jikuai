@@ -168,6 +168,21 @@ class Manifest:
         return {k: v for k, v in raw.items() if isinstance(v, str)}
 
     @property
+    def block_roots(self) -> list:
+        """包携带的块根相对路径列表（ADR-32 §2.1）。
+
+        `块` 是可选顶层字段；缺失或空 = 普通包，不携带块。每条路径相对
+        包根解析，语义与 `JIKUAI_PKG_ROOTS` 每条路径一致（直接指向
+        `blocks/` 那一级）。合法性由 `_validate` 保证（字符串列表、每条不
+        含 `..` / 不是绝对路径），这里只做读取。
+        """
+        raw = self._data.get('块')
+        if raw is None:
+            return []
+        return list(raw)
+
+
+    @property
     def root(self) -> str:
         """包根目录（清单所在目录）。"""
         if self.path is None:
@@ -249,6 +264,39 @@ def _validate(data: dict, path: Optional[str]) -> None:
         table = data.get(key)
         if table is not None and not isinstance(table, dict):
             raise ManifestError(f'清单「{key}」必须是对象{where}')
+    _validate_block_roots(data.get('块'), where)
+
+
+def _validate_block_roots(raw, where: str) -> None:
+    """校验 `块` 字段（ADR-32 §2.1）：字符串列表，每条是包内相对路径。
+
+    安全边界：块根路径来自**第三方包的清单**，是新增的外部输入面。绝对
+    路径与 `..` 都会让安装器把块根指到包外，等于开一个目录穿越口子——
+    与 `入口` 字段的逃逸防护同一口径，在这里一次拦住。
+    """
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        raise ManifestError(f'清单「块」必须是数组{where}')
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise ManifestError(f'清单「块」的每一项必须是非空字符串{where}')
+        # 统一按两种分隔符看，避免平台差异放过某种形态
+        规整 = item.replace('\\', '/')
+        # `os.path.isabs` 在 Windows 上对 `/x`（无盘符）自 3.13 起返回 False，
+        # 所以显式查前导分隔符；再加盘符形态（`C:...`）与 POSIX 绝对路径。
+        if (规整.startswith('/') or os.path.isabs(item)
+                or (len(item) > 1 and item[1] == ':')):
+            raise ManifestError(
+                f'清单「块」的路径必须是包内相对路径，不允许绝对路径：'
+                f'{item!r}{where}')
+        段 = [s for s in 规整.split('/') if s]
+        if os.pardir in 段:
+            raise ManifestError(
+                f'清单「块」的路径不允许用 `..` 逃出包目录：{item!r}{where}')
+        if not 段:
+            raise ManifestError(f'清单「块」的路径不能只由分隔符组成{where}')
+
 
 
 def find_manifest(start: Optional[str] = None) -> Optional[str]:

@@ -230,10 +230,12 @@ def main(argv):
     except Exception as e:
         print("G13+ 跳过（%s）" % e)
 
-    # G15：版本号单一真源（W25 · v0.16.0）。`_version.__version__` 是唯一真源；
-    # pyproject（dynamic 引用它，解析后应相等）、CHANGELOG 最新条目、VS Code 扩展
-    # package.json 三处必须与之一致。历史上 pyproject/__init__/main/扩展四处停在
-    # 0.6.0 与实际发布 v0.15.0 脱节达九个版本，本门禁防止再次漂移。
+    # G15：版本号单一真源（W25 · v0.16.0；W60 · v0.18.0 补入扩展 CHANGELOG 第五处）。
+    # `_version.__version__` 是唯一真源；pyproject（dynamic 引用它，解析后应相等）、
+    # 根 CHANGELOG 最新条目、VS Code 扩展 package.json、**VS Code 扩展 CHANGELOG**
+    # 四处投影必须与之一致。历史上 pyproject/__init__/main/扩展四处停在 0.6.0 与
+    # 实际发布 v0.15.0 脱节达九个版本；扩展 CHANGELOG 又在 v0.17/v0.18 连续两轮
+    # 漏更——本门禁防止再次漂移。
     problems = _check_version_consistency()
     if problems:
         print("G15 版本号不一致（%d 处）：" % len(problems))
@@ -280,15 +282,38 @@ def _read_pyproject_version(source_version):
     return None
 
 
-def _read_changelog_version():
-    """CHANGELOG.md 最新条目版本号（首个 `## vX.Y.Z` 或 `## [X.Y.Z]`）。"""
-    path = os.path.join(REPO_ROOT, "CHANGELOG.md")
+def _read_changelog_version(path=None):
+    """CHANGELOG 最新条目版本号（首个 `## vX.Y.Z` 或 `## [X.Y.Z]`）。
+
+    `path` 缺省读仓库根 `CHANGELOG.md`。同一份解析口径也用于
+    `editors/vscode/CHANGELOG.md`——两份文件的标题格式不同
+    （根用 `## v0.18.0（日期）`，扩展用 `## [0.18.0] - 日期`），
+    但 `\\[?v?` 这一段同时吃得下，不必写两个正则。
+    """
+    if path is None:
+        path = os.path.join(REPO_ROOT, "CHANGELOG.md")
+    if not os.path.isfile(path):
+        return None
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             m = re.match(r"^##\s+\[?v?(\d+\.\d+\.\d+)", line.strip())
             if m:
                 return m.group(1)
     return None
+
+
+def _read_vscode_changelog_version():
+    """editors/vscode/CHANGELOG.md 最新条目版本号（G15 第五处 · W60）。
+
+    **为什么补这一处**：v0.17.0 与 v0.18.0 连续两轮漏更这份文件。G15 原本只管
+    `pyproject` / 根 `CHANGELOG` / `package.json` 三处比对真源，扩展自己的
+    CHANGELOG 落在覆盖盲区，只有 `tests/test_v0_6_0_vscode_grammar.py::
+    test_changelog_has_current_version_entry` 那个独立 pytest 兜着——而它跑在
+    pytest 阶段，改完版本号先跑门禁的人不会当场看到红。纳入 G15 后，
+    「改版本号 → 跑 check_stdlib_contract.py」一步就能发现漏更。
+    """
+    return _read_changelog_version(
+        os.path.join(REPO_ROOT, "editors", "vscode", "CHANGELOG.md"))
 
 
 def _read_vscode_version():
@@ -301,7 +326,11 @@ def _read_vscode_version():
 
 
 def _check_version_consistency():
-    """比对四处版本号，返回不一致描述列表（空 = 一致）。"""
+    """比对五处版本号，返回不一致描述列表（空 = 一致）。
+
+    真源是 `jikuai._version.__version__`；其余五处都只是它的投影。
+    第五处（扩展 CHANGELOG）在 W60 补入，理由见 `_read_vscode_changelog_version`。
+    """
     problems = []
     try:
         src = _read_source_version()
@@ -312,6 +341,7 @@ def _check_version_consistency():
         ("pyproject.toml", _read_pyproject_version(src)),
         ("CHANGELOG.md 最新条目", _read_changelog_version()),
         ("editors/vscode/package.json", _read_vscode_version()),
+        ("editors/vscode/CHANGELOG.md 最新条目", _read_vscode_changelog_version()),
     ]
     for 名, 值 in checks:
         if 值 is None:

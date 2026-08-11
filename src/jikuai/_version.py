@@ -8,8 +8,10 @@
 W25（v0.16.0）起这里是**唯一真源**：
 - `pyproject.toml` 通过 `[tool.setuptools.dynamic]` 引用它
 - `src/jikuai/__init__.py`、`src/jikuai/main.py` 都从这里导入
-- G15 门禁校验 `pyproject` / `__version__` / `CHANGELOG` / `editors/vscode/package.json`
-  四处一致，任何一处改动其它三处不同步 CI 都红
+- G15 门禁校验 `pyproject` / `CHANGELOG` / `editors/vscode/package.json` /
+  `editors/vscode/CHANGELOG.md` 四处投影与真源一致，任何一处改动其它不同步 CI 都红
+  （第四处「扩展 CHANGELOG」是 W60 / v0.18.0 补入的——v0.17.0 与 v0.18.0
+  连续两轮漏更它，此前只有一个独立 pytest 兜着，跑门禁的人当场看不到红）
 
 `BLOCK_INDEX_VERSION`（`src/jikuai/pkg/blocks.py`）刻意不并入这里 ——
 索引格式版本与语言版本解耦，是 v0.12.0 起的既定设计。

@@ -25,10 +25,11 @@
 
 ### 已知限制
 
-- `.vsix` **仍未真机验证**。v0.18.0 W57 计划做但未完成——需要装了 Node
-  工具链 + VS Code 的机器跑 `vsce package` 并实测 completion / hover /
-  documentSymbol / signatureHelp / references / rename / `极快.选块`。
-  当前状态是「代码就绪待人工验证」，不是「已发布可用」。
+- `.vsix` **已真机验证通过**（v0.18.0 W57）。用户验证环境：Node 工具链 + VS Code
+  + `pip install -e .` + `pip install -e lsp\`。打包 `vsce package` 成功产出
+  `jikuai-vscode-0.18.0.vsix`（14.63 KB）；安装后 LSP 拉起、hover / completion /
+  definition / references / rename / signatureHelp / `极快.选块` 七项能力可见。
+  两个 vsce warning（缺 `repository` 字段 + 缺独立 LICENSE 文件）不影响功能。
 
 ## [0.17.0] - 2026-08-11
 

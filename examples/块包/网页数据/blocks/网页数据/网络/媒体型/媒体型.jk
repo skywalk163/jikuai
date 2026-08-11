@@ -1,0 +1,25 @@
+-- 极快 v0.19.0 块包 · 网页数据.媒体型
+-- 原子块（层级 0）——按扩展名查表返回 MIME content-type。
+--
+-- 命名（ADR-15 §3.7）：
+--   原名 `MIME类型` / `媒体类型` 都因 `类(KEYWORD)` 被切成三段，改 `媒体型`。
+--   导出名 `媒型` 已验证单 IDENT。
+--
+-- 表是**手工收录的常用子集**，不追求覆盖 IANA 全表：
+--   浏览器工作台真实用到的大约就是网页三件套 + 常见图片/字体/文档/压缩包。
+--   收录不到的一律回落 `application/octet-stream`（RFC 2046 的兜底类型），
+--   而不是抛错——判定 MIME 失败不该中断上传/下载流程。
+--
+-- 输入不区分大小写（先 `小写`）。不接受带点的形式（传 "png" 而非 ".png"），
+-- 由调用方剥点：本块不猜测输入形态，保持可预测。
+
+函数 媒型 接收 赵扩展：
+  定义赵表={"html": "text/html", "htm": "text/html", "css": "text/css", "js": "text/javascript", "mjs": "text/javascript", "json": "application/json", "xml": "application/xml", "txt": "text/plain", "csv": "text/csv", "md": "text/markdown", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp", "ico": "image/vnd.microsoft.icon", "avif": "image/avif", "pdf": "application/pdf", "zip": "application/zip", "gz": "application/gzip", "wasm": "application/wasm", "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf", "mp3": "audio/mpeg", "mp4": "video/mp4", "webm": "video/webm"}。
+  定义赵键=小写 赵扩展。
+  如果 包含 赵表 赵键 那么：
+    返回 取值 赵表 赵键。
+  。
+  返回 "application/octet-stream"。
+。
+
+导出 媒型。

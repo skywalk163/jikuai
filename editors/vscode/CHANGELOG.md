@@ -2,6 +2,22 @@
 
 本扩展遵循 [语义化版本](https://semver.org/lang/zh-CN/)，版本号与主包 `jikuai` 对齐。
 
+## [0.17.0] - 2026-08-11
+
+版本号随主包对齐。本条目为 v0.18.0 W58 回归时补录——v0.17.0 发布时 `package.json`
+已升到 `0.17.0`，但本 CHANGELOG 漏更（G15 只校验 pyproject/根 CHANGELOG/package.json
+三处，未覆盖扩展 CHANGELOG），由 `test_changelog_has_current_version_entry` 逮出。
+
+### 扩展侧变化
+
+- 版本号随主包 v0.17.0 对齐（LSP 服务端本轮上线 `textDocument/references` 与
+  `textDocument/rename`，扩展通过 `vscode-languageclient` 透传，无需扩展侧改代码）。
+
+### 已知限制
+
+- 沿用 v0.16.0：`.vsix` 仍未在装了 Node 工具链的机器上真机验证；四点 DoD
+  （诊断 / hover / F12 / 选块）为「代码就绪待人工验证」。v0.18.0 W57 处理。
+
 ## [0.16.0] - 2026-08-10
 
 版本号随主包对齐（此前长期停在 `0.6.0`，与主包 v0.7.0-v0.15.0 脱节九个版本）。G15 门禁现已校验本文件版本号与主包一致。

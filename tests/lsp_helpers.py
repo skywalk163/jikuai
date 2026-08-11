@@ -127,17 +127,24 @@ def stop_lsp_process(proc: subprocess.Popen) -> None:
 # 协议对话辅助
 # ---------------------------------------------------------------------------
 
-def initialize(proc, msg_id: int = 1) -> Optional[Dict]:
-    """发送 initialize 请求并返回响应体。"""
+def initialize(proc, msg_id: int = 1, workspace_folders=None) -> Optional[Dict]:
+    """发送 initialize 请求并返回响应体。
+
+    workspace_folders：可选 `[{"uri": ..., "name": ...}]`（W54 多根 workspace 测试用）。
+    传 None 时不带该字段，等价于单根/无根客户端。
+    """
+    params: Dict[str, Any] = {
+        "processId": None,
+        "rootUri": None,
+        "capabilities": {},
+    }
+    if workspace_folders is not None:
+        params["workspaceFolders"] = workspace_folders
     write_frame(proc.stdin, {
         "jsonrpc": "2.0",
         "id": msg_id,
         "method": "initialize",
-        "params": {
-            "processId": None,
-            "rootUri": None,
-            "capabilities": {},
-        },
+        "params": params,
     })
     return read_until(
         proc.stdout,

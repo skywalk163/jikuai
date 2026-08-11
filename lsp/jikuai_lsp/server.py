@@ -601,6 +601,55 @@ class LspServer:
         候选目录 = Path(_blocks_root()) / 领域 / 块名
         return str(候选目录) if 候选目录.is_dir() else None
 
+    def _block_dirs_in_workspace_folders(self, dotpath: str) -> List[str]:
+        """W54：在 `workspaceFolders` 各根下按声明顺序搜 `<根>/blocks/<领域>/<块名>/`。
+
+        - `dotpath` 必须是 `blocks.<领域>.<块名>` 形态，否则空列表
+        - 返回**所有**命中的根内块目录（按 workspaceFolders 声明顺序）
+        - 空列表 → 多根里都没有
+
+        为什么返回全部而不是首个：调用方要判是否存在冲突（>1 个命中就发
+        `window/showMessage` 告诉用户「哪些根都定义了这个块，用了第一个」）。
+        """
+        parts = dotpath.split('.')
+        if len(parts) != 3 or parts[0] != 'blocks':
+            return []
+        领域, 块名 = parts[1], parts[2]
+        if not 领域 or not 块名:
+            return []
+        命中: List[str] = []
+        for folder_uri in self._workspace_folders:
+            folder_path = _uri_to_path(folder_uri)
+            if not folder_path:
+                continue
+            候选目录 = Path(folder_path) / 'blocks' / 领域 / 块名
+            if 候选目录.is_dir():
+                命中.append(str(候选目录))
+        return 命中
+
+    def _notify_multi_root_block_conflict(self, dotpath: str,
+                                          全部命中: List[str]) -> None:
+        """W54：多根 workspace 里同名块命中 >1 时告知用户「用了第一个」。
+
+        `window/showMessage` 是通知（无 id），不阻塞 definition 响应。级别 Info(3)。
+        """
+        if len(全部命中) <= 1:
+            return
+        try:
+            用了 = 全部命中[0]
+            忽略 = 全部命中[1:]
+            消息 = (
+                "多根 workspace 里 %s 在 %d 个根下都有定义，用了第一个：%s"
+                "（其余：%s）"
+            ) % (dotpath, len(全部命中), 用了, '、'.join(忽略))
+            self._send_notification("window/showMessage", {
+                "type": 3,  # Info
+                "message": 消息,
+            })
+        except Exception as e:
+            # 通知失败不影响 definition 主流程
+            self._logger.debug("多根冲突通知发送失败：%s", e)
+
     @staticmethod
     def _block_entry_in(块目录: str, 块名: str) -> Optional[str]:
         """块目录里的主文件：`<块名>.jk` 优先，`main.jk` 兜底。
@@ -623,8 +672,14 @@ class LspServer:
         解析顺序：
           1. 光标必须压在含 `.` 的 dotpath 上，否则 null。
           2. `blocks.<领域>.<块名>` → `blocks_root()/<领域>/<块名>/` 的入口 `.jk`。
-          3. 否则回落 `ModuleLoader.try_resolve`（覆盖用户块 / 三级 dotpath 优先级）。
-          4. 都不命中 → null。
+          3. **W54 新增**：`workspaceFolders` 各根下 `<根>/blocks/<领域>/<块名>/`，
+             按声明顺序第一个赢；命中 >1 个根时发 `window/showMessage` 告知。
+          4. 否则回落 `ModuleLoader.try_resolve`（覆盖文档自身目录的用户块）。
+          5. 都不命中 → null。
+
+        **为什么内建块优先于多根**：`blocks_root()` 是标准库，语义上是「语言自带」，
+        工作区不该悄悄遮蔽它——真要遮蔽会让同一段 `.jk` 在不同工作区行为不同，
+        且用户无从察觉。多根只补 `blocks_root()` 里没有的块。
         """
         _ensure_jikuai()
         host = self._get_host()
@@ -645,9 +700,20 @@ class LspServer:
 
         目标 = None
         try:
+            叶名 = dotpath.split('.')[-1]
             块目录 = self._block_dir_of(dotpath)
             if 块目录:
-                目标 = self._block_entry_in(块目录, dotpath.split('.')[-1])
+                目标 = self._block_entry_in(块目录, 叶名)
+            if not 目标:
+                # W54：多根 workspace。声明顺序第一个赢，冲突时告知用户。
+                多根命中 = self._block_dirs_in_workspace_folders(dotpath)
+                for 根内目录 in 多根命中:
+                    目标 = self._block_entry_in(根内目录, 叶名)
+                    if 目标:
+                        # 只有真拿到入口 .jk 才算命中，才报冲突
+                        self._notify_multi_root_block_conflict(
+                            dotpath, 多根命中)
+                        break
             if not 目标:
                 # current_file 从 uri 反推：ModuleLoader 以该目录为首个搜索路径，
                 # 用户块（工作区自建）由此命中。

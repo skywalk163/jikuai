@@ -24,7 +24,7 @@
 |------|------|--------|----------|
 | ~~`textDocument/rename`~~ —— **v0.17.0 W41 已上线**（跨文件 `WorkspaceEdit`；非原子新名被拒；块导出名被拒且给中文理由） | `lsp/README.md` | — | v0.17.0 已完成 |
 | ~~`textDocument/references`~~ —— **v0.17.0 W40 已上线**（跨文件，走 `service/symbol_index.py` 反向引用图） | `lsp/README.md` | — | v0.17.0 已完成 |
-| `textDocument/codeAction` —— v0.15.0/v0.16.0/v0.17.0 三轮判定可选并跳过；W41 可降级项实际未做，无新证据说明必要性 | `lsp/README.md` | 低 | v0.18.0 |
+| `textDocument/codeAction` —— v0.15.0/v0.16.0/v0.17.0/v0.18.0 四轮复审后明确关闭。理由见 `docs/ADR-31-不做codeAction.md`：14 个诊断码无一满足唯一机械修复、唯一候选用例已被 `极快.选块` 覆盖、四轮零社区诉求。重开条件见 ADR-31 §5 | `lsp/README.md` | 设计边界 | 不做（除非另立 ADR 推翻 ADR-31） |
 | `foldingRange` —— 未实现 | `lsp/README.md` | 低 | 待定 |
 | 增量诊断 —— `didChange` 已走增量同步，但诊断仍是整篇重编译 | `lsp/README.md` | 低 | 待定 |
 | ~~多根 workspace~~ —— **v0.17.0 W38 已接线**（`initialize` 解析并记录 `workspaceFolders`）；但 `definition` 的块路径解析仍只查 `blocks_root()` 与文档自身目录 | `lsp/README.md` | 低 | 部分完成 |

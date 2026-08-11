@@ -41,7 +41,7 @@ __all__ = [
     'SCALAR_TYPES', 'CONTAINER_TYPE_NAMES', 'UNION_TYPE_NAME',
     'VECTOR_INDEX_NAME', 'VECTOR_INDEX_META_NAME',
     'BlockError', 'BlockMetadata',
-    'NAMESPACE_KEY', 'BUILTIN_NAMESPACE', 'PKG_ROOTS_ENV',
+    'NAMESPACE_KEY', 'EXAMPLE_KEY', 'BUILTIN_NAMESPACE', 'PKG_ROOTS_ENV',
     'blocks_root', 'extra_roots', 'index_path', 'load_block_metadata',
     'find_block_files',
     'scan_blocks', 'generate_index', 'render_index', 'load_index',
@@ -140,6 +140,10 @@ _INDEX_ENTRY_KEYS = ('名称', '领域', '层级', '描述', '输入', '输出',
 #: **不进 `块.json` schema**——命名空间由目录布局决定，不该让发布者手填
 #: （手填必然与目录漂移，且 `_validate` 也没法交叉验证）。扫描时注入。
 NAMESPACE_KEY = '命名空间'
+
+#: 胖索引追加的「示例」键名（v0.18.0 · 集成反馈 P2）。
+#: **不进** `_INDEX_ENTRY_KEYS`——默认索引不带示例，只在 `含示例=True` 时追加。
+EXAMPLE_KEY = '示例'
 
 #: 内置块（`stdlib/blocks/`）的命名空间。空串，保证 `blocks.数据.求和`
 #: 这类既有引用形态一字不变（ADR-27 §2.2）。
@@ -256,8 +260,16 @@ class BlockMetadata:
     def to_dict(self) -> dict:
         return self._data
 
-    def to_index_entry(self) -> Dict[str, Any]:
-        """投影成索引条目（字段与顺序固定，见 `_INDEX_ENTRY_KEYS`）。"""
+    def to_index_entry(self, 含示例: bool = False) -> Dict[str, Any]:
+        """投影成索引条目（字段与顺序固定，见 `_INDEX_ENTRY_KEYS`）。
+
+        `含示例=True`（v0.18.0 · 集成反馈 P2）在末尾追加 `示例` 字段，产出
+        「胖索引」。**默认关**：`示例` 是文档期字段，进索引会白涨 token，而
+        索引的第一消费者是 AI Agent（见模块头「为什么索引里只有一个子集字段」）。
+        为「不在乎 token、在乎 I/O 次数」的下游（浏览器 / 单文件分发 / 离线包）
+        留这个出口——它们否则要为每个候选块回头读一次 `块.json`。
+        追加在**末尾**，理由同 `命名空间`：既有字段的行位不动，git diff 最小。
+        """
         entry = {
             '名称': self.name,
             '领域': self.domains,
@@ -269,7 +281,10 @@ class BlockMetadata:
             '稳定性': self.stability,
             NAMESPACE_KEY: self.namespace,
         }
-        return {k: entry[k] for k in _INDEX_ENTRY_KEYS}
+        out = {k: entry[k] for k in _INDEX_ENTRY_KEYS}
+        if 含示例:
+            out[EXAMPLE_KEY] = self.example
+        return out
 
     def __repr__(self):
         if self.namespace:
@@ -679,7 +694,8 @@ def scan_blocks(root: Optional[str] = None,
 def generate_index(root: Optional[str] = None,
                    version: str = BLOCK_INDEX_VERSION,
                    timestamp: Optional[str] = None,
-                   roots: Optional[List[str]] = None) -> dict:
+                   roots: Optional[List[str]] = None,
+                   含示例: bool = False) -> dict:
     """扫描块目录并构造索引结构（ADR-15 §3.4 / ADR-27 §2.4）。
 
     `timestamp` 省略时取本地当前时间，秒级精度的 ISO 8601（不带微秒——
@@ -689,13 +705,16 @@ def generate_index(root: Optional[str] = None,
     `scan_blocks()` 的缺省合并内置 + `JIKUAI_PKG_ROOTS`。**内置 stdlib 索引
     刻意只传 `root=blocks_root()`**（见 `scripts/generate_block_index.py`），
     避免把某台机器上配的第三方块写进版本控制的 `索引.json`。
+
+    `含示例=True`（v0.18.0 · 集成反馈 P2）产出「胖索引」——每条追加 `示例`
+    字段。默认关，见 `BlockMetadata.to_index_entry` 的取舍。
     """
     if timestamp is None:
         timestamp = datetime.now().replace(microsecond=0).isoformat()
     return {
         '版本': version,
         '生成时间': timestamp,
-        '块': [b.to_index_entry() for b in scan_blocks(root, roots)],
+        '块': [b.to_index_entry(含示例=含示例) for b in scan_blocks(root, roots)],
     }
 
 

@@ -56,6 +56,72 @@ __all__ = ['synthesize', 'result_var', 'TypeGraph', 'type_feeds', 'normalize_typ
 _占位符 = '?'
 
 
+# ---------------------------------------------------------------------------
+# 块元数据表（W55 · 集成反馈 P0/P1）—— 让 synthesize 也能拿到入参元数与示例
+# ---------------------------------------------------------------------------
+#
+# TypeGraph 已经在 `--自动链式` 路径下用 `scan_blocks` 把 `输入/输出` 灌进内存。
+# 但 P0（`?` 占位数与元数一致）与 P1（从块 `示例` 提取实参）在 `--自动链式`
+# 关闭时也要用，所以把 scan 结果抽成一个进程级弱缓存 `_块元数据表(root)`。
+# 键用绝对路径（None 用 '<default>' 兜底），生命周期与进程等长——scan_blocks
+# 单次 100+ 块耗时可观，重复 synthesize 不该反复扫盘。
+#
+# 缓存仅在测试或临时 root 变化时可能陈旧。测试要清空可调用 `reset_meta_cache()`。
+_块元数据缓存 = {}
+
+
+def _块元数据表(root=None):
+    key = os.path.abspath(root) if root else '<default>'
+    cached = _块元数据缓存.get(key)
+    if cached is not None:
+        return cached
+    from jikuai.pkg import blocks as _blocks_mod
+    meta = {}
+    for m in _blocks_mod.scan_blocks(root):
+        meta[m.name] = {
+            '输入': [dict(x) for x in m.inputs],
+            '输出': dict(m.output),
+            '示例': m.example or '',
+        }
+    _块元数据缓存[key] = meta
+    return meta
+
+
+def reset_meta_cache():
+    """清空块元数据进程级缓存（测试用）。"""
+    _块元数据缓存.clear()
+
+
+def _从示例提取实参(示例文本, 导出名):
+    r"""从块 `示例` 里定位第一处 `<导出名>(...)` 调用，返回括号内的原始实参串。
+
+    识别不到、括号不配对、内容为空 均返回 None——由调用方决定回落到占位符。
+    刻意用**逐字符括号平衡扫描**而非正则：JiKuai 表达式里允许再嵌 `(`（例如
+    `顺排(列 1 2 3)`），正则的 `\((.*?)\)` 会在第一个 `)` 处提前收工，把
+    `顺排(列 1 2 3` 当实参吐出去。
+    """
+    if not 示例文本 or not 导出名:
+        return None
+    prefix = 导出名 + '('
+    idx = 示例文本.find(prefix)
+    if idx < 0:
+        return None
+    start = idx + len(prefix)
+    depth = 1
+    i = start
+    while i < len(示例文本):
+        c = 示例文本[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                inner = 示例文本[start:i].strip()
+                return inner or None
+        i += 1
+    return None
+
+
 def result_var(i):
     """第 i 步（0 基）的结果变量名。
 
@@ -251,13 +317,8 @@ class TypeGraph:
     """
 
     def __init__(self, root=None):
-        from jikuai.pkg import blocks
-        self._meta = {}
-        for m in blocks.scan_blocks(root):
-            self._meta[m.name] = {
-                '输入': [dict(x) for x in m.inputs],
-                '输出': dict(m.output),
-            }
+        # 复用 `_块元数据表` 的进程级缓存，避免自动链式与占位路径各扫一遍盘。
+        self._meta = _块元数据表(root)
 
     def _block_inputs(self, 名):
         info = self._meta.get(名)
@@ -382,7 +443,7 @@ def _导入行(steps):
     return lines
 
 
-def synthesize(方案, 自动链式=False, root=None):
+def synthesize(方案, 自动链式=False, root=None, 用示例填参=False):
     """把选块方案（`docs/协议-三通道.md` 定义的 JSON）合成为极快源码字符串。
 
     参数校验走 `schema.ensure_plan`（三通道协议的唯一真源）：字段形状、`步骤`
@@ -392,6 +453,15 @@ def synthesize(方案, 自动链式=False, root=None):
 
     `自动链式=True` 时，对**缺 `参数`** 的步骤用 `TypeGraph` 按类型推断实参链；
     推不出的仍落 `?` 占位并把拒绝理由写进注释。
+
+    `用示例填参=True`（v0.18.0 · W55 · 集成反馈 P1）：**opt-in**——当步骤既没
+    手写 `参数`、又不是自动链式命中，则尝试从块 `示例` 里提取 `<导出名>(...)`
+    的实参串直接复用。默认 **关**：这条路径会把「块作者示例值」硬塞给方案，
+    在链式上下文里可能覆盖掉「本该接前步 赵果i」的语义。给嵌入式/浏览器等
+    「拿到即想跑」的场景一个 opt-in 出口即可，主链（Web/CLI/REPL）不动。
+
+    P0（v0.18.0 · W55 · 集成反馈）：落到 `?` 占位时，占位符个数与块 `输入`
+    元数一致；查不到元数据（未知块）才回退到单个 `?`。
 
     返回：以换行分隔、末尾带单个换行的极快源码。
     """
@@ -406,6 +476,13 @@ def synthesize(方案, 自动链式=False, root=None):
     if 自动链式:
         图 = TypeGraph(root=root)
         自动实参, _未匹配, 拒绝理由 = 图.plan(steps, 方案.get(_F共享))
+
+    # 元数据表（P0/P1）——占位路径 与 示例填参 都要用；未启用可选路径时
+    # 也用于查 `输入` 元数以生成对应个数的 `?`（这是纯正确性问题，无 opt-in）。
+    # 惰性：所有步骤都手写了 `参数` 就一个块都不用扫，Web `/api/组` 的常见
+    # 路径（前端把参数填齐了才提交）因此零额外开销。
+    _元数据 = (_块元数据表(root)
+               if any(s.get(_F参数) is None for s in steps) else {})
 
     lines = ['-- 由 极快 AI 桥接（选块 + 粘合%s）自动合成'
              % ('，类型图链式' if 自动链式 else '')]
@@ -440,14 +517,26 @@ def synthesize(方案, 自动链式=False, root=None):
             lines.append('-- 步骤 %d：%s' % (i + 1, s[_F说明]))
 
         参数 = s.get(_F参数)
+        块名 = s.get(_F块)
+        块元 = _元数据.get(块名) or {}
+        块输入 = 块元.get('输入') or []
+        块示例 = 块元.get('示例') or ''
+
         if 参数 is not None:
             实参 = ' '.join(str(p) for p in 参数)
         elif 自动实参 is not None and 自动实参[i] is not None:
             实参 = ' '.join(自动实参[i])
+        elif 用示例填参 and 块示例:
+            # P1（opt-in）：从块作者的示例里取实参串，逐字放回调用位。
+            示例实参 = _从示例提取实参(块示例, s[_F导出名])
+            if 示例实参:
+                lines.append('-- 用块示例填参（%s）：%s'
+                             % (s[_F导出名], 示例实参))
+                实参 = 示例实参
+            else:
+                实参 = _占位符生成(块输入, s[_F导出名], lines)
         else:
-            lines.append('-- 需人工填参：%s 的入参未指定（下一行的 %s 占位）'
-                         % (s[_F导出名], _占位符))
-            实参 = _占位符
+            实参 = _占位符生成(块输入, s[_F导出名], lines)
         lines.append('定义%s=%s(%s)。' % (var, s[_F导出名], 实参))
 
     # 4) 打印
@@ -459,15 +548,44 @@ def synthesize(方案, 自动链式=False, root=None):
     return '\n'.join(lines).rstrip() + '\n'
 
 
+def _占位符生成(块输入, 导出名, lines):
+    """P0：按 `输入` 元数生成 N 个 `?` 占位，注释里点明参数名。
+
+    - 元数 ≥ 1 且拿得到入参名 → `? ? ...` 空格拼接，与既有实参空格分隔口径一致；
+      注释形如 `-- 需人工填参：<导出名> 的入参未指定（下一行 N 个 ? 对应：名1, 名2）`
+    - 元数为 0 或元数据缺失 → 单个 `?` + 原文案（旧路径兼容——已有测试与
+      `_占位记号 = '需人工填参'` 的 Web 检查都吃这条文案）
+    """
+    n = len(块输入)
+    if n <= 0:
+        lines.append('-- 需人工填参：%s 的入参未指定（下一行的 %s 占位）'
+                     % (导出名, _占位符))
+        return _占位符
+    if n == 1:
+        # 单参数不带「N 个」，避免噪音；仍带参数名以便人一眼看出要填啥
+        名 = 块输入[0].get('名') or '参数1'
+        lines.append('-- 需人工填参：%s 的入参未指定（下一行的 %s 占位对应：%s）'
+                     % (导出名, _占位符, 名))
+        return _占位符
+    名单 = [ (x.get('名') or ('参数%d' % (k + 1)))
+             for k, x in enumerate(块输入) ]
+    lines.append('-- 需人工填参：%s 的入参未指定（下一行 %d 个 %s 对应：%s）'
+                 % (导出名, n, _占位符, ', '.join(名单)))
+    return ' '.join([_占位符] * n)
+
+
 def _cli(argv=None):
     p = argparse.ArgumentParser(description='极快块粘合合成器')
     p.add_argument('方案', help='选块方案 JSON 文件路径')
     p.add_argument('--自动链式', '--auto', action='store_true',
                    help='用类型图推断缺 参数 的步骤实参链（ADR-26）')
+    p.add_argument('--用示例填参', '--from-example', action='store_true',
+                   help='缺 参数 且未自动链上时，从块 `示例` 取实参（v0.18.0）')
     args = p.parse_args(argv)
     with open(args.方案, 'r', encoding='utf-8') as f:
         方案 = json.load(f)
-    sys.stdout.write(synthesize(方案, 自动链式=args.自动链式))
+    sys.stdout.write(synthesize(方案, 自动链式=args.自动链式,
+                                用示例填参=args.用示例填参))
     return 0
 
 

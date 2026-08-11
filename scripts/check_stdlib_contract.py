@@ -32,6 +32,10 @@ REPO_ROOT = os.path.normpath(os.path.join(HERE, ".."))
 SRC_PATH = os.path.join(REPO_ROOT, "src")
 if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
+# G16 要 `import check_protocol_doc`（同目录兄弟脚本）。直接跑脚本时解释器会
+# 自动把脚本目录放进 sys.path，但被测试以模块形式 import 时不会——显式加上。
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 from jikuai import stdlib_contract  # noqa: E402
 
@@ -235,6 +239,18 @@ def main(argv):
         print("G15 版本号不一致（%d 处）：" % len(problems))
         for 条 in problems:
             print("  - %s" % 条)
+        exit_code = exit_code or 1
+
+    # G16：协议文档同步（W55 · v0.18.0）。`docs/协议-三通道.md` 的 Web 端点清单
+    # 必须与 `tools/web/server.py` 的四张路由清单**双向**一致。v0.17.0 复盘发现
+    # W31/W46 六个新端点漂了一年半才被手工审计（W47）追上——文档漂移是 CI 该抓
+    # 的问题，不该靠人定期对账。
+    #
+    # 刻意**不**学 G13+ 的 `except → 跳过`：G13+ 的宽容是历史遗留（早期块库还没
+    # 补齐 `依赖块` 时不该红），而 G16 是新门禁，解析不了就是它自己坏了——静默
+    # 跳过等于门禁形同虚设，那正是它要防的病。
+    import check_protocol_doc
+    if check_protocol_doc.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
     return exit_code

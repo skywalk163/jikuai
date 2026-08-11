@@ -783,6 +783,18 @@ _POST路由 = {
 _方案列路径 = '/api/方案/列'
 _方案id前缀 = '/api/方案/'
 
+#: `<id>` 占位形态的规范写法——单资源端点在协议文档里写作 `/api/方案/<id>`，
+#: 与下面的路由清单口径一致（G16 门禁按此比对）。
+_方案id端点 = _方案id前缀 + '<id>'
+
+#: 非 POST 三方法的路由清单（W55 · G16 单一真源）。**既供 404 文案枚举、也供
+#: `scripts/check_protocol_doc.py` 比对文档**——两处共用一份，杜绝「文案/校验/
+#: 实际分派」三份各写一遍再漂开。GET 的两个固定端点 + 方案枚举 + 方案单资源；
+#: PUT / DELETE 只服务方案单资源。POST 见 `_POST路由`（真字典自成清单）。
+_GET路由 = ('/api/blocks', '/api/能力', _方案列路径, _方案id端点)
+_PUT路由 = (_方案id端点,)
+_DELETE路由 = (_方案id端点,)
+
 
 # ---- HTTP 层 -----------------------------------------------------------
 
@@ -958,9 +970,8 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
         elif 路径.startswith(_方案id前缀):
             self._发JSON(200, 方案_取(self._取方案id(路径)))
         elif 路径.startswith('/api/'):
-            raise _请求错误('未知端点 %s（GET 只有 /api/blocks、/api/能力、'
-                          '%s、%s<id>）' % (路径, _方案列路径, _方案id前缀),
-                          状态=404)
+            raise _请求错误('未知端点 %s（GET 只有 %s）'
+                          % (路径, '、'.join(_GET路由)), 状态=404)
         else:
             # 静态走**原始**（未 unquote）路径：`_解析静态路径` 内部只 unquote 一次，
             # 提前 unquote 会让 `%252e` 这类二次编码逃逸绕过校验。

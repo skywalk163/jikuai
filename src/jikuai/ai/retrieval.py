@@ -24,12 +24,15 @@
 
 import array
 import json
+import logging
 import math
 import os
 import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -71,15 +74,25 @@ class Hit:
     domain: str
     description: str
     path: str = field(default='', compare=False)  # 检索路径标签
+    #: 块 `示例`（v0.18.0 · 集成反馈 P2）。**只有当块库条目自带 `示例` 时才非空**
+    #: ——即索引由 `generate_index(含示例=True)` / `--with-examples` 生成的「胖索引」。
+    #: 默认索引不含 `示例`（token 成本优先，见 `pkg.blocks._INDEX_ENTRY_KEYS`），
+    #: 此时保持空串。`compare=False`：示例不参与排序/相等语义。
+    example: str = field(default='', compare=False)
 
     def as_dict(self) -> dict:
-        return {
+        d = {
             '名称': self.name,
             '领域': self.domain,
             '描述': self.description,
             '分数': round(self.score, 4),
             '路径': self.path,
         }
+        # 空示例不进字典：`选响应.候选` 的既有形状不变（schema 校验按可选字段
+        # 处理），token 敏感的调用方也不会平白多收一个空键。
+        if self.example:
+            d['示例'] = self.example
+        return d
 
 
 @dataclass
@@ -590,6 +603,7 @@ class Retriever:
                 domain=(block.get('领域') or ['?'])[0],
                 description=block.get('描述', ''),
                 path=PATH_HEURISTIC,
+                example=block.get('示例', ''),
             ))
         return hits
 
@@ -626,6 +640,7 @@ class Retriever:
                 domain=(block.get('领域') or ['?'])[0],
                 description=block.get('描述', ''),
                 path=PATH_NEURAL,
+                example=block.get('示例', ''),
             ))
         return hits
 
@@ -643,6 +658,10 @@ def _load_blocks() -> List[dict]:
     repo_root = os.path.normpath(os.path.join(here, '..', '..', '..'))
     idx_path = os.path.join(repo_root, 'stdlib', 'blocks', '索引.json')
     if not os.path.isfile(idx_path):
+        _log.warning(
+            '块索引未找到：%s——retrieve() 将恒返回空列表。'
+            '若包被搬到非仓库布局，请设 JIKUAI_PATH 或显式传入 blocks 列表。',
+            idx_path)
         return []
     with open(idx_path, 'r', encoding='utf-8') as f:
         data = json.load(f)

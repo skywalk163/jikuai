@@ -2,6 +2,34 @@
 
 本扩展遵循 [语义化版本](https://semver.org/lang/zh-CN/)，版本号与主包 `jikuai` 对齐。
 
+## [0.18.0] - 2026-08-11
+
+版本号随主包 v0.18.0 对齐。**扩展侧无代码改动** —— 本轮 LSP 增强
+（W54 多根 `definition`、W56 `_token_at` 走 lexer）全在服务端，扩展通过
+`vscode-languageclient` 透传即可。
+
+### 服务端能力变化（扩展透传，无需改扩展代码）
+
+- `textDocument/definition` 的块路径解析扩到多根 workspace（W54）。此前只查
+  `blocks_root()` 与文档自身目录，多根工程里跨根跳转会失败。
+- `_token_at` 改为优先走 JiKuai lexer 分词（W56）。此前 `定义赵共享` 这种
+  「关键字紧贴标识符」形态会被当成一个整体 token，**从定义处发起 rename
+  拿不到符号**；现在 `定义`(KEYWORD) 与 `赵共享`(IDENT) 正确切开。
+
+### 明确不做
+
+- `textDocument/codeAction`：v0.18.0 W53 以 `docs/ADR-31-不做codeAction.md`
+  **正式关闭**（四轮复审后结论：14 个诊断码无一满足「唯一机械修复」、唯一候选
+  用例已被 `极快.选块` 覆盖、四轮零社区诉求）。重开条件见 ADR-31 §5。
+  此前四个版本的 CHANGELOG 都写「留待下一轮复审」，本轮起不再逐轮挂账。
+
+### 已知限制
+
+- `.vsix` **仍未真机验证**。v0.18.0 W57 计划做但未完成——需要装了 Node
+  工具链 + VS Code 的机器跑 `vsce package` 并实测 completion / hover /
+  documentSymbol / signatureHelp / references / rename / `极快.选块`。
+  当前状态是「代码就绪待人工验证」，不是「已发布可用」。
+
 ## [0.17.0] - 2026-08-11
 
 版本号随主包对齐。本条目为 v0.18.0 W58 回归时补录——v0.17.0 发布时 `package.json`

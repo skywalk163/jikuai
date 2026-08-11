@@ -64,6 +64,12 @@ def _parse_args(argv):
         '--output', default=None,
         help='索引输出路径（默认 <root>/%s）' % BLOCK_INDEX_NAME,
     )
+    parser.add_argument(
+        '--with-examples', dest='with_examples', action='store_true',
+        help='生成「胖索引」：每条追加 `示例` 字段（浏览器/离线包等在乎 I/O '
+             '次数、不在乎 token 的下游用；默认关，见 blocks.to_index_entry。'
+             '**不与 --check 组合**：仓库内 stdlib 索引固定走 lean 形态）',
+    )
     return parser.parse_args(argv)
 
 
@@ -89,8 +95,13 @@ def main(argv=None):
         print('错误：块目录不存在：%s' % root, file=sys.stderr)
         return 1
 
+    if args.with_examples and args.check:
+        print('错误：--with-examples 与 --check 不能同时使用（仓库内 stdlib 索引固定 lean）',
+              file=sys.stderr)
+        return 1
+
     try:
-        fresh = generate_index(root)
+        fresh = generate_index(root, 含示例=args.with_examples)
     except BlockError as e:
         print('错误：扫描块元数据失败：%s' % e, file=sys.stderr)
         return 1

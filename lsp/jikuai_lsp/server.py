@@ -117,10 +117,67 @@ def _ensure_jikuai():
 _TOKEN_BOUNDARY = set(' \t\r\n。，、：:；;=（）()【】[]「」{}<>+-*/%!?"\'`|&^~@$#\\')
 
 
+#: 走 lexer 时算作「符号」的 token 类型名（`type.name` 匹配，避免 LSP 侧 import
+#: `TokenType` 枚举——`jikuai_lsp` 与主包保持物理隔离，只吃字符串）。
+#: 含 KEYWORD/VERB：hover 要给 `定义` / `打印` 出帮助。刻意**不含** PERIOD/
+#: COMMA/EQUALS 等纯语法记号——光标落在句号上应返回空串，与原「边界字符」语义一致。
+_SEMANTIC_TOKEN_TYPE_NAMES = frozenset({
+    'IDENT', 'KEYWORD', 'VERB', 'ADVERB',
+    'NUMBER', 'STRING', 'MONEY',
+})
+
+
+def _lex_token_at(line_text: str, cp_col: int):
+    """走 JiKuai lexer 对单行分词，返回 1-based 码点列 cp_col 命中的 token 文本。
+
+    返回值三态：
+      - `str`（可能是空串）：lexer 成功且判定了结果，直接采信
+      - `None`：lexer 不可用 / 抛异常 / 没有任何 token 覆盖该列，交回调用方兜底
+
+    为什么走 lexer 而非字符边界（W56 · W41 遗留）：`定义X` / `赋值X` 这类关键字
+    紧贴标识符时，字符边界扫描会把 `定义赵共享` 当**一个** token 吐出去，
+    rename / references 拿到的「符号名」其实是「关键字+标识符」拼串，两侧都匹配
+    不上。lexer 知道 `定义`(KEYWORD col=1) 与 `赵共享`(IDENT col=3) 是两截，
+    光标落哪截就返回哪截。
+    """
+    if not line_text:
+        return None
+    try:
+        from jikuai.lexer import tokenize
+    except Exception:                                     # noqa: BLE001
+        return None
+    try:
+        tokens = tokenize(line_text)
+    except Exception:                                     # noqa: BLE001
+        # 未闭合字符串、非法金额等 lexer 会抛。用户正在敲一半代码是常态，
+        # 不能因此让 hover/rename 整个哑火——交给字符边界兜底。
+        return None
+    for t in tokens:
+        if getattr(t, 'col', 0) <= 0:
+            continue                                      # INDENT/DEDENT/EOF 无位置
+        文本 = t.value if isinstance(t.value, str) else ''
+        if not 文本:
+            continue
+        start = t.col
+        end = start + len(文本) - 1
+        if start <= cp_col <= end:
+            if t.type.name in _SEMANTIC_TOKEN_TYPE_NAMES:
+                return 文本
+            return ''                                     # 命中纯语法记号 → 空串
+    return None
+
+
 def _token_at(line_text: str, cp_col: int) -> str:
-    """取 1-based 码点列所在的 token（连续非边界字符段）。"""
+    """取 1-based 码点列所在的 token。
+
+    v0.18.0 W56 起**优先走 lexer**（`_lex_token_at`），解决关键字紧贴标识符时
+    符号被粘成一坨的问题。lexer 不可用或命不中时回落到 v0.15 起的字符边界扫描。
+    """
     if not line_text:
         return ''
+    命中 = _lex_token_at(line_text, cp_col)
+    if 命中 is not None:
+        return 命中
     idx = cp_col - 1
     if idx < 0:
         idx = 0

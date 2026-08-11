@@ -97,18 +97,18 @@ python -m jikuai_lsp   # 通过 stdio 与 LSP 客户端通信
 
 ## 已知缺口
 
-> v0.17.0 W40-W41 已落地 `references` + `rename`（prepareProvider），
-> `codeAction` 仍未实现（W41 的可降级项，本轮无新证据说明必要性）。
+> v0.17.0 W40-W41 已落地 `references` + `rename`（prepareProvider）；
+> v0.18.0 W53 以 **ADR-31 明确关闭 `codeAction`**（四轮复审后不做）；
+> v0.18.0 W56 修掉 `_token_at` 切不开 `定义X` / `赋值X` 的老边界。
 
 | 缺口 | 现状 |
 | --- | --- |
-| `textDocument/codeAction` | 未实现。v0.15.0/v0.16.0/v0.17.0 三轮判定可选并跳过——无新证据说明必要性。留待 v0.18.0 复审 |
+| `textDocument/codeAction` | **明确不做**（v0.18.0 W53 · `docs/ADR-31-不做codeAction.md`）。v0.15.0/v0.16.0/v0.17.0/v0.18.0 四轮复审：14 个诊断码无一满足「唯一机械修复」、唯一候选用例已被 `极快.选块` 覆盖、四轮零社区诉求。重开条件见 ADR-31 §5 |
 | `textDocument/rename`（块导出名） | v0.17.0 W41 明确**拒绝**改块导出名——改它要连 `块.json` 与 G13 全局唯一门禁一起改，超出 LSP 层职责。手工改：动 `.jk` + `块.json` 后重跑 `scripts/generate_block_index.py` |
-| `_token_at` 无法切开 `定义X` / `赋值X` | 现状：极快里 `定义` / `赋值` 关键字紧贴标识符（无空格），`_token_at` 会把 `定义赵共享` 当一个整体，从这里发起 rename 会拿不到符号。绕开：把光标放到该变量的**使用**位置（前后有空格边界）。留待增强 |
 | 启动时全量扫工作区 | 未做。当前只在 `didOpen` / `didChange` 时增量索引；未打开的文件里的引用查不到。工作区大文件多时，用户逐个打开就会补齐。留待做后台异步全量扫 |
 | `foldingRange` | 未实现 |
 | 增量诊断 | `didChange` 走增量同步，但诊断仍是整篇重编译 |
-| 多根 workspace | `initialize` 已解析 `workspaceFolders`（v0.17.0 W38），但 `definition` 的块路径解析仍只查 `blocks_root()` 与文档自身目录 |
+| 多根 workspace | `initialize` 已解析 `workspaceFolders`（v0.17.0 W38）；`definition` 的块路径解析已在 v0.18.0 W54 扩到多根 |
 | pull-based 诊断 | `diagnosticProvider: false`。诊断只走服务端 push |
 | 补全空前缀 | LSP 口径下空前缀返回 `[]`（不列全表），与 REPL 的 Tab 行为**故意不同** |
 

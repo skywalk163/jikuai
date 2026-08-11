@@ -1,6 +1,66 @@
 # 极快 JiKuai · 变更日志
 
-## v0.17.0（2026-08-11）· LSP 跨文件符号表 + 粘合器槽名消解 + Web 原地更新
+## v0.18.0（2026-08-11）· L3 扩容 + 集成反馈落地 + G16 协议门禁 + LSP _token_at 增强
+
+> WBS 见 `docs/v0.18.0-WBS.md`；复盘见 `docs/v0.18-复盘.md`。
+> 全量回归 **2060 passed / 34 skipped**；契约门禁 **G10-G16 + G13+ 八门全绿**（`scripts/check_stdlib_contract.py` exit 0）。块库 **112（L3 扩到 7）**。
+
+### Breaking Change（先看这段）
+
+1. **新增门禁 G16「协议文档同步」**。`docs/协议-三通道.md` 的 Web 端点列表与 `tools/web/server.py` 路由清单必须双向一致，差一个门禁就红。若你在 server.py 加了 API 端点却没更新协议文档（或反过来），CI 会报
+2. **`pkg/__init__.py` import 解耦**：`installer` / `resolver` / `sources` / `registry` 改为 PEP 562 惰性属性。`from jikuai.pkg import install` 等公开名不变；但**模块级 `import jikuai.pkg.sources`** 不再在 `import jikuai.pkg` 时副作用执行——嵌入式 / Pyodide 环境无需再提供 `sources.py` 替身
+3. **`retrieval.Hit` 新增可选字段 `example`**。`as_dict()` 只在 `example` 非空时输出 `示例` 键。消费 `Hit.as_dict()` 的下游若做严格字段白名单校验，需加 `示例`
+4. **`synthesize` 签名扩展**：新增 `用示例填参=False` 参数（opt-in）。既有调用点（CLI / Web / REPL / LSP）均不传此参数，行为不变
+5. **`synthesize` 的 `?` 占位个数变化**（P0 正确性修复）：多参块从此生成 `? ?`（N 个）而非单个 `?`。Web 端 `_占位记号 = '需人工填参'` 的检测不受影响（仍在注释行里出现），但如果有下游用 `源码.count('?') == 1` 做判断会受影响
+6. **`generate_index` 新增 `含示例=False` 参数；CLI `--with-examples`**。默认行为（lean 索引）不变
+
+**迁移建议**：先跑 `python scripts/check_stdlib_contract.py` 看八门哪条红；若你在嵌入式环境自造了 `sources.py` 替身，升级后可删；版本号只动 `_version.py`。
+
+### L3 块扩容（W49-W51）
+
+- 新增 4 个 L3 块（`员工薪历` / `档案贺卡` / `贷户档案` / `贷款简报`），加上原有 3 个共 **7 个 L3 块**，跨财务 + 中文 + 数据三域
+- 评测集 `评测集-L3.json` 同步更新（~50 槽）；`bench_glue_l3.py` 验证粘合率
+- 向量索引 + `索引.json` 重生成（`HF_HUB_OFFLINE=1`）
+
+### ADR-31 codeAction 关闭（W53）
+
+- `docs/ADR-31-不做codeAction.md` 定稿。四轮复审（v0.15/v0.16/v0.17/v0.18）结论一致：14 个诊断码无一满足「唯一机械修复」、唯一候选用例被 `极快.选块` 覆盖、四轮零社区诉求
+- `docs/BACKLOG.md` 对应条目改为「不做（除非另立 ADR 推翻 ADR-31）」
+
+### LSP multi-root definition（W54）
+
+- `textDocument/definition` 的块路径解析从只查 `blocks_root()` + 文档目录，扩到 `workspaceFolders` 全遍历
+- `tests/test_lsp_definition.py` +195 行
+
+### 集成反馈落地（W55 · `docs/集成反馈-quye浏览器工作台.md`）
+
+- **P0** `synthesize` 的 `?` 占位个数与块 `输入` 元数一致（纯正确性 bug 修复）
+- **P1** `synthesize(用示例填参=True)` opt-in：缺参数且未自动链上时从块 `示例` 提取实参串直接复用。默认关，给嵌入式环境 opt-in
+- **P1** `ai/retrieval.py:_load_blocks()` 找不到 `索引.json` 时打 warning（不再静默返回空列表）
+- **P2** `Hit` 带 `example` 字段；`generate_index(含示例=True)` / CLI `--with-examples` 产出胖索引
+- **P2** `pkg/__init__.py` 安装执行层 → PEP 562 惰性属性（编译期只拉 `manifest` / `lockfile` / `blocks`）
+
+### G16 协议-三通道 CI 门禁（W55）
+
+- `scripts/check_protocol_doc.py`：AST 解析 server.py 的 `_POST路由` / `_GET路由` / `_PUT路由` / `_DELETE路由` ↔ 文档「三、通道 × schema 对应关系」端点列表双向 diff
+- `tools/web/server.py` 新增 `_GET路由` / `_PUT路由` / `_DELETE路由` 模块级清单，与 `_POST路由` 口径统一
+- 串进 `scripts/check_stdlib_contract.py` 作为 G16
+- `tests/test_check_protocol_doc.py` 14 pass（正例 + 6 类反例）
+
+### LSP `_token_at` 增强（W56）
+
+- 优先走 JiKuai lexer 分词：`定义赵共享` 关键字紧贴标识符时正确切为 `定义` + `赵共享`，rename/references 从此拿得到符号
+- lexer 不可用或抛异常时回落字符边界扫描（用户正在敲一半代码时不哑火）
+- `lsp/README.md` 缺口表移出此条
+
+### 发布卫生
+
+- 版本号单一真源 `_version.py` → `0.18.0`；G15 逼同步 CHANGELOG 首条 + `editors/vscode/package.json`
+- 块库 112 条目（L0: 83, L1: 19, L2: 3, L3: 7）
+- `docs/BACKLOG.md` 数字纠偏（L3 扩容 / 多根 definition / _token_at 三条清账）
+
+
+
 
 > WBS 见 `docs/v0.17.0-WBS.md`；复盘见 `docs/v0.17-复盘.md`。
 > 全量回归 **2037 passed / 34 skipped**；契约门禁 **G10-G15 + G13+ 七门全绿**（`scripts/check_stdlib_contract.py` exit 0）。块库 **108（无新增，L3 仍为 3）**。

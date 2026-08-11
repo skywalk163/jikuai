@@ -255,6 +255,17 @@ def main(argv):
     if check_protocol_doc.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
+    # G17：包管理文档同步（W62 · v0.19.0）。`docs/包管理.md` 的「命令表」小节
+    # 必须与 `src/jikuai/pkg/cli.py` 的 `_ALIASES` 键集**双向**一致（中文命令集、
+    # 英文别名集分别比）。v0.19.0 W61 纠偏发现 `发布`/`搜索`/`注册表` 三个在
+    # v0.11.0 就落地的子命令一直没进文档、还被记作「MVP 占位」，漂了约七个版本。
+    # G16 只锁了协议文档 ↔ Web 路由，这类「文档 ↔ CLI」漂移没人管——补上。
+    #
+    # 同 G16：**不**学 G13+ 的 `except → 跳过`。新门禁解析不了就是它自己坏了。
+    import check_pkg_doc
+    if check_pkg_doc.main(["--quiet"]) != 0:
+        exit_code = exit_code or 1
+
     return exit_code
 
 

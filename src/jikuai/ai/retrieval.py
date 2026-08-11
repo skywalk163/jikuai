@@ -652,14 +652,14 @@ class Retriever:
 _cached_retriever: Optional[Retriever] = None
 
 
-def _load_blocks() -> List[dict]:
-    """加载 `stdlib/blocks/索引.json` 的块列表。"""
+def _load_builtin_blocks() -> List[dict]:
+    """加载 `stdlib/blocks/索引.json` 的内置块列表。"""
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.normpath(os.path.join(here, '..', '..', '..'))
     idx_path = os.path.join(repo_root, 'stdlib', 'blocks', '索引.json')
     if not os.path.isfile(idx_path):
         _log.warning(
-            '块索引未找到：%s——retrieve() 将恒返回空列表。'
+            '块索引未找到：%s——内置块检索将为空。'
             '若包被搬到非仓库布局，请设 JIKUAI_PATH 或显式传入 blocks 列表。',
             idx_path)
         return []
@@ -668,7 +668,62 @@ def _load_blocks() -> List[dict]:
     return data.get('块', [])
 
 
+def _load_third_party_blocks() -> List[dict]:
+    """现扫已装块包的第三方块，投影成与内置索引同构的条目（ADR-32 §2.3 检索侧）。
+
+    **为什么不读持久化索引**：`stdlib/blocks/索引.json` 是版本控制里的产物，
+    `generate_index` 刻意只传 `root=blocks_root()` 以免把某台机器上装的第三方块
+    写进仓库。第三方块因此没有、也不该有一份提交进 git 的索引——只能现扫。
+    代价是每个新进程首次 `retrieve()` 多一次目录遍历，靠 `_cached_retriever`
+    的进程级缓存摊掉。
+
+    **为什么不传 `roots=`**：`scan_blocks(roots=[...])` 会**跳过** `extra_roots`
+    的注册逻辑，扫到的块 `namespace=''`——因为 namespace 只在遍历 `_registered_roots`
+    的名义映射时才被填。想要「内置 + 装了的第三方」这套完整聚合，只能用无参
+    `scan_blocks()`，再靠 `namespace` 非空过滤掉内置。改成传 roots 会静默漏掉命名
+    空间，检索出来的块名字冲突时无法定位来源。
+
+    **失败必须隔离**：第三方包的 `块.json` 是外部输入，坏一个不该让内置块也搜
+    不到。这里与门禁的「解析不了就是它自己坏了」philosophy 相反——门禁是 CI 期
+    的守卫，本函数是用户运行期的路径，可用性优先于严格性。故整段兜 Exception
+    并降级为空列表 + 一条 warning。
+    """
+    try:
+        from ..pkg import blocks as _B          # 延迟导入：不用检索就不拖块子系统
+        return [b.to_index_entry() for b in _B.scan_blocks()
+                if b.namespace]
+    except Exception as e:                      # noqa: BLE001 —— 见 docstring
+        _log.warning('扫描第三方块失败，本次检索只含内置块：%s: %s',
+                     type(e).__name__, e)
+        return []
+
+
+def _load_blocks() -> List[dict]:
+    """内置块 + 已装块包的第三方块，内置优先。
+
+    去重键取 `(命名空间, 名称)`：内置块命名空间是空串，第三方块取包名
+    （ADR-32 §2.4），所以同名不同源不会互相遮蔽；真撞上同键时**内置先入为主**，
+    与发现侧 `extra_roots()` 的合并顺序和执行侧「第三方块挂在 stdlib 之前搜索路径」
+    保持同一套优先级语义。
+    """
+    合并: List[dict] = []
+    见过 = set()
+    for entry in list(_load_builtin_blocks()) + _load_third_party_blocks():
+        键 = (entry.get('命名空间') or '', entry.get('名称'))
+        if 键 in 见过:
+            continue
+        见过.add(键)
+        合并.append(entry)
+    return 合并
+
+
 def _get_retriever() -> Retriever:
+    """取进程级缓存的检索器。
+
+    **装包后需显式 `reset_cache()`**：第三方块是现扫的，但扫描结果被缓存在
+    `_cached_retriever` 里，同一进程内装完包不会自动生效。CLI 每条命令一个新
+    进程所以无感；库调用方（含测试）装完包要自己清缓存。
+    """
     global _cached_retriever
     if _cached_retriever is None:
         blocks = _load_blocks()

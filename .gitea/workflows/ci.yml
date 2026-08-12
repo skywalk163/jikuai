@@ -1,0 +1,57 @@
+# 极快 JiKuai · 本地 CI（Gitea Actions，FreeBSD host 模式，无 Docker）
+#
+# 与 .github/workflows/ci.yml 等价，但适配本机 runner：
+#   - runs-on: freebsd（act_runner，系统已带 gcc / python3 v3.11 / node v24）
+#   - 去掉 actions/setup-python 矩阵，改用 venv 里的系统 python3
+#   - checkout 走本地 actions/checkout（不依赖 GitHub）
+#   - gcc 已在 runner 预装，AOT 端到端用例会真正运行（非 skip）
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: freebsd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 环境 (venv)
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: 确认 gcc 在位（AOT 端到端用例需要）
+        run: |
+          . .venv/bin/activate
+          gcc --version
+          python -c "import shutil,sys; cc=shutil.which('gcc'); print('gcc ->', cc); sys.exit(0 if cc else 1)"
+
+      - name: 运行全部测试
+        run: |
+          . .venv/bin/activate
+          python -m pytest -v
+
+      # G10 stdlib 契约一致性 + G11 块索引一致性 + G12 向量索引同源 + G13 导出名全局唯一 + G14 类型精度。
+      - name: 契约门禁 G10~G14
+        run: |
+          . .venv/bin/activate
+          python scripts/check_stdlib_contract.py
+
+      # 守卫：AOT 端到端二进制用例在有 gcc 的环境必须真正运行、零 skip。
+      - name: 守卫 - AOT e2e 必须运行（非 skip）
+        run: |
+          . .venv/bin/activate
+          python -m pytest -v -rs tests/test_v0_7_0_aot.py tests/test_v0_8_0_aot_controlflow.py | tee aot_run.log
+          if grep -q "skipped" aot_run.log; then
+            echo "::error::AOT 端到端用例出现 skip —— gcc 环境下不应跳过"
+            exit 1
+          fi
+          echo "AOT 端到端用例全部运行，无跳过"

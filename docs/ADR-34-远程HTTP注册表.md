@@ -1,6 +1,6 @@
 # ADR-34：远程 HTTP 注册表 + token 鉴权
 
-- 状态：**已定稿**（待实施）
+- 状态：**已实施**（v0.20.0 W77-W80）
 - 日期：2026-08-12
 - 阶段：v0.20.0 · M20（W77-W80）
 - 关联：`docs/ADR-33-包签名.md`、`docs/ADR-27-第三方块注册表.md`、`docs/包管理.md`、`src/jikuai/pkg/registry.py`、`src/jikuai/pkg/sources.py`、`src/jikuai/pkg/manifest.py`、`docs/路线图-v0.19-v0.20.md`

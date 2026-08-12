@@ -1,5 +1,43 @@
 # 极快 JiKuai · 变更日志
 
+## v0.20.0（2026-08-12）· HTTP 远程注册表 + 包签名 + 可信跨机分发
+
+> WBS 见 `docs/路线图-v0.19-v0.20.md`；ADR 见 `docs/ADR-33-包签名.md` + `docs/ADR-34-远程HTTP注册表.md`。
+> 全量回归 **2177 passed / 34 skipped**；契约门禁 **G10-G18 全绿**。
+
+### Breaking Change（先看这段）
+
+1. **`Dependency.__slots__` 新增 `registry_url`**。`from_spec` 现在识别 `{"注册表": url, "版本": constraint}` 形态——不是第四种来源，只是「注册表」来源的修饰。`to_spec()` round-trip 无损：纯字符串依赖不会被改写成 dict。
+2. **`FetchedSource.__slots__` 新增 `registry_locator`**。消费 `FetchedSource` 的代码如果做 `*slots` 解包需跟改（但 `__slots__` 本身就不允许位置解包，影响面为零）。
+3. **`registry.py` 公开 API 新增 `open_backend`/`lookup_entry`/`key_rel`/`package_rel`/`archive_rel`**。既有 `lookup`/`lookup_signature`/`load_index`/`save_index` 签名不变，但内部改走 `RegistryBackend`。`registry_root()` 现在可以返回 URL（`https://...`），而不只是本地路径。
+4. **`trust.resolve_and_pin` 内部改用 `RegistryBackend` 读公钥**。远程注册表的 TOFU 首次 pin 现在也能工作。对外接口不变。
+
+### M19 · 包签名（W73-W76）
+
+- **ADR-33 已实施**：Ed25519 纯标准库 `_ed25519.py`（RFC 8032）；`keys.py` 密钥管理；`trust.py` TOFU 信任库 + 显式白名单；`registry.publish(signer=)` 签校验和字符串；`installer._verify_registry_signature` 三道检查（完整性 / 签名 / 未签名过渡告警）
+- CLI `jk 包 密钥 生成|列表|导出` + `jk 包 发布 --签名 <别名>`
+- G18 门禁：`JIKUAI_*` 环境变量 ↔ `docs/包管理.md` 双向同步
+- `test_pkg_signing.py` 28 用例
+
+### M20 · HTTP 远程注册表 + token 鉴权（W77-W80 / ADR-34）
+
+- **`backend.py` 新增**：`RegistryBackend` 协议 + `LocalBackend`（行为与 v0.19.0 逐字节一致）+ `HttpBackend`（`urllib.request` 零依赖只读；写操作抛 `UnsupportedOperation` 预留 M21）
+- `registry.py`：所有读写函数改走后端；`publish` 同步生成 `<版本>.tar.gz`（远端静态托管即可）
+- `sources.py`：远程注册表走 `GET <base>/包/<名>/<版本>.tar.gz` → `_safe_extract_targz`（拒绝绝对路径/链接/`..`/设备节点，3.12+ 叠 `data_filter`）→ 临时目录 → M19 三道验证原路径复用
+- `manifest.py`：`Dependency.registry_url`（per-dependency override，ADR-34 §2.5）
+- token 鉴权：`JIKUAI_REGISTRY_TOKEN` 环境变量 > `~/.jikuai/凭证.json`（最长前缀匹配）；非 latin-1 token 提前拦
+- `JIKUAI_REGISTRY_TIMEOUT` / `JIKUAI_REGISTRY_INSECURE`（明文 http 默认拒）
+- `test_pkg_http_registry.py` 20 用例（mock 静态 HTTP 服务端到端）
+- `docs/包管理.md` 远程注册表小节 + 三个新环境变量
+
+### 文档
+
+- `docs/ADR-33-包签名.md` 状态转「已实施」
+- `docs/ADR-34-远程HTTP注册表.md`（新）
+- `docs/BACKLOG.md`「HTTP 分发」条目关闭；「包签名」条目关闭
+
+---
+
 ## v0.19.0（2026-08-12）· 块包一体 + 生态冷启动 + G17 门禁 + 命名空间贯通
 
 > WBS 见 `docs/v0.19.0-WBS.md`；复盘见 `docs/v0.19-复盘.md`；ADR 见 `docs/ADR-32-块包格式.md`。

@@ -1,5 +1,79 @@
 # 极快 JiKuai · 变更日志
 
+## v0.19.0（2026-08-12）· 块包一体 + 生态冷启动 + G17 门禁 + 命名空间贯通
+
+> WBS 见 `docs/v0.19.0-WBS.md`；复盘见 `docs/v0.19-复盘.md`；ADR 见 `docs/ADR-32-块包格式.md`。
+> 全量回归 **2121 passed / 34 skipped**；契约门禁 **G10-G17 + G13+ 九门全绿**（`scripts/check_stdlib_contract.py` exit 0）。块库 **112 条目**（L0: 83, L1: 19, L2: 3, L3: 7 —— 内置块数未增；`examples/块包/` 下 4 个真实第三方块包 + 1 个 W64 桩验证包）。
+
+### Breaking Change（先看这段）
+
+1. **新增门禁 G17「包管理文档同步」**（W62）。`docs/包管理.md` 命令表与 `src/jikuai/pkg/cli.py` 的 `_ALIASES`/`_DISPATCH` 必须双向一致；漏写子命令或加了未文档化子命令，CI 会当场报红。沿用 G16 的双向 diff 思路 —— 之后靠门禁不靠人。
+2. **块包安装落点约定**（ADR-32）。带 `块` 字段的包（`包.json` 里 `"块": ["blocks"]`）安装到 `极快_包/<包名>/blocks/<命名空间>/<领域>/<块名>/`；同时 installer 维护 `极快_包/.块根.json` 索引让 `blocks.extra_roots()` 合并读取。旧包（无 `块` 字段）行为不变。
+3. **步骤协议新增可选字段 `命名空间`**（W68/W69）。`schema.STEP_OPTIONAL` 从 `('参数', '说明')` 扩为 `('参数', '说明', '命名空间')`。**任何 `_F参数, _F说明 = schema.STEP_OPTIONAL` 的整元组解包会当场 `ValueError: too many values to unpack`——这是刻意金丝雀**，加字段就顺手更新所有解包点，别绕过。第三方块的导入路径从此形如 `从 blocks.<命名空间>.<领域>.<块> 导入 X`；内置块无此字段，`从 blocks.<领域>.<块> 导入 X` 一字不变。
+4. **候选 schema 新增 `命名空间` 可选字段**。`CANDIDATE_OPTIONAL = ('命名空间',)`。消费候选卡片的三通道（Web/LSP/CLI）看到非空命名空间应把它带进方案步骤，否则第三方块的导入行会缺一段。
+5. **包名原子性门禁放到 `_validate_block_roots`**（W69）。`_NAME_RE` 允许 `-`/`_`/拉丁的完全合法包名（如 `my-pkg`）不再被误杀；仅当**包声明了 `块` 字段**时才会校验包名能过 lexer 原子性（因为要进点分模块路径）。`my-pkg` 这类包可以照常发布/安装，只是不能作为命名空间。
+6. **`retrieval.Hit` 新增可选字段 `namespace`**（W68）。`as_dict()` 只在 `namespace` 非空时输出 `命名空间` 键。消费 `Hit.as_dict()` 的下游若做严格字段白名单，需加 `命名空间`。`compare=False` —— 命名空间不参与排序/相等语义，跨命名空间同名块不会互相影响排序。
+
+**迁移建议**：先跑 `python scripts/check_stdlib_contract.py` 看九门哪条红；协议消费者补 `命名空间` 字段解包；`STEP_OPTIONAL` 的所有解包点扩到三元；版本号只动 `_version.py`。
+
+### 文档纠偏 · 准入前置（W61）
+
+`docs/BACKLOG.md §3` / `docs/包管理.md` §尚未实现 / `src/jikuai/pkg/sources.py` docstring 与代码有**七个版本**的漂移 —— 「本地注册表 MVP 占位」「`jk 包 发布` 未落地」两条错误认定实际在 v0.11.0 就已实现（`registry.publish/lookup/search/list/unpublish` 全可跑；`test_v0_11_0_registry.py` 37 条端到端全绿）。W61 把它们改为「已实现」+ 附实况；真正的缺口收敛为「HTTP 分发（v0.20.0）」+「块↔包桥接（本轮 W63-W66）」两条。顺带清 v0.18.0 W57 遗留：`docs/LSP-使用.md` 补 `npm install` 一步；`editors/vscode/package.json` 补 `repository` 字段消 vsce warning。
+
+### G17 包管理文档同步门禁（W62）
+
+- `scripts/check_pkg_doc.py`：复用 G16 的元件（章节截取、占位符归一、AST 常量表求值、双向 diff）；吃 `_ALIASES` + `_DISPATCH` dict，把命令主名 + 别名一起收进代码侧集合
+- 串进 `scripts/check_stdlib_contract.py` 作 G17，与 G10-G16 并列
+- `tests/test_check_pkg_doc.py`：正例 + **≥3 类反例**（文档漏子命令、代码加未文档化子命令、别名对不上）证明门禁真能抓漂移 —— 沿用 W55/G16 硬门槛
+
+### 块包格式与桥接（W63-W66 · ADR-32）
+
+- **ADR-32 定型「最小桥接」**：块元数据格式一字不动；包 manifest 加可选 `块: [目录相对路径]` 字段声明块根；installer 落地 + 写 `极快_包/.块根.json` 索引；`blocks.extra_roots()` 合并读取该索引 + 环境变量 `JIKUAI_PKG_ROOTS`（保留原语义）
+- **W64 桩验证** `examples/块包/示范块集/`：ADR 定的格式必须在最小 fixture 上通全链路，才进 W65-W66 批量实现
+- **installer 侧**（`src/jikuai/pkg/installer.py`）：安装带块的包时收集块根 → 写入 `.块根.json`；卸载时同步移除；`_prune` 清理块根条目
+- **发现侧**（`src/jikuai/pkg/blocks.py`）：`extra_roots()` 读环境变量 + `.块根.json` 两路合并；`scan_blocks()` 无参调用自动带上第三方块（**注意：`scan_blocks(roots=[...])` 会跳过 `extra_roots` 的注册逻辑，扫到的块 `namespace=''`——想拿完整聚合只能无参调用**）
+- **执行侧**（`src/jikuai/module_loader.py`）：`_block_root_parents(pkg_dir)` 把已装包的块根父目录挂进搜索路径，`从 blocks.<命名空间>.<领域>.<块> 导入 X` 能解析
+
+### 生态冷启动 · 4 个真实第三方块包 · 10 块（W67）
+
+从 quye 等真实集成方需求反推，不为凑数造玩具。`examples/块包/` 下四个真实包（10 块）+ W64 桩验证包（1 块）：
+
+- **数据统计** —— 4 块（`众数`/`分位数`/`前缀和`/`缩放`；数据聚合/统计基础）
+- **财务扩展** —— 3 块（`成本溢价`/`毛利率`/`等额本金`；财务真实场景）
+- **网页数据** —— 2 块（`媒体型`/`小饼解析`；网络数据处理）
+- **中文扩展** —— 1 块（`中文数字解析`；中文文本处理）
+- **示范块集** —— 1 块（`翻倍`；W64 桩验证保留）
+
+每个块过七门（G10-G16 + G13+）+ `测试.jk` 绿；改块元数据后跑了 embeddings（`HF_HUB_OFFLINE=1`）。选题原则记 W67 commit message。
+
+### 端到端钉板 + 检索侧接入第三方块（W68）
+
+- **W64 曾判定「发现侧 + 执行侧」两根系统，W68 发现检索侧是第三根**：`ai/retrieval.py` 原来只读 `stdlib/blocks/索引.json`，第三方块根本不进候选。教训：数一个「有几处独立读同一类资源」时，别只数写路径，读路径也算一根。
+- `retrieval._load_blocks()` 走 `scan_blocks()` + `namespace` 过滤，第三方块进候选池；索引条目附 `命名空间` 键
+- **端到端钉板** `tests/test_pkg_block_e2e.py`：`发布 → 装 → 检索命中 → 导入并跑` 五步全绿 + 篡改块内容 checksum 变化的负例
+- **checksum 格式不一致钉住**：`registry.publish` 存裸 hex，`installer` 往锁文件写 `sha256:<hex>`；测试第 125-131 行钉住现状 + 注释说明 v0.20.0 做 HTTP 分发要跨端比对时必须统一（已挂账 v0.20.0 W73）
+
+### 命名空间贯通 + 包名原子性门禁放位（W69）
+
+- **`_导入行` 去重键改带命名空间**（`tools/ai-bridge/glue.py:433-457`）：跨命名空间同名块（`scan_blocks` 明确允许）以前会被 `(领域, 块, 导出名)` 键静默吞掉一条；改成 `(命名空间, 领域, 块, 导出名)` 四元键
+- **`scan_blocks()` 必须无参调用**：踩过 `scan_blocks(roots=[...])` 会静默丢命名空间的坑（namespace='' 却检索得到——但没法定位来源），教训写入 memory
+- **包名原子性门禁位置修正**：从 `validate_package_name`（对**每个**包查）挪到 `_validate_block_roots`（**只对带 `块` 字段的包**查）—— 包名字符集与点分模块路径段字符集是两套不兼容集合，第一版放错位置误杀合法普通包
+- `tests/test_glue_type.py` + `tests/test_pkg_block_e2e.py`：跨命名空间同名块的钉板测试
+
+### 发布卫生
+
+- 版本号单一真源 `_version.py` → `0.19.0`；G15 逼同步 `pyproject.toml` / `CHANGELOG.md` / `editors/vscode/package.json` / `editors/vscode/CHANGELOG.md` 五处
+- 块库 112 条目（未增内置块 —— 本轮增量在 `examples/块包/` 的 10 个第三方块）
+- `docs/BACKLOG.md`：三条清账（本地注册表已实现、`jk 包 发布` 已实现、块↔包桥接已实现）
+
+### 已知遗留（→ v0.20.0 W73 前置清账）
+
+- **checksum 格式不一致**：`registry.publish` 裸 hex vs `installer` `sha256:<hex>` 前缀 —— HTTP 分发要跨端比对时必须统一
+- **`_块元数据表` 键冲突**（`tools/ai-bridge/glue.py`）：以纯 `m.name` 作键，跨命名空间同名块静默覆盖 —— W69 判定当前 glue-plan 侧无实际用例暴露，未修
+- **`blocks_cli._块目录` / `server._校验块存在` 硬编码 stdlib**：第三方块 `jk 块 组`/`跑` 会挂
+
+---
+
 ## v0.18.0（2026-08-11）· L3 扩容 + 集成反馈落地 + G16 协议门禁 + LSP _token_at 增强
 
 > WBS 见 `docs/v0.18.0-WBS.md`；复盘见 `docs/v0.18-复盘.md`。

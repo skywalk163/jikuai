@@ -71,6 +71,12 @@ _块元数据缓存 = {}
 
 
 def _块元数据表(root=None):
+    """返回 {(命名空间, 领域, 名称): {...}} 字典。
+
+    v0.20.0 W73 修：原来按纯 m.name 做键，跨命名空间同名块静默覆盖（第三方
+    覆盖内置）。改为 (命名空间, 领域, 名称) 三元键；下游消费点（TypeGraph /
+    synthesize）统一走带命名空间的查找。
+    """
     key = os.path.abspath(root) if root else '<default>'
     cached = _块元数据缓存.get(key)
     if cached is not None:
@@ -78,13 +84,36 @@ def _块元数据表(root=None):
     from jikuai.pkg import blocks as _blocks_mod
     meta = {}
     for m in _blocks_mod.scan_blocks(root):
-        meta[m.name] = {
+        # 领域取首个（多领域块的物理目录只落在一个领域下）
+        领域 = m.domains[0] if m.domains else ''
+        meta_key = (m.namespace, 领域, m.name)
+        meta[meta_key] = {
             '输入': [dict(x) for x in m.inputs],
             '输出': dict(m.output),
             '示例': m.example or '',
         }
     _块元数据缓存[key] = meta
     return meta
+
+
+def _查块元数据(meta_table, 块名, 命名空间='', 领域=''):
+    """从三元键元数据表里查找一个块。
+
+    查找策略（与 synthesize 消费步骤时的信息量匹配）：
+    1. 若调用方给了完整三元 (命名空间, 领域, 块名) → 精确命中
+    2. 否则遍历表找 name 匹配的条目：优先内置（空命名空间），有多个取首条
+    """
+    if 命名空间 or 领域:
+        return meta_table.get((命名空间, 领域, 块名))
+    # 退化查找：优先内置
+    候选 = [(k, v) for k, v in meta_table.items() if k[2] == 块名]
+    if not 候选:
+        return None
+    # 内置（空命名空间）优先
+    for k, v in 候选:
+        if k[0] == '':
+            return v
+    return 候选[0][1]
 
 
 def reset_meta_cache():
@@ -320,12 +349,12 @@ class TypeGraph:
         # 复用 `_块元数据表` 的进程级缓存，避免自动链式与占位路径各扫一遍盘。
         self._meta = _块元数据表(root)
 
-    def _block_inputs(self, 名):
-        info = self._meta.get(名)
+    def _block_inputs(self, 名, 命名空间='', 领域=''):
+        info = _查块元数据(self._meta, 名, 命名空间, 领域)
         return info['输入'] if info else []
 
-    def _block_output_type(self, 名):
-        info = self._meta.get(名)
+    def _block_output_type(self, 名, 命名空间='', 领域=''):
+        info = _查块元数据(self._meta, 名, 命名空间, 领域)
         if not info or not info['输出']:
             return ('任意', None)
         return normalize_type(info['输出'].get('类型'))
@@ -356,7 +385,9 @@ class TypeGraph:
 
         for i, s in enumerate(steps):
             名 = s.get(_F块)
-            inputs = self._block_inputs(名)
+            ns = s.get(_F命名空间) or ''
+            域 = s.get(_F领域) or ''
+            inputs = self._block_inputs(名, ns, 域)
             这步实参 = []
             这步齐全 = True
             这步已用 = set()   # 本步已被消费的变量名，防同型静默复用
@@ -424,7 +455,7 @@ class TypeGraph:
                 这步已用.add(命中)
 
             # 该步产出入池，供后续步骤消费
-            池.append((result_var(i), self._block_output_type(名)))
+            池.append((result_var(i), self._block_output_type(名, ns, 域)))
             实参方案.append(这步实参 if 这步齐全 else None)
 
         return 实参方案, 未匹配, 拒绝理由
@@ -532,7 +563,9 @@ def synthesize(方案, 自动链式=False, root=None, 用示例填参=False):
 
         参数 = s.get(_F参数)
         块名 = s.get(_F块)
-        块元 = _元数据.get(块名) or {}
+        块ns = s.get(_F命名空间) or ''
+        块域 = s.get(_F领域) or ''
+        块元 = _查块元数据(_元数据, 块名, 块ns, 块域) or {}
         块输入 = 块元.get('输入') or []
         块示例 = 块元.get('示例') or ''
 

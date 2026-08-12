@@ -212,9 +212,25 @@ def _glue():
     return mod
 
 
-def _块目录(领域: str, 块: str) -> str:
-    """块在 `stdlib/blocks/` 下的目录——与 `从 blocks.<领域>.<块> 导入` 同构。"""
-    return os.path.join(blocks.blocks_root(), 领域, 块)
+def _块目录(领域: str, 块: str, 命名空间: str = '') -> str:
+    """块所在磁盘目录。
+
+    - 内置块（`命名空间` 空串或未传）：`stdlib/blocks/<领域>/<块>/`
+    - 第三方块（`命名空间` 非空）：遍历 `extra_roots()`，取第一个存在的
+      `<根>/<命名空间>/<领域>/<块>/`；都不存在时返回**首选路径**（让上层
+      `os.path.isdir` 汇报统一的「不存在」错误）
+    """
+    if not 命名空间:
+        return os.path.join(blocks.blocks_root(), 领域, 块)
+    候选 = None
+    for 根 in blocks.extra_roots():
+        p = os.path.join(根, 命名空间, 领域, 块)
+        if 候选 is None:
+            候选 = p
+        if os.path.isdir(p):
+            return p
+    # 都不存在时给一个可诊断的路径（含命名空间）供错误消息使用
+    return 候选 or os.path.join('<第三方块根>', 命名空间, 领域, 块)
 
 
 def _主jk(块目录: str, 块: str) -> Optional[str]:
@@ -226,15 +242,18 @@ def _主jk(块目录: str, 块: str) -> Optional[str]:
     return None
 
 
-def _推导出名(领域: str, 块: str) -> str:
+def _推导出名(领域: str, 块: str, 命名空间: str = '') -> str:
     """从块的主 `.jk` 里提取导出名（协议.md：导入用目录名，调用用导出名）。
 
     多个导出时优先取与块同名的那个，否则取排序首位——要稳定可测。
+    第三方块要传 `命名空间`，否则只会去 `stdlib/blocks/` 里找（查不到）。
     """
-    目录 = _块目录(领域, 块)
+    目录 = _块目录(领域, 块, 命名空间)
     jk = _主jk(目录, 块)
     if jk is None:
-        raise BlockError('块「%s」（领域 %s）没有主 .jk，无法确定导出名' % (块, 领域))
+        raise BlockError('块「%s」（领域 %s%s）没有主 .jk，无法确定导出名'
+                         % (块, 领域,
+                            '，命名空间 %s' % 命名空间 if 命名空间 else ''))
     names = sorted(blocks.extract_exports(jk))
     if not names:
         raise BlockError('块「%s」没有 `导出` 声明，无法调用' % 块)
@@ -337,15 +356,20 @@ def _校验方案(方案: dict) -> dict:
             if not s.get(字段):
                 raise BlockError('步骤 %d 缺少必填字段「%s」' % (i, 字段))
         块, 领域 = s[_F块], s[_F领域]
+        命名空间 = s.get(_F命名空间) or ''
         if 领域 not in ALLOWED_DOMAINS:
             raise BlockError('步骤 %d 的领域 %r 不在白名单（允许：%s）'
                              % (i, 领域, '/'.join(sorted(ALLOWED_DOMAINS))))
-        if not os.path.isdir(_块目录(领域, 块)):
+        if not os.path.isdir(_块目录(领域, 块, 命名空间)):
             raise BlockError('步骤 %d 的块「%s」不存在：%s 下没有这个目录'
                              '（`jk 块 查找 %s` 看看真名）'
-                             % (i, 块, os.path.join('blocks', 领域), 块))
+                             % (i, 块,
+                                os.path.join('blocks',
+                                             *([命名空间] if 命名空间 else []),
+                                             领域),
+                                块))
         if not s.get(_F导出名):
-            s[_F导出名] = _推导出名(领域, 块)
+            s[_F导出名] = _推导出名(领域, 块, 命名空间)
         新步骤.append(s)
 
     新方案 = dict(方案)
@@ -718,7 +742,9 @@ def _cmd_select(args: List[str]) -> int:
             方案 = _校验方案({
                 _F需求: 需求,
                 _F步骤: [{_F块: h.name, _F领域: h.domain,
-                        _F说明: h.description} for h in hits],
+                        _F说明: h.description,
+                        **({_F命名空间: h.namespace} if h.namespace else {})}
+                        for h in hits],
             })
             源码 = _glue().synthesize(方案, 自动链式=True)
         except (BlockError, ValueError) as e:

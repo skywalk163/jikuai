@@ -196,5 +196,77 @@ class 命名空间导入行Test(unittest.TestCase):
         ])
 
 
+class 块元数据表三元键Test(unittest.TestCase):
+    """v0.20.0 W73：`_块元数据表` 从纯块名键改为 (命名空间, 领域, 名称) 三元键。
+
+    此前跨命名空间同名块会静默互相覆盖，且 `scan_blocks` 把空命名空间排在最前
+    （字典序），后写的第三方条目赢 —— 结果是**第三方块的入参元数/示例顶掉内置块的**。
+    合成出的 `?` 占位个数与「用示例填参」都会拿错块的元数据。
+    """
+
+    class _假块:
+        def __init__(self, name, domain, namespace, inputs, example):
+            self.name = name
+            self.domains = [domain]
+            self.namespace = namespace
+            self.inputs = inputs
+            self.output = {'类型': '数'}
+            self.example = example
+
+    def setUp(self):
+        glue.reset_meta_cache()
+        self.addCleanup(glue.reset_meta_cache)
+
+    def _装假扫描(self, 块列表):
+        from jikuai.pkg import blocks as 真块模块
+        原 = 真块模块.scan_blocks
+        真块模块.scan_blocks = lambda root=None: list(块列表)
+        self.addCleanup(lambda: setattr(真块模块, 'scan_blocks', 原))
+
+    def test_跨命名空间同名块_元数据不互相覆盖(self):
+        内置 = self._假块('求和', '数据', '',
+                        [{'名': '列', '类型': '数'}], '求和(1)')
+        第三方 = self._假块('求和', '数据', '甲包',
+                         [{'名': '甲一', '类型': '数'},
+                          {'名': '甲二', '类型': '数'}], '甲值(7 8)')
+        self._装假扫描([内置, 第三方])
+
+        表 = glue._块元数据表()
+        self.assertIn(('', '数据', '求和'), 表)
+        self.assertIn(('甲包', '数据', '求和'), 表)
+        self.assertEqual(len(表[('', '数据', '求和')]['输入']), 1)
+        self.assertEqual(len(表[('甲包', '数据', '求和')]['输入']), 2)
+
+    def test_占位符个数按命名空间取对块的元数(self):
+        """内置块 1 参、第三方同名块 2 参：合成时各自拿到自己那份元数。"""
+        内置 = self._假块('求和', '数据', '',
+                        [{'名': '列', '类型': '数'}], '')
+        第三方 = self._假块('求和', '数据', '甲包',
+                         [{'名': '甲一', '类型': '数'},
+                          {'名': '甲二', '类型': '数'}], '')
+        self._装假扫描([内置, 第三方])
+
+        内置源码 = glue.synthesize({'步骤': [
+            {'块': '求和', '领域': '数据', '导出名': '求和'}]})
+        self.assertIn('求和(?)', 内置源码)
+
+        glue.reset_meta_cache()
+        第三方源码 = glue.synthesize({'步骤': [
+            {'块': '求和', '领域': '数据', '导出名': '甲值', '命名空间': '甲包'}]})
+        self.assertIn('甲值(? ?)', 第三方源码)
+
+    def test_未给命名空间时退化查找优先内置(self):
+        """旧调用方（不带 `命名空间` 字段的方案）行为必须一字不变——取内置那条。"""
+        内置 = self._假块('求和', '数据', '',
+                        [{'名': '列', '类型': '数'}], '')
+        第三方 = self._假块('求和', '数据', '甲包',
+                         [{'名': '甲一', '类型': '数'},
+                          {'名': '甲二', '类型': '数'}], '')
+        self._装假扫描([内置, 第三方])
+        表 = glue._块元数据表()
+        命中 = glue._查块元数据(表, '求和')
+        self.assertEqual(len(命中['输入']), 1, '退化查找应优先内置块')
+
+
 if __name__ == '__main__':
     unittest.main()

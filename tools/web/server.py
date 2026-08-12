@@ -69,6 +69,7 @@ from jikuai.service import schema                                  # noqa: E402
 _F需求, _F共享, _F打印 = schema.PLAN_OPTIONAL
 _F步骤 = schema.PLAN_REQUIRED[0]
 _F块, _F领域, _F导出名 = schema.STEP_REQUIRED
+_F参数, _F说明, _F命名空间 = schema.STEP_OPTIONAL
 _F源码, _F执行结果 = schema.RUN_ENVELOPE_REQUIRED
 #: `已存方案` 的字段名（W31）。`_F方案` 同时也是 `/api/组`、`/api/跑` 请求体
 #: 里那个信封键——存档项与请求信封用的是同一个字段名，取自同一处常量。
@@ -248,16 +249,28 @@ def _校验块存在(方案: dict) -> dict:
     `schema.ensure_plan` 只管字段形状，管不到「这个块是不是真的有」。不在这里
     拦的话，glue 会照着不存在的块生成 `从 blocks.数据.不存在 导入 x`，等到
     执行期才炸——报错位置离病根太远。
+
+    v0.20.0 W73：第三方块（步骤带非空 `命名空间`）要在 `extra_roots()` 里找
+    `<根>/<命名空间>/<领域>/<块>/`，不再只查内置 `stdlib/blocks/`。此前硬编码
+    内置根让「装得上、检索得到，但一 `组`/`跑` 就报块不存在」。
     """
-    from jikuai.pkg.blocks import ALLOWED_DOMAINS, blocks_root
+    from jikuai.pkg.blocks import ALLOWED_DOMAINS, blocks_root, extra_roots
     for i, 步 in enumerate(方案.get(_F步骤) or [], 1):
         领域, 块 = 步.get(_F领域), 步.get(_F块)
+        命名空间 = 步.get(_F命名空间) or ''
         if 领域 not in ALLOWED_DOMAINS:
             raise _请求错误('步骤 %d 的领域「%s」不在白名单（允许：%s）'
                           % (i, 领域, '/'.join(sorted(ALLOWED_DOMAINS))))
-        if not os.path.isdir(os.path.join(blocks_root(), 领域, 块)):
-            raise _请求错误('步骤 %d 的块「%s」不存在：blocks/%s 下没有这个目录'
-                          % (i, 块, 领域))
+        if 命名空间:
+            候选根 = [os.path.join(根, 命名空间, 领域, 块)
+                    for 根 in extra_roots()]
+            位置说明 = 'blocks/%s/%s' % (命名空间, 领域)
+        else:
+            候选根 = [os.path.join(blocks_root(), 领域, 块)]
+            位置说明 = 'blocks/%s' % 领域
+        if not any(os.path.isdir(p) for p in 候选根):
+            raise _请求错误('步骤 %d 的块「%s」不存在：%s 下没有这个目录'
+                          % (i, 块, 位置说明))
     return 方案
 
 

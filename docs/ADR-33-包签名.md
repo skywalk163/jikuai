@@ -1,6 +1,6 @@
 # ADR-33：包签名
 
-- 状态：**已定稿**
+- 状态：**已实施**
 - 日期：2026-08-12
 - 阶段：v0.20.0 · M19（W73-W76）
 - 关联：`docs/ADR-27-第三方块注册表.md`、`docs/ADR-32-块包格式.md`、`docs/包管理.md`、`src/jikuai/pkg/registry.py`、`src/jikuai/pkg/installer.py`、`docs/路线图-v0.19-v0.20.md`

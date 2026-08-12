@@ -203,11 +203,14 @@ def _cmd_remove(args: List[str]) -> int:
         if not removed:
             return _err(f'清单里没有依赖 {name}')
         save_manifest(manifest)
-        install(manifest)                   # 重解析并裁掉不再需要的包
+        # 重解析并裁掉不再需要的包。报告不能丢：移除一个依赖会触发对**其余**
+        # 依赖的重装，未签名告警在这条路径上同样该出（v0.20.0 W76 补，W75 漏）。
+        报告 = install(manifest)
         uninstall(manifest.root, name)
     except (ManifestError, ResolveError, InstallError) as e:
         return _err(str(e))
     print(f'已移除依赖 {name}')
+    _print_install_warnings(报告)
     return 0
 
 

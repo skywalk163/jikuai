@@ -41,9 +41,14 @@ import base64
 import json
 import os
 import shutil
+import tarfile
 from typing import Dict, List, Optional, Tuple
 
 from . import semver
+from .backend import (
+    BackendError, LocalBackend, RegistryBackend,
+    get_backend, is_remote, join_rel,
+)
 from .manifest import (
     MANIFEST_NAME, Manifest, ManifestError,
     load_manifest, validate_package_name,
@@ -52,8 +57,10 @@ from .manifest import (
 __all__ = [
     'RegistryError', 'PublishReport',
     'INDEX_NAME', 'CATEGORY_DIR', 'PACKAGE_DIR', 'KEY_DIR', 'DEFAULT_CATEGORY',
-    'registry_root', 'load_index', 'save_index', 'registry_key_path',
-    'publish', 'lookup', 'lookup_signature',
+    'ARCHIVE_SUFFIX',
+    'registry_root', 'open_backend', 'load_index', 'save_index',
+    'registry_key_path', 'key_rel', 'package_rel', 'archive_rel',
+    'publish', 'lookup', 'lookup_entry', 'lookup_signature',
     'list_packages', 'search', 'unpublish',
 ]
 
@@ -68,6 +75,9 @@ PACKAGE_DIR = '包'
 KEY_DIR = '密钥'
 #: 清单未声明「分类」时的归属。
 DEFAULT_CATEGORY = '通用'
+#: 远程注册表下快照归档后缀。本地 `publish` 同步生成 `<版本>.tar.gz`，
+#: 远程读端 `GET 包/<名>/<版本>.tar.gz`。
+ARCHIVE_SUFFIX = '.tar.gz'
 #: 索引格式版本。索引结构演进时递增，读到更高版本直接拒绝而非猜测。
 INDEX_VERSION = 1
 
@@ -111,13 +121,46 @@ class PublishReport:
 # ---- 路径解析 ---------------------------------------------------------
 
 def registry_root(root: Optional[str] = None) -> str:
-    """解析注册表根目录（不创建）。"""
+    """解析注册表定位符（本地路径或远程 URL）。
+
+    v0.20.0 M20：`JIKUAI_REGISTRY` 既可以是本地路径也可以是 `https://...`。
+    返回值直接传 `open_backend` 即可。
+    """
     if root:
+        if is_remote(root):
+            return root.rstrip('/')
         return os.path.abspath(root)
     env = os.environ.get('JIKUAI_REGISTRY')
     if env:
+        if is_remote(env):
+            return env.rstrip('/')
         return os.path.abspath(env)
     return os.path.join(os.path.expanduser('~'), '.jikuai', '注册表')
+
+
+def open_backend(root: Optional[str] = None) -> 'RegistryBackend':
+    """按定位符取后端实例。便利函数，等价于 `get_backend(registry_root(root))`。"""
+    return get_backend(registry_root(root))
+
+
+def key_rel(signer: str) -> str:
+    """签名者公钥在注册表内的相对路径。"""
+    validate_package_name(signer)
+    return join_rel(KEY_DIR, signer + '.公钥')
+
+
+def package_rel(name: str, version: str) -> str:
+    """快照目录在注册表内的相对路径。"""
+    validate_package_name(name)
+    semver.parse_version(version)
+    return join_rel(PACKAGE_DIR, name, version)
+
+
+def archive_rel(name: str, version: str) -> str:
+    """快照归档在注册表内的相对路径（远端 tar.gz 下载）。"""
+    validate_package_name(name)
+    semver.parse_version(version)
+    return join_rel(PACKAGE_DIR, name, version + ARCHIVE_SUFFIX)
 
 
 def _ensure_within(base: str, target: str) -> str:
@@ -133,29 +176,36 @@ def _ensure_within(base: str, target: str) -> str:
     return target_abs
 
 
-def _index_path(root: str) -> str:
-    return os.path.join(root, INDEX_NAME)
+def _category_rel(category: str) -> str:
+    _validate_category(category)
+    return join_rel(CATEGORY_DIR, f'{category}.json')
+
+
+def _local(root: str) -> LocalBackend:
+    """要求定位符是本地的，返回 `LocalBackend`。写路径与快照目录用。"""
+    if is_remote(root):
+        raise RegistryError(
+            f'{root} 是远程注册表，本轮只支持远程读；'
+            f'发布/删除请对本地注册表根操作（见 ADR-34 §2.1）')
+    return LocalBackend(root)
 
 
 def _category_path(root: str, category: str) -> str:
-    _validate_category(category)
-    return _ensure_within(root, os.path.join(root, CATEGORY_DIR, f'{category}.json'))
+    return _local(root).path_of(_category_rel(category))
 
 
 def _package_path(root: str, name: str, version: str) -> str:
-    validate_package_name(name)
-    semver.parse_version(version)
-    return _ensure_within(root, os.path.join(root, PACKAGE_DIR, name, version))
+    return _local(root).path_of(package_rel(name, version))
 
 
 def registry_key_path(root: str, signer: str) -> str:
-    """签名者公钥在注册表内的落点：`<注册表根>/密钥/<签名者>.公钥`。
+    """签名者公钥在**本地**注册表内的落点：`<注册表根>/密钥/<签名者>.公钥`。
 
     签名者别名与包名同一注入面（要拼进路径），复用 `validate_package_name`
-    的字符白名单：不允许点、路径分隔符、控制字符。
+    的字符白名单：不允许点、路径分隔符、控制字符。远程注册表下用
+    `key_rel(signer)` + 后端 `read_text`。
     """
-    validate_package_name(signer)
-    return _ensure_within(root, os.path.join(root, KEY_DIR, signer + '.公钥'))
+    return _local(root).path_of(key_rel(signer))
 
 
 def _validate_category(category: str) -> str:
@@ -165,27 +215,27 @@ def _validate_category(category: str) -> str:
     return category
 
 
-# ---- 原子写 -----------------------------------------------------------
+# ---- 后端读写（统一收口） ---------------------------------------------
 
-def _write_json(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + '\n'
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(text)
-    os.replace(tmp, path)
+def _dump_json(data: dict) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + '\n'
 
 
-def _read_json(path: str) -> Optional[dict]:
-    if not os.path.isfile(path):
-        return None
+def _write_json(backend: RegistryBackend, rel: str, data: dict) -> str:
+    """写 JSON 到注册表内相对路径。返回定位串（本地是绝对路径）。"""
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        raise RegistryError(f'{path} 不是合法 JSON：第 {e.lineno} 行 {e.msg}') from None
-    except UnicodeDecodeError:
-        raise RegistryError(f'{path} 编码不是 UTF-8') from None
+        backend.write_text(rel, _dump_json(data))
+    except BackendError as e:
+        raise RegistryError(str(e)) from None
+    return backend.describe(rel)
+
+
+def _read_json(backend: RegistryBackend, rel: str) -> Optional[dict]:
+    """读注册表内相对路径的 JSON。不存在返回 `None`。"""
+    try:
+        return backend.read_json(rel)
+    except BackendError as e:
+        raise RegistryError(str(e)) from None
 
 
 # ---- 主索引 -----------------------------------------------------------
@@ -198,14 +248,12 @@ def _empty_index() -> dict:
     }
 
 
-def load_index(root: Optional[str] = None) -> dict:
-    """读取主索引。不存在时返回一份空索引（不落盘）。"""
-    base = registry_root(root)
-    data = _read_json(_index_path(base))
+def _load_index_via(backend: RegistryBackend) -> dict:
+    data = _read_json(backend, INDEX_NAME)
     if data is None:
         return _empty_index()
     if not isinstance(data, dict) or not isinstance(data.get('索引'), dict):
-        raise RegistryError(f'主索引结构损坏：{_index_path(base)}')
+        raise RegistryError(f'主索引结构损坏：{backend.describe(INDEX_NAME)}')
     fmt = data.get('格式版本', 1)
     if not isinstance(fmt, int) or fmt > INDEX_VERSION:
         raise RegistryError(
@@ -213,26 +261,46 @@ def load_index(root: Optional[str] = None) -> dict:
     return data
 
 
+def load_index(root: Optional[str] = None) -> dict:
+    """读取主索引。不存在时返回一份空索引（不落盘）。远程注册表同样可读。"""
+    return _load_index_via(open_backend(root))
+
+
 def save_index(index: dict, root: Optional[str] = None) -> str:
     """刷新统计后原子写回主索引。返回写入路径。"""
-    base = registry_root(root)
+    backend = _local(registry_root(root))
     entries = index.setdefault('索引', {})
     index['格式版本'] = INDEX_VERSION
     index['统计'] = {
         '总包数': len(entries),
         '总版本数': sum(len(v.get('版本', ())) for v in entries.values()),
     }
-    path = _index_path(base)
-    _write_json(path, index)
-    return path
+    return _write_json(backend, INDEX_NAME, index)
 
 
-def _load_category(root: str, category: str) -> dict:
-    data = _read_json(_category_path(root, category))
+def _load_category_via(backend: RegistryBackend, category: str) -> dict:
+    data = _read_json(backend, _category_rel(category))
     return data if isinstance(data, dict) else {}
 
 
+def _load_category(root: str, category: str) -> dict:
+    return _load_category_via(get_backend(root), category)
+
+
 # ---- 发布 -------------------------------------------------------------
+
+def _archive_snapshot(snapshot_dir: str, archive_path: str) -> None:
+    """把快照目录打成 tar.gz 归档（本地发布同步生成，远程读端直接 GET）。
+
+    归档内成员路径以快照目录名为根：`<版本>/包.json`、`<版本>/主.jk` 等。
+    解压端据此还原为与本地快照一致的目录结构。
+    """
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    base_name = os.path.basename(snapshot_dir)
+    tmp = archive_path + '.tmp'
+    with tarfile.open(tmp, 'w:gz') as tf:
+        tf.add(snapshot_dir, arcname=base_name)
+    os.replace(tmp, archive_path)
 
 def _copy_source(src_root: str, dest: str) -> Tuple[int, List[str]]:
     """把包源码拷进注册表快照目录。返回 (文件数, 警告列表)。
@@ -295,6 +363,7 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
     if manifest is None:
         manifest = load_manifest()
     base = registry_root(root)
+    backend = _local(base)          # 发布是本地动作（ADR-34 §2.1）
     name = validate_package_name(manifest.name)
     version = manifest.version
     semver.parse_version(version)
@@ -357,23 +426,26 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
         if staging and os.path.isdir(staging):
             shutil.rmtree(staging, ignore_errors=True)
 
+    # v0.20.0 W78（ADR-34 §2.4）：本地发布同步生成 `<版本>.tar.gz`，让远程
+    # 读端能直接 `GET 包/<名>/<版本>.tar.gz`。归档只是快照目录的镜像，
+    # 内容仍由校验和/签名背书，本身不签名。管理员把整个注册表根静态托管即可。
+    _archive_snapshot(dest, _package_path(base, name, version) + ARCHIVE_SUFFIX)
+
     # 有签名：把公钥落到注册表 `密钥/<签名者>.公钥`（TOFU 首次拉取源）。
     # 与已存在的公钥字节不等 → 拒写，避免同一别名被静默改身份 —— 别名换身份
     # 必须换名字，管理员端做的动作应是「删旧公钥、审新公钥」而非静默覆盖。
     if signer is not None and signature_b64:
-        pk_dest = registry_key_path(base, signer)
-        os.makedirs(os.path.dirname(pk_dest), exist_ok=True)
+        pk_rel = key_rel(signer)
         pk_b64_line = base64.b64encode(pubkey_bytes).decode('ascii') + '\n'
-        if os.path.isfile(pk_dest):
-            with open(pk_dest, 'r', encoding='utf-8') as f:
-                if f.read().strip() != pk_b64_line.strip():
-                    raise RegistryError(
-                        f'注册表里已有别名 {signer!r} 的公钥，且与本次不一致；'
-                        f'签名身份不允许静默替换。要换身份请先删 {pk_dest}，'
-                        f'或改用另一个别名')
+        existing_pk = backend.read_text(pk_rel)
+        if existing_pk is not None:
+            if existing_pk.strip() != pk_b64_line.strip():
+                raise RegistryError(
+                    f'注册表里已有别名 {signer!r} 的公钥，且与本次不一致；'
+                    f'签名身份不允许静默替换。要换身份请先删 '
+                    f'{backend.describe(pk_rel)}，或改用另一个别名')
         else:
-            with open(pk_dest, 'w', encoding='utf-8', newline='\n') as f:
-                f.write(pk_b64_line)
+            backend.write_text(pk_rel, pk_b64_line)
 
     # 写分片：包名 → 版本 → 条目详情
     shard = _load_category(base, category)
@@ -397,7 +469,7 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
         entry_detail['签名者'] = signer
         entry_detail['签名'] = signature_b64
     pkg_shard[version] = entry_detail
-    _write_json(_category_path(base, category), shard)
+    _write_json(backend, _category_rel(category), shard)
 
     # 写主索引：只存路由信息，详情在分片里
     versions = sorted(set((existing or {}).get('版本') or ()) | {version},
@@ -423,8 +495,9 @@ def unpublish(name: str, version: Optional[str] = None,
     能力——已发布版本被撤回会让下游锁文件失效（left-pad 事件的教训）。
     """
     base = registry_root(root)
+    backend = _local(base)
     validate_package_name(name)
-    index = load_index(base)
+    index = _load_index_via(backend)
     entries = index.setdefault('索引', {})
     entry = entries.get(name)
     if entry is None:
@@ -436,13 +509,14 @@ def unpublish(name: str, version: Optional[str] = None,
         if v not in all_versions:
             raise RegistryError(f'{name} 没有版本 {v}')
 
-    shard = _load_category(base, category)
+    shard = _load_category_via(backend, category)
     for v in targets:
         shutil.rmtree(_package_path(base, name, v), ignore_errors=True)
+        backend.remove(archive_rel(name, v))
         shard.get(name, {}).pop(v, None)
     if not shard.get(name):
         shard.pop(name, None)
-    _write_json(_category_path(base, category), shard)
+    _write_json(backend, _category_rel(category), shard)
 
     remaining = [v for v in all_versions if v not in targets]
     if remaining:
@@ -460,14 +534,18 @@ def unpublish(name: str, version: Optional[str] = None,
 
 def lookup(name: str, constraint: Optional[str] = None,
            root: Optional[str] = None) -> Tuple[str, str]:
-    """在注册表里选一个满足约束的版本。返回 `(版本, 快照目录)`。
+    """在本地注册表里选一个满足约束的版本。返回 `(版本, 快照目录)`。
 
     选版策略：满足约束的**最高**版本。没有任何版本满足时报错并列出
     实际可用版本——比笼统的「找不到包」有用得多。
+
+    NOTE: 本函数只对本地注册表有意义（返回快照目录路径）。远程注册表
+    用 `lookup_entry`（返回字段 dict）+ tar.gz 下载。
     """
     base = registry_root(root)
+    backend = _local(base)
     validate_package_name(name)
-    index = load_index(base)
+    index = _load_index_via(backend)
     entry = (index.get('索引') or {}).get(name)
     if entry is None:
         raise RegistryError(f'注册表里没有包 {name}（注册表根：{base}）')
@@ -496,6 +574,42 @@ def lookup(name: str, constraint: Optional[str] = None,
     return chosen, snapshot
 
 
+def lookup_entry(name: str, constraint: Optional[str] = None,
+                 root: Optional[str] = None) -> Tuple[str, dict]:
+    """在注册表（本地或远程）里选版并返回 `(版本, 分片条目 dict)`。
+
+    v0.20.0 M20 新增：远程注册表无法返回快照目录路径，`sources.py` 的
+    HTTP 分支需要分片条目里的 `快照`/`校验和`/`签名者`/`签名` 等字段。
+    本地注册表同样可用——与 `lookup` 共享选版逻辑，只是返回值不同。
+    """
+    base = registry_root(root)
+    backend = open_backend(root)
+    validate_package_name(name)
+    index = _load_index_via(backend)
+    entry = (index.get('索引') or {}).get(name)
+    if entry is None:
+        raise RegistryError(f'注册表里没有包 {name}（{backend.describe()}）')
+
+    versions = list(entry.get('版本') or ())
+    if not versions:
+        raise RegistryError(f'包 {name} 在注册表里没有任何已发布版本')
+
+    if constraint in (None, '*'):
+        candidates = versions
+    else:
+        candidates = [v for v in versions if semver.matches(v, constraint)]
+    if not candidates:
+        have = '、'.join(sorted(versions, key=semver.parse_version))
+        raise RegistryError(
+            f'包 {name} 没有满足 {constraint} 的版本；已发布版本：{have}')
+
+    chosen = sorted(candidates, key=semver.parse_version)[-1]
+    category = entry.get('分类') or DEFAULT_CATEGORY
+    shard = _load_category_via(backend, category)
+    detail = (shard.get(name) or {}).get(chosen) or {}
+    return chosen, detail
+
+
 def lookup_signature(name: str, version: str,
                      root: Optional[str] = None) -> Tuple[str, str, str]:
     """取某个已发布版本的 `(签名者, 签名, 校验和)`（v0.20.0 W75）。
@@ -509,13 +623,14 @@ def lookup_signature(name: str, version: str,
     只读主索引，不读分片）。
     """
     base = registry_root(root)
+    backend = open_backend(root)
     validate_package_name(name)
-    index = load_index(base)
+    index = _load_index_via(backend)
     entry = (index.get('索引') or {}).get(name)
     if entry is None:
         raise RegistryError(f'注册表里没有包 {name}（注册表根：{base}）')
     category = entry.get('分类') or DEFAULT_CATEGORY
-    detail = (_load_category(base, category).get(name) or {}).get(version) or {}
+    detail = (_load_category_via(backend, category).get(name) or {}).get(version) or {}
     return (str(detail.get('签名者') or ''),
             str(detail.get('签名') or ''),
             str(detail.get('校验和') or ''))
@@ -523,14 +638,14 @@ def lookup_signature(name: str, version: str,
 
 def list_packages(root: Optional[str] = None) -> Dict[str, dict]:
     """列出注册表里所有包的路由条目（不读分片，很快）。"""
-    index = load_index(registry_root(root))
+    index = _load_index_via(open_backend(root))
     return dict(index.get('索引') or {})
 
 
 def search(keyword: str, root: Optional[str] = None) -> List[dict]:
     """按包名/描述搜索。命中时读对应分片取描述，未命中不读盘。"""
-    base = registry_root(root)
-    index = load_index(base)
+    backend = open_backend(root)
+    index = _load_index_via(backend)
     entries = index.get('索引') or {}
     kw = (keyword or '').strip()
     results: List[dict] = []
@@ -540,7 +655,7 @@ def search(keyword: str, root: Optional[str] = None) -> List[dict]:
         category = entry.get('分类') or DEFAULT_CATEGORY
         if category not in shard_cache:
             try:
-                shard_cache[category] = _load_category(base, category)
+                shard_cache[category] = _load_category_via(backend, category)
             except RegistryError:
                 shard_cache[category] = {}
         latest = entry.get('最新版本') or ''

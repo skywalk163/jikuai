@@ -79,12 +79,40 @@ def _read_pubkey_file(path: str):
     if not os.path.isfile(path):
         return None
     with open(path, 'r', encoding='utf-8') as f:
-        pk = base64.b64decode(f.read().strip())
+        return _decode_pubkey(f.read(), path)
+
+
+def _decode_pubkey(text: str, where: str):
+    """base64 文本 → 32 字节公钥。长度不对即抛（不给「差不多」留口子）。"""
+    try:
+        pk = base64.b64decode(text.strip())
+    except (ValueError, TypeError):
+        raise TrustError('公钥 %s 不是合法 base64' % where) from None
     if len(pk) != ed.PUBLIC_KEY_SIZE:
         raise TrustError(
-            '公钥文件 %s 长度异常（期望 %d 字节，得到 %d）'
-            % (path, ed.PUBLIC_KEY_SIZE, len(pk)))
+            '公钥 %s 长度异常（期望 %d 字节，得到 %d）'
+            % (where, ed.PUBLIC_KEY_SIZE, len(pk)))
     return pk
+
+
+def _registry_pubkey(registry_root: str, signer: str):
+    """从注册表（本地或远程 HTTP）取签名者公钥；缺失返回 `(None, 定位串)`。
+
+    v0.20.0 M20：远程注册表下公钥也得走 HTTP（`GET <base>/密钥/<别名>.公钥`），
+    否则远程包的 TOFU 首次 pin 无从建立。读端统一走 `RegistryBackend`。
+    """
+    from . import registry
+    from . import backend as _backend
+    rel = registry.key_rel(signer)
+    try:
+        b = _backend.get_backend(registry_root)
+        text = b.read_text(rel)
+        where = b.describe(rel)
+    except _backend.BackendError as e:
+        raise TrustError(str(e)) from None
+    if text is None:
+        return None, where
+    return _decode_pubkey(text, where), where
 
 
 def resolve_and_pin(signer: str, registry_root: str) -> bytes:
@@ -95,13 +123,12 @@ def resolve_and_pin(signer: str, registry_root: str) -> bytes:
     - 信任库未 pin：从注册表 `密钥/<签名者>.公钥` 拉、pin、返回；注册表也
       没有 → 抛 TrustError（无从建立信任）。
 
-    注册表根里公钥的读取复用 registry.registry_key_path，保证路径校验一致。
+    注册表侧读取走 `RegistryBackend`，本地路径与远程 URL 同一套相对路径，
+    路径校验与 registry 模块一致。
     """
-    from . import registry
     keys.validate_alias(signer)
 
-    reg_path = registry.registry_key_path(registry_root, signer)
-    reg_pk = _read_pubkey_file(reg_path)
+    reg_pk, reg_where = _registry_pubkey(registry_root, signer)
 
     pin_path = _pinned_path(signer)
     pinned = _read_pubkey_file(pin_path)
@@ -118,7 +145,7 @@ def resolve_and_pin(signer: str, registry_root: str) -> bytes:
     if reg_pk is None:
         raise TrustError(
             '签名者「%s」在注册表 %s 里没有公钥，无法建立信任'
-            % (signer, reg_path))
+            % (signer, reg_where))
     os.makedirs(os.path.dirname(pin_path), exist_ok=True)
     with open(pin_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(base64.b64encode(reg_pk).decode('ascii') + '\n')

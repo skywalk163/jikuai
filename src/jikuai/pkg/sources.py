@@ -7,9 +7,11 @@
   开发依赖被拍成快照）。相对路径以「引用它的清单」所在目录为基准。
 - `仓库`：git 仓库。用 `git clone --depth 1` 抓，指定标签时用 `--branch`。
   `git` 不在 PATH 时立即报错，不去尝试拼接 HTTP 或 hackish 降级。
-- `注册表`：已接本地/内网文件系统注册表（M11-1 落地）。`registry.lookup`
-  按 `JIKUAI_REGISTRY` → `~/.jikuai/注册表` 查找本地索引，装不到明确报错。
-  **HTTP 远程注册表分发待 v0.20.0**（需先接入 token 鉴权 + 包签名）。
+- `注册表`：本地/内网文件系统注册表（M11-1）或**远程 HTTP 注册表**
+  （v0.20.0 M20 / ADR-34）。定位符优先取依赖自带的 `registry_url`
+  （per-dependency override），否则用全局 `JIKUAI_REGISTRY` → `~/.jikuai/注册表`。
+  远程走 `GET <base>/包/<名>/<版本>.tar.gz` 下载 + 安全解压到临时目录；
+  本地维持「返回只读快照目录」语义。装不到明确报错。
 
 安全底线：所有磁盘写入路径都用 `_ensure_within(base, target)` 校验，
 杜绝路径穿越；`subprocess` 全部走 `shell=False` + 显式 argv 列表。
@@ -19,6 +21,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from typing import Optional, Tuple
 
@@ -38,12 +41,14 @@ class FetchedSource:
     """一次抓取的结果：包源码根目录 + 清单 + 若干坐标信息。"""
 
     __slots__ = ('root', 'manifest', 'kind', 'origin', 'ephemeral',
-                 'signer', 'signature', 'expected_checksum')
+                 'signer', 'signature', 'expected_checksum',
+                 'registry_locator')
 
     def __init__(self, root: str, manifest: Manifest, kind: str,
                  origin: str, ephemeral: bool,
                  signer: str = '', signature: str = '',
-                 expected_checksum: str = ''):
+                 expected_checksum: str = '',
+                 registry_locator: str = ''):
         self.root = os.path.abspath(root)
         self.manifest = manifest
         self.kind = kind                 # 路径 / 仓库 / 注册表
@@ -57,6 +62,10 @@ class FetchedSource:
         self.signer = signer                        # 签名者别名，未签名为空
         self.signature = signature                  # base64 的 64 字节签名
         self.expected_checksum = expected_checksum  # 索引里记的 `sha256:<hex>`
+        #: v0.20.0 M20：这个包来自哪个注册表定位符（本地路径或 URL）。
+        #: 装包端用这个查公钥——per-dependency override 下不能拿全局
+        #: JIKUAI_REGISTRY 去查，会拿到错包或空。
+        self.registry_locator = registry_locator
 
 
 # ---- 路径工具 ---------------------------------------------------------
@@ -143,13 +152,113 @@ def _fetch_git(dep: Dependency, _base_dir: str) -> FetchedSource:
                          ephemeral=True)
 
 
-def _fetch_registry(dep: Dependency, _base_dir: str) -> FetchedSource:
-    # M11-1：接本地/内网文件系统注册表（registry 模块）。中央 HTTP 注册中心
-    # 待接入 token 鉴权 + 包签名后再开；在那之前 registry.lookup 只认
-    # JIKUAI_REGISTRY / ~/.jikuai/注册表 下的本地索引，装不到就明确报错。
+def _safe_extract_targz(data: bytes, dest_dir: str) -> None:
+    """把 tar.gz 字节流安全解压到 `dest_dir`（ADR-34 §2.4）。
+
+    拒绝任何逃逸出 `dest_dir` 的成员：绝对路径、含 `..` 段、软/硬链接、
+    设备节点。Python 3.12+ 有内置 `data_filter`，3.10/3.11 手写等价校验
+    （项目 `requires-python >= 3.10`）。历史上 Windows 的 tar 路径处理踩过
+    坑，这里宁可拒绝可疑归档也不冒解压到目录外的风险。
+    """
+    dest_abs = os.path.abspath(dest_dir)
+    import io
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tf:
+        members = tf.getmembers()
+        for m in members:
+            if m.islnk() or m.issym():
+                raise SourceError(f'快照归档含链接成员，拒绝解压：{m.name}')
+            if m.isdev():
+                raise SourceError(f'快照归档含设备节点，拒绝解压：{m.name}')
+            name = m.name.replace('\\', '/')
+            if name.startswith('/') or os.path.isabs(name):
+                raise SourceError(f'快照归档含绝对路径成员：{m.name}')
+            target = os.path.abspath(os.path.join(dest_abs, name))
+            try:
+                common = os.path.commonpath([dest_abs, target])
+            except ValueError:
+                raise SourceError(f'快照归档成员越出解压目录：{m.name}') from None
+            if common != dest_abs:
+                raise SourceError(f'快照归档成员越出解压目录：{m.name}')
+        # 校验通过后统一解压。3.12+ 再叠一层官方过滤器兜底。
+        try:
+            tf.extractall(dest_abs, filter='data')
+        except TypeError:
+            tf.extractall(dest_abs)
+
+
+def _fetch_registry_remote(dep: Dependency, backend, locator: str) -> FetchedSource:
+    """从远程 HTTP 注册表抓取：选版 → 下 tar.gz → 安全解压到临时目录。"""
     from . import registry
+    version, detail = registry.lookup_entry(dep.name, dep.constraint,
+                                            root=locator)
+    raw = backend.read_bytes(registry.archive_rel(dep.name, version))
+    if raw is None:
+        raise SourceError(
+            f'远程注册表 {locator} 里 {dep.name}@{version} 缺少快照归档；'
+            f'注册表未按 tar.gz 分发（管理员需用 v0.20.0+ 发布并静态托管）')
+
+    temp_root = tempfile.mkdtemp(prefix='jikuai-fetch-')
     try:
-        version, snapshot = registry.lookup(dep.name, dep.constraint)
+        _safe_extract_targz(raw, temp_root)
+    except Exception:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    # 归档内成员以 `<版本>/...` 为根（见 registry._archive_snapshot）；
+    # 解压后包根就是那唯一的顶层目录。
+    entries = [e for e in os.listdir(temp_root)
+               if os.path.isdir(os.path.join(temp_root, e))]
+    if len(entries) == 1:
+        pkg_root = os.path.join(temp_root, entries[0])
+    else:
+        pkg_root = temp_root
+    try:
+        manifest = load_manifest(pkg_root)
+    except Exception as e:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise SourceError(
+            f'远程注册表包 {dep.name}@{version} 的快照缺少可读的 包.json：{e}'
+        ) from None
+    if manifest.name != dep.name:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise SourceError(
+            f'远程注册表包名不匹配：请求 {dep.name}，'
+            f'但快照清单「名称」是 {manifest.name}')
+    signer = str(detail.get('签名者') or '')
+    signature = str(detail.get('签名') or '')
+    expected = str(detail.get('校验和') or '')
+    # 远程快照落在临时目录，安装完必须清理（ephemeral=True）。校验和/验签
+    # 由 installer 复用 M19 的三道检查完成——归档本身不签名。
+    return FetchedSource(pkg_root, manifest, '注册表', locator,
+                         ephemeral=True, signer=signer,
+                         signature=signature, expected_checksum=expected,
+                         registry_locator=locator)
+
+
+def _fetch_registry(dep: Dependency, _base_dir: str) -> FetchedSource:
+    # v0.20.0 M20（ADR-34）：注册表定位符可以是本地路径或 https:// URL。
+    # 优先级：依赖自带 registry_url（per-dependency override）> 全局
+    # JIKUAI_REGISTRY / ~/.jikuai/注册表。远程走 tar.gz 下载 + 安全解压，
+    # 本地维持原来的「返回只读快照目录」语义。
+    from . import registry
+    from . import backend as _backend
+    locator = dep.registry_url or registry.registry_root()
+
+    if _backend.is_remote(locator):
+        try:
+            b = _backend.get_backend(locator)
+        except _backend.BackendError as e:
+            raise SourceError(str(e)) from None
+        try:
+            return _fetch_registry_remote(dep, b, locator)
+        except registry.RegistryError as e:
+            raise SourceError(str(e)) from None
+        except _backend.BackendError as e:
+            raise SourceError(str(e)) from None
+
+    # 本地注册表：沿用 M11-1 路径，返回不可删的只读快照目录。
+    try:
+        version, snapshot = registry.lookup(dep.name, dep.constraint,
+                                            root=locator)
     except registry.RegistryError as e:
         raise SourceError(str(e)) from None
     try:
@@ -167,13 +276,14 @@ def _fetch_registry(dep: Dependency, _base_dir: str) -> FetchedSource:
     # 抓取阶段就抛错反而会让用户以为包不存在。
     try:
         signer, signature, expected = registry.lookup_signature(
-            dep.name, version)
+            dep.name, version, root=locator)
     except registry.RegistryError:
         signer, signature, expected = '', '', ''
     # 快照是注册表的只读副本，绝不能删（ephemeral=False）。
     return FetchedSource(snapshot, manifest, '注册表', dep.name,
                          ephemeral=False, signer=signer,
-                         signature=signature, expected_checksum=expected)
+                         signature=signature, expected_checksum=expected,
+                         registry_locator=locator)
 
 
 _FETCHERS = {

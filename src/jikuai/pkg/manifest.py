@@ -62,17 +62,23 @@ class ManifestError(Exception):
 class Dependency:
     """一条依赖声明。三种来源互斥：注册表版本约束 / 本地路径 / git 仓库。"""
 
-    __slots__ = ('name', 'constraint', 'path', 'repo', 'tag', 'dev')
+    __slots__ = ('name', 'constraint', 'path', 'repo', 'tag', 'dev',
+                 'registry_url')
 
     def __init__(self, name: str, constraint: Optional[str] = None,
                  path: Optional[str] = None, repo: Optional[str] = None,
-                 tag: Optional[str] = None, dev: bool = False):
+                 tag: Optional[str] = None, dev: bool = False,
+                 registry_url: Optional[str] = None):
         self.name = name
         self.constraint = constraint
         self.path = path
         self.repo = repo
         self.tag = tag
         self.dev = dev
+        #: per-dependency 注册表覆盖（ADR-34 §2.5）。非空时该依赖从这个
+        #: 注册表解析，忽略全局 `JIKUAI_REGISTRY`。它**不是**第四种来源，
+        #: 只是「注册表」来源的修饰——远程与本地注册表是同一种依赖。
+        self.registry_url = registry_url
 
     @property
     def kind(self) -> str:
@@ -114,8 +120,26 @@ class Dependency:
                 raise ManifestError(f'依赖 {name} 的「标签」必须是字符串')
             return cls(name, repo=repo, tag=tag, dev=dev)
 
+        if '注册表' in spec:
+            # ADR-34 §2.5：per-dependency 注册表覆盖。
+            #   {"注册表": "https://reg.example.com", "版本": "^1.2.0"}
+            # 不新增 kind——仍是「注册表」来源，只换解析源。
+            url = spec['注册表']
+            if not isinstance(url, str) or not url:
+                raise ManifestError(f'依赖 {name} 的「注册表」必须是非空字符串')
+            constraint = spec.get('版本')
+            if constraint is not None:
+                if not isinstance(constraint, str):
+                    raise ManifestError(f'依赖 {name} 的「版本」必须是字符串')
+                try:
+                    semver.parse_constraint(constraint)
+                except (semver.InvalidConstraint, semver.InvalidVersion) as e:
+                    raise ManifestError(
+                        f'依赖 {name} 的版本约束不合法：{e}') from None
+            return cls(name, constraint=constraint, registry_url=url, dev=dev)
+
         raise ManifestError(
-            f'依赖 {name} 必须给出「路径」或「仓库」之一，或直接写版本约束')
+            f'依赖 {name} 必须给出「路径」「仓库」「注册表」之一，或直接写版本约束')
 
     def to_spec(self):
         """序列化回清单里的规格形态（与 `from_spec` 互逆）。"""
@@ -125,6 +149,13 @@ class Dependency:
             spec = {'仓库': self.repo}
             if self.tag:
                 spec['标签'] = self.tag
+            return spec
+        if self.registry_url:
+            # 只有显式声明过 override 的依赖才输出 dict —— 既有纯字符串依赖
+            # 必须原样回写，否则 `包.json` 会被无谓改形态、diff 全是噪声。
+            spec = {'注册表': self.registry_url}
+            if self.constraint:
+                spec['版本'] = self.constraint
             return spec
         return self.constraint or '*'
 

@@ -289,9 +289,12 @@ def _verify_registry_signature(node: ResolvedNode,
         return
 
     from . import registry
+    # v0.20.0 M20：per-dependency override 下注册表定位符可能与全局不同，
+    # 验签要从包实际来源的注册表查公钥，否则 TOFU 会去错误的注册表找。
+    reg_locator = getattr(src, 'registry_locator', '') or registry.registry_root()
     try:
         trust.verify_signature(src.signer, src.signature, node.checksum,
-                               registry.registry_root())
+                               reg_locator)
     except trust.TrustError as e:
         raise InstallError(f'{coord} 签名校验失败：{e}') from None
 

@@ -31,6 +31,7 @@ from .installer import (
 from .resolver import ResolveError
 from . import registry
 from . import semver
+from . import keys
 
 __all__ = ['main', 'run']
 
@@ -44,17 +45,22 @@ _USAGE = f"""极快包管理 用法：
   jk 包 装 [--含开发]          按清单安装全部依赖
   jk 包 列表                   列出已安装的包
   jk 包 运行 <脚本名>          执行清单「脚本」里的命令
-  jk 包 发布 [--确认] [--分类 X] [--允许覆盖]
+  jk 包 发布 [--确认] [--分类 X] [--允许覆盖] [--签名 别名]
                                发布当前包到本地注册表。
                                **默认演练**（只体检不落盘），加 --确认 才真发布
+                               --签名 用该别名的私钥签校验和（见 密钥 子命令）
   jk 包 搜索 [关键词]          搜索本地注册表里的包
   jk 包 注册表                 显示注册表根目录与统计
+  jk 包 密钥 生成 <别名>       生成 Ed25519 签名密钥对
+  jk 包 密钥 列表              列出本机已有的签名密钥
+  jk 包 密钥 导出 <别名>       打印 base64 公钥（交给注册表管理员）
   jk 包 帮助                   显示本帮助
 
 英文别名：init / add / remove(rm) / install(i) / list(ls) / run /
-          publish / search / registry / help
+          publish / search / registry / key / help
 
 注册表根目录解析顺序：环境变量 JIKUAI_REGISTRY → ~/.jikuai/注册表
+密钥根目录解析顺序：  环境变量 JIKUAI_KEY_ROOT → ~/.jikuai/密钥
 """
 
 #: 中文命令 -> 规范命令名；英文别名一并归一。
@@ -68,6 +74,7 @@ _ALIASES = {
     '发布': 'publish', 'publish': 'publish',
     '搜索': 'search', 'search': 'search',
     '注册表': 'registry', 'registry': 'registry',
+    '密钥': 'key', 'key': 'key',
     '帮助': 'help', 'help': 'help', '-h': 'help', '--help': 'help',
 }
 
@@ -274,6 +281,7 @@ def _cmd_publish(args: List[str]) -> int:
     confirm = ('--确认' in args or '--confirm' in args)
     allow_overwrite = ('--允许覆盖' in args or '--overwrite' in args)
     category = None
+    signer = None
     i = 0
     while i < len(args):
         if args[i] in ('--分类', '--category'):
@@ -281,25 +289,97 @@ def _cmd_publish(args: List[str]) -> int:
             if i >= len(args):
                 return _err('--分类 后面需要跟一个分类名')
             category = args[i]
+        elif args[i] in ('--签名', '--sign'):
+            i += 1
+            if i >= len(args):
+                return _err('--签名 后面需要跟一个密钥别名（见 jk 包 密钥 列表）')
+            signer = args[i]
         i += 1
     try:
         manifest = load_manifest()
         report = registry.publish(
-            manifest, category=category,
-            dry_run=not confirm, allow_overwrite=allow_overwrite)
+            manifest, category=category, dry_run=not confirm,
+            allow_overwrite=allow_overwrite, signer=signer)
     except (ManifestError, registry.RegistryError) as e:
+        return _err(str(e))
+    except (ValueError, FileNotFoundError) as e:
+        # keys 层的别名不合法 / 私钥缺失
         return _err(str(e))
     for w in report.warnings:
         print(f'  ⚠ {w}')
     if report.dry_run:
         print(f'[演练] {report.name}@{report.version}（分类：{report.category}）')
         print(f'  文件数：{report.file_count}  校验和：{report.checksum[:12]}…')
+        if report.signature:
+            print(f'  签名者：{report.signer}  签名：{report.signature[:12]}…')
         print('  演练完成，未落盘。确认无误后加 --确认 正式发布。')
     else:
         verb = '已覆盖发布' if report.overwritten else '已发布'
         print(f'{verb} {report.name}@{report.version}（分类：{report.category}）')
         print(f'  文件数：{report.file_count}  校验和：{report.checksum[:12]}…')
+        if report.signature:
+            print(f'  签名者：{report.signer}  签名：{report.signature[:12]}…')
+        else:
+            print('  ⚠ 未签名发布。v0.21.0 起装未签名包会被拒，'
+                  '建议加 --签名 <别名>')
         print(f'  快照：{report.target}')
+    return 0
+
+
+def _cmd_key(args: List[str]) -> int:
+    """`jk 包 密钥 生成/列表/导出`（ADR-33 §2.6）。
+
+    子子命令而不是三个顶层命令：密钥操作是同一件事的三个面，挂在 `密钥`
+    下比 `生成密钥`/`列密钥`/`导出密钥` 三个顶层名更好记，也给未来的
+    `密钥 删除`/`密钥 信任` 留了位置。
+
+    **try 只包 keys 调用、不包 print**：`UnicodeEncodeError` 是 `ValueError`
+    子类，把 print 一起包进去会把「控制台编码写不出」误报成「密钥出错」。
+    """
+    if not args:
+        return _err('密钥 需要一个子命令：生成 / 列表 / 导出')
+    sub = args[0]
+    rest = args[1:]
+
+    if sub in ('生成', 'generate', 'gen', 'new'):
+        if not rest:
+            return _err('密钥 生成 需要一个别名，例如：jk 包 密钥 生成 甲')
+        try:
+            pub = keys.generate_keypair(rest[0])
+        except (ValueError, OSError) as e:   # FileExistsError 也是 OSError
+            return _err(str(e))
+        print(f'已生成密钥对「{rest[0]}」')
+        print(f'  密钥根：{keys.key_root()}')
+        print(f'  公钥：{pub}')
+        print('  注意：私钥请勿提交进版本库、勿外发；泄露后只能换别名重发。')
+    elif sub in ('列表', 'list', 'ls'):
+        try:
+            rows = keys.list_keys()
+        except OSError as e:
+            return _err(str(e))
+        if not rows:
+            print(f'密钥根 {keys.key_root()} 下没有任何密钥。'
+                  f'用 jk 包 密钥 生成 <别名> 建一个。')
+            return 0
+        print(f'密钥根：{keys.key_root()}')
+        for alias, has_sk, has_pk in rows:
+            if has_sk and has_pk:
+                kind = '可签名'
+            elif has_pk:
+                kind = '仅公钥（只能验签）'
+            else:
+                kind = '仅私钥（公钥缺失，需重新生成）'
+            print(f'  {alias}  [{kind}]')
+    elif sub in ('导出', 'export'):
+        if not rest:
+            return _err('密钥 导出 需要一个别名，例如：jk 包 密钥 导出 甲')
+        try:
+            b64 = keys.export_public_key_b64(rest[0])
+        except (ValueError, OSError) as e:
+            return _err(str(e))
+        print(b64)
+    else:
+        return _err(f'未知的密钥子命令：{sub}（可用：生成 / 列表 / 导出）')
     return 0
 
 
@@ -354,11 +434,19 @@ _DISPATCH = {
     'publish': _cmd_publish,
     'search': _cmd_search,
     'registry': _cmd_registry,
+    'key': _cmd_key,
 }
 
 
 def run(argv: Optional[List[str]] = None) -> int:
     """包管理子命令入口。`argv` 是 `包` 之后的参数列表。"""
+    # Windows 控制台默认 GBK，输出里的 `⚠` 会 UnicodeEncodeError——而这条
+    # 异常是 ValueError 子类，会被下游的 except 误当成业务错误报出来
+    # （v0.20.0 W74 实测：`密钥 生成` 成功却报「包管理错误」）。
+    # `blocks_cli` 早就这么做了，这里补齐同一处理。
+    from .blocks_cli import _reconfigure_utf8
+    _reconfigure_utf8(sys.stdout)
+    _reconfigure_utf8(sys.stderr)
     argv = list(sys.argv[2:] if argv is None else argv)
     if not argv:
         print(_USAGE)

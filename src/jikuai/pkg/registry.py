@@ -37,6 +37,7 @@
   供应链攻击的经典入口，要改必须显式 `允许覆盖=True`。
 """
 
+import base64
 import json
 import os
 import shutil
@@ -50,8 +51,8 @@ from .manifest import (
 
 __all__ = [
     'RegistryError', 'PublishReport',
-    'INDEX_NAME', 'CATEGORY_DIR', 'PACKAGE_DIR', 'DEFAULT_CATEGORY',
-    'registry_root', 'load_index', 'save_index',
+    'INDEX_NAME', 'CATEGORY_DIR', 'PACKAGE_DIR', 'KEY_DIR', 'DEFAULT_CATEGORY',
+    'registry_root', 'load_index', 'save_index', 'registry_key_path',
     'publish', 'lookup', 'list_packages', 'search', 'unpublish',
 ]
 
@@ -61,6 +62,9 @@ INDEX_NAME = '索引.json'
 CATEGORY_DIR = '分类'
 #: 源码快照目录名。
 PACKAGE_DIR = '包'
+#: 签名者公钥目录名（ADR-33 §2.5）。发布方的公钥随包进注册表，
+#: 装包端 TOFU 首次拉取后记进本地信任库。
+KEY_DIR = '密钥'
 #: 清单未声明「分类」时的归属。
 DEFAULT_CATEGORY = '通用'
 #: 索引格式版本。索引结构演进时递增，读到更高版本直接拒绝而非猜测。
@@ -81,11 +85,13 @@ class PublishReport:
     """一次发布的结果摘要。`演练` 为真时不落盘，其余字段照常填。"""
 
     __slots__ = ('name', 'version', 'category', 'checksum', 'file_count',
-                 'target', 'dry_run', 'overwritten', 'warnings')
+                 'target', 'dry_run', 'overwritten', 'warnings',
+                 'signer', 'signature')
 
     def __init__(self, name: str, version: str, category: str,
                  checksum: str, file_count: int, target: str,
-                 dry_run: bool, overwritten: bool, warnings: List[str]):
+                 dry_run: bool, overwritten: bool, warnings: List[str],
+                 signer: str = '', signature: str = ''):
         self.name = name
         self.version = version
         self.category = category
@@ -95,6 +101,10 @@ class PublishReport:
         self.dry_run = dry_run
         self.overwritten = overwritten
         self.warnings = warnings
+        #: 签名者别名（ADR-33）。未签名发布时是空串。
+        self.signer = signer
+        #: base64 的 64 字节 Ed25519 签名。未签名发布时是空串。
+        self.signature = signature
 
 
 # ---- 路径解析 ---------------------------------------------------------
@@ -135,6 +145,16 @@ def _package_path(root: str, name: str, version: str) -> str:
     validate_package_name(name)
     semver.parse_version(version)
     return _ensure_within(root, os.path.join(root, PACKAGE_DIR, name, version))
+
+
+def registry_key_path(root: str, signer: str) -> str:
+    """签名者公钥在注册表内的落点：`<注册表根>/密钥/<签名者>.公钥`。
+
+    签名者别名与包名同一注入面（要拼进路径），复用 `validate_package_name`
+    的字符白名单：不允许点、路径分隔符、控制字符。
+    """
+    validate_package_name(signer)
+    return _ensure_within(root, os.path.join(root, KEY_DIR, signer + '.公钥'))
 
 
 def _validate_category(category: str) -> str:
@@ -263,11 +283,13 @@ def _publish_checklist(manifest: Manifest) -> List[str]:
 
 def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
             category: Optional[str] = None, dry_run: bool = True,
-            allow_overwrite: bool = False) -> PublishReport:
+            allow_overwrite: bool = False,
+            signer: Optional[str] = None) -> PublishReport:
     """把一个包发布到本地注册表。
 
     `dry_run` **默认为真**：发布是不可逆动作，默认演练、显式才落盘。
     `allow_overwrite` 为假（默认）时，`名称@版本` 已存在即报错。
+    `signer` 非 None 时用该别名的私钥签校验和，签名与签名者写入索引条目。
     """
     if manifest is None:
         manifest = load_manifest()
@@ -306,9 +328,24 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
         # 跨端比对会因格式不同误判不匹配）。前缀即算法标识，为将来换算法留位。
         checksum = 'sha256:' + digest
 
+        # v0.20.0 W74（ADR-33）：签名对象是**校验和字符串**（含前缀），
+        # 不是快照字节。签名输入定长 71 字节，与包体积解耦；校验和已在
+        # 索引条目里，验签方比对字符串即可，无需重跑 sha256。
+        signature_b64 = ''
+        pubkey_bytes = b''
+        if signer is not None:
+            from . import keys as _keys
+            from . import _ed25519 as _ed
+            _keys.validate_alias(signer)
+            seed = _keys.load_private_key(signer)
+            pubkey_bytes = _keys.load_public_key(signer)
+            signature_b64 = base64.b64encode(
+                _ed.sign(seed, checksum.encode('utf-8'))).decode('ascii')
+
         if dry_run:
             return PublishReport(name, version, category, checksum,
-                                 file_count, dest, True, overwritten, warnings)
+                                 file_count, dest, True, overwritten, warnings,
+                                 signer or '', signature_b64)
 
         if os.path.isdir(dest):
             shutil.rmtree(dest)
@@ -319,10 +356,28 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
         if staging and os.path.isdir(staging):
             shutil.rmtree(staging, ignore_errors=True)
 
+    # 有签名：把公钥落到注册表 `密钥/<签名者>.公钥`（TOFU 首次拉取源）。
+    # 与已存在的公钥字节不等 → 拒写，避免同一别名被静默改身份 —— 别名换身份
+    # 必须换名字，管理员端做的动作应是「删旧公钥、审新公钥」而非静默覆盖。
+    if signer is not None and signature_b64:
+        pk_dest = registry_key_path(base, signer)
+        os.makedirs(os.path.dirname(pk_dest), exist_ok=True)
+        pk_b64_line = base64.b64encode(pubkey_bytes).decode('ascii') + '\n'
+        if os.path.isfile(pk_dest):
+            with open(pk_dest, 'r', encoding='utf-8') as f:
+                if f.read().strip() != pk_b64_line.strip():
+                    raise RegistryError(
+                        f'注册表里已有别名 {signer!r} 的公钥，且与本次不一致；'
+                        f'签名身份不允许静默替换。要换身份请先删 {pk_dest}，'
+                        f'或改用另一个别名')
+        else:
+            with open(pk_dest, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(pk_b64_line)
+
     # 写分片：包名 → 版本 → 条目详情
     shard = _load_category(base, category)
     pkg_shard = shard.setdefault(name, {})
-    pkg_shard[version] = {
+    entry_detail = {
         '名称': name,
         '版本': version,
         '描述': manifest.description,
@@ -335,6 +390,12 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
         '极快版本': manifest.jikuai_requirement,
         '快照': os.path.relpath(dest, base).replace(os.sep, '/'),
     }
+    if signer is not None and signature_b64:
+        # 签名字段与旧条目**共存不冲突**：老版本没有这两个字段，装包端读到
+        # 空/缺失时走「未签名」路径（v0.20.0 Warn，v0.21.0 拒装）。
+        entry_detail['签名者'] = signer
+        entry_detail['签名'] = signature_b64
+    pkg_shard[version] = entry_detail
     _write_json(_category_path(base, category), shard)
 
     # 写主索引：只存路由信息，详情在分片里
@@ -349,7 +410,8 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
     save_index(index, base)
 
     return PublishReport(name, version, category, checksum, file_count,
-                         dest, False, overwritten, warnings)
+                         dest, False, overwritten, warnings,
+                         signer or '', signature_b64)
 
 
 def unpublish(name: str, version: Optional[str] = None,

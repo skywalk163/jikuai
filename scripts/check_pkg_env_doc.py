@@ -48,6 +48,7 @@ _CODE_PATHS = [
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'sources.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'registry.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'installer.py'),
+    os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'backend.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'blocks.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'module_loader.py'),
 ]

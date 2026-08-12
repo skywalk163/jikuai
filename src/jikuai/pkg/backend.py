@@ -269,6 +269,14 @@ class HttpBackend(RegistryBackend):
         req = urllib.request.Request(url, method='GET')
         req.add_header('User-Agent', 'jikuai-pkg')
         if self._token:
+            # HTTP 头只能是 latin-1；token 含非 latin-1 字符会在 urllib 内部
+            # 抛 UnicodeEncodeError，这里提前拦成可读的 BackendError。
+            try:
+                self._token.encode('latin-1')
+            except UnicodeEncodeError:
+                raise BackendError(
+                    '注册表 token 含非 latin-1 字符，无法放进 HTTP 头；'
+                    'token 通常是 ASCII 串，请检查配置') from None
             req.add_header('Authorization', f'Bearer {self._token}')
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:

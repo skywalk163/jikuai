@@ -69,7 +69,7 @@
 | 条目 | 来源 | 优先级 | 目标版本 |
 |------|------|--------|----------|
 | ~~中央注册表 = MVP 占位~~ / ~~`jk 包 发布` 未落地~~ —— **认定错误，已于 v0.19.0 W61 纠偏**。本地注册表 + 发布 早在 v0.11.0 落地 | `src/jikuai/pkg/registry.py`、`cli.py` | — | v0.11.0 已完成（此前误记） |
-| HTTP 分发（远程注册表） —— `registry.py` docstring 自陈「HTTP 分发留到接入 token 鉴权 + 包签名之后」。纯本地注册表跨不了机器；`sources._fetch_registry` 目前只认 `JIKUAI_REGISTRY` / `~/.jikuai/注册表` 下的本地索引。**v0.20.0 W73 已定 `docs/ADR-33-包签名.md`**（Ed25519 纯标准库实现 + 校验和格式统一），签名前置就绪，M19 W74-W75 实现发布/校验，M20 才碰 HTTP | `src/jikuai/pkg/registry.py`、`sources.py` | 中 | v0.20.0 M20（签名先行、传输在后） |
+| HTTP 分发（远程注册表） —— **v0.20.0 M20 进行中**。`docs/ADR-34-远程HTTP注册表.md` 已定稿：RegistryBackend 协议抽象（Local/Http）、urllib.request 零依赖、tar.gz 快照传输、两层多注册表（全局默认 + per-dependency override）、Bearer token 鉴权、本轮只做装包端读（发布端预留 M21）。W77 ADR 定稿；W78 后端抽象 + LocalBackend；W79 HTTP 读 + Dependency.registry_url；W80 端到端测试 + 文档 | `src/jikuai/pkg/registry.py`、`sources.py`、`manifest.py`、`docs/ADR-34-远程HTTP注册表.md` | 中 | v0.20.0 M20（W77-W80） |
 | ~~校验和格式不一致~~ —— **v0.20.0 W73 已清**。`registry.publish` 曾存裸 hex、`installer` 往 `包.锁` 存 `sha256:<hex>`；统一为带前缀。动因不是好看：ADR-33 的签名对象是校验和字符串，两端格式不同会签出不同签名导致验签必失败 | `docs/ADR-33-包签名.md` | — | v0.20.0 W73 已完成 |
 | 包签名（非对称）—— **v0.20.0 W73-W76 已完成**。ADR-33 已实施：`_ed25519.py`（RFC 8032 纯标准库）+ `keys.py` 密钥管理 + `trust.py` TOFU 信任库 + `registry.publish(signer=)` 签校验和 + `installer._verify_registry_signature` 三道检查（完整性/签名/未签名过渡告警）+ CLI `密钥` 子命令族与 `发布 --签名` + G17/G18 门禁。`test_pkg_signing.py` 28 用例 | `docs/ADR-33-包签名.md`、`src/jikuai/pkg/{_ed25519,keys,trust,registry,installer,cli}.py` | — | v0.20.0 M19（W73-W76 已完成） |
 | 全局缓存共享 —— 当前每个项目独立 `极快_包/` | `docs/包管理.md` | 低 | 待定 |

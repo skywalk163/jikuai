@@ -54,6 +54,13 @@ MODE_ENV = 'env'  # 由环境变量决定
 PATH_NEURAL = '[神经]'
 PATH_HEURISTIC = '[启发式]'
 
+#: 索引条目里承载命名空间的键名。**必须与 `pkg.blocks.NAMESPACE_KEY` 同值**——
+#: 这里不 import 那个常量，是为了守住「不用检索就不拖块子系统」的惰性边界
+#: （见 `_load_third_party_blocks` 的延迟导入注释）。有 `test_命名空间键名与块子系统同源`
+#: 在测试侧钉住两者一致，改一边漏另一边会当场红。
+_NAMESPACE_KEY = '命名空间'
+
+
 #: 环境变量名。
 _ENV_MODE = 'JIKUAI_AI_RETRIEVAL'
 
@@ -79,6 +86,12 @@ class Hit:
     #: 默认索引不含 `示例`（token 成本优先，见 `pkg.blocks._INDEX_ENTRY_KEYS`），
     #: 此时保持空串。`compare=False`：示例不参与排序/相等语义。
     example: str = field(default='', compare=False)
+    #: 块所属命名空间（v0.19.0 W69）。**内置块恒为空串**，第三方块是其来源包名。
+    #: 这是「导入路径」的第一段真源：`从 blocks.<命名空间>.<领域>.<块> 导入 X`
+    #: 少了它，第三方块的命中就永远拼不出能跑的导入行（失败发生在使用方，
+    #: 块作者自己测不出来）。`compare=False`：命名空间不参与排序/相等语义，
+    #: 否则同名块跨命名空间会被当成「不同分数」影响 order。
+    namespace: str = field(default='', compare=False)
 
     def as_dict(self) -> dict:
         d = {
@@ -92,6 +105,9 @@ class Hit:
         # 处理），token 敏感的调用方也不会平白多收一个空键。
         if self.example:
             d['示例'] = self.example
+        # 同理：内置块（空命名空间）不写这个键，旧调用方的字典形状一字不变。
+        if self.namespace:
+            d['命名空间'] = self.namespace
         return d
 
 
@@ -604,6 +620,7 @@ class Retriever:
                 description=block.get('描述', ''),
                 path=PATH_HEURISTIC,
                 example=block.get('示例', ''),
+                namespace=block.get(_NAMESPACE_KEY) or '',
             ))
         return hits
 
@@ -641,6 +658,7 @@ class Retriever:
                 description=block.get('描述', ''),
                 path=PATH_NEURAL,
                 example=block.get('示例', ''),
+                namespace=block.get(_NAMESPACE_KEY) or '',
             ))
         return hits
 

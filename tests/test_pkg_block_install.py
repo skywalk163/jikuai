@@ -195,11 +195,11 @@ def test_索引路径用正斜杠且不含绝对路径(tmp_path):
 
 def test_声明的块根不存在时跳过而不报错(tmp_path):
     """包声明了 `块` 但没带上目录：跳过这一条，别让整个安装失败。"""
-    甲 = os.path.join(str(tmp_path), '空壳')
+    甲 = os.path.join(str(tmp_path), '虚壳包')
     _写(os.path.join(甲, '包.json'), json.dumps(
-        {'名称': '空壳', '版本': '1.0.0', '块': ['blocks']},
+        {'名称': '虚壳包', '版本': '1.0.0', '块': ['blocks']},
         ensure_ascii=False))
-    proj = _造宿主(str(tmp_path), {'空壳': '../空壳'})
+    proj = _造宿主(str(tmp_path), {'虚壳包': '../虚壳包'})
     _装(proj)                                  # 不抛
     assert not os.path.isfile(_索引路径(proj))
 

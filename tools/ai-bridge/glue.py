@@ -44,7 +44,7 @@ from jikuai.service.schema import (  # noqa: E402
 #: 整元组解包而不是硬编码下标：协议真加了字段这里会当场 ValueError。
 #: `PLAN_REQUIRED` 目前只有一个字段，解包写法保留尾逗号（`_F步骤, = ...`）。
 _F块, _F领域, _F导出名 = STEP_REQUIRED
-_F参数, _F说明 = STEP_OPTIONAL
+_F参数, _F说明, _F命名空间 = STEP_OPTIONAL
 _F步骤, = PLAN_REQUIRED
 _F需求, _F共享, _F打印 = PLAN_OPTIONAL
 
@@ -431,15 +431,29 @@ class TypeGraph:
 
 
 def _导入行(steps):
-    """生成去重后的 `从 ... 导入 ...` 行。顺序按步骤首次出现，稳定可测。"""
+    """生成去重后的 `从 ... 导入 ...` 行。顺序按步骤首次出现，稳定可测。
+
+    v0.19.0 W69：第三方块（步骤带非空 `命名空间`）多插一段——
+    `从 blocks.<命名空间>.<领域>.<块> 导入 X`。内置块（无 `命名空间` 或空串）
+    仍是两段 `blocks.<领域>.<块>`，一个字节都不变。
+
+    这段不是可选优化：`module_loader` 把「已装块包的块根父目录」挂进搜索路径，
+    第三方块的物理布局是 `<块根>/<命名空间>/<领域>/<块>/`，少了命名空间段
+    永远解析不到。而失败发生在**使用方**运行时——块作者自己测不出来。
+
+    去重键含命名空间：跨命名空间同名块（`scan_blocks` 明确允许）是两条不同的
+    导入行，用 (领域, 块, 导出名) 做键会把后者静默吞掉。
+    """
     seen = set()
     lines = []
     for s in steps:
-        key = (s[_F领域], s[_F块], s[_F导出名])
+        ns = s.get(_F命名空间) or ''
+        key = (ns, s[_F领域], s[_F块], s[_F导出名])
         if key in seen:
             continue
         seen.add(key)
-        lines.append('从 blocks.%s.%s 导入 %s。' % key)
+        路径段 = ['blocks'] + ([ns] if ns else []) + [s[_F领域], s[_F块]]
+        lines.append('从 %s 导入 %s。' % ('.'.join(路径段), s[_F导出名]))
     return lines
 
 

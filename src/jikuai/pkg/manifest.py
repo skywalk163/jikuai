@@ -231,7 +231,14 @@ class Manifest:
 
 
 def validate_package_name(name: str) -> str:
-    """校验包名。不合法直接抛 `ManifestError`。"""
+    """校验包名。不合法直接抛 `ManifestError`。
+
+    **注意本函数刻意不校验词法原子性。** 包名空间（`_NAME_RE` 允许 `-` / `_` /
+    拉丁字母）与「点分模块路径段」空间（lexer 只吃单 token，`-` 直接是非法字符）
+    是**两套不兼容的字符集**——`my-pkg` 是完全合法的包名，但永远做不了命名空间。
+    只有**携带块**的包才会被当命名空间用，所以原子性检查放在 `_validate_block_roots`
+    那一侧（见 v0.19.0 W69 的取舍记录），普通包不受牵连。
+    """
     if not isinstance(name, str):
         raise ManifestError(f'包名必须是字符串，得到 {type(name).__name__}')
     if not _NAME_RE.match(name):
@@ -240,6 +247,37 @@ def validate_package_name(name: str) -> str:
             f'1-64 字，且不含点与路径分隔符）')
     if name in _RESERVED_NAMES:
         raise ManifestError(f'包名 {name!r} 与内置标准库模块重名，请另取一个')
+    return name
+
+
+def validate_namespace_name(name: str) -> str:
+    """校验一个包名能否充当块命名空间（v0.19.0 W69）。
+
+    携带块的包，其包名会作为命名空间进入点分模块路径
+    （`从 blocks.<包名>.<领域>.<块> 导入 X`）。parser 的 `_read_module_name()`
+    每个 `.` 之后只取**一个** token，所以包名必须词法原子，否则块永远导不进来
+    ——而且失败发生在**使用方**，包作者自己测不出来。
+
+    与 `validate_package_name` 分开的理由见后者的 docstring：普通包不需要这条。
+
+    `check_module_segment_atomicity` 内部直接喂 lexer，遇到 `-` 这类**非法字符**
+    会抛 `JiKuaiError` 而不是返回 `(False, ...)`，所以这里要兜住转成 `ManifestError`
+    ——对调用方来说「lexer 都吃不下」和「切成了多段」是同一类失败。
+    """
+    from .blocks import check_module_segment_atomicity  # 延迟导入，无循环
+    try:
+        atomic, pieces = check_module_segment_atomicity(name)
+    except Exception:                       # lexer 非法字符（`-` 等）
+        raise ManifestError(
+            f'包名 {name!r} 不能作为块命名空间：分词器无法处理其中的字符'
+            f'（`-` 之类在极快源码里是非法字符）。携带块的包请改用纯中文或'
+            f'纯字母的单 token 名字。')
+    if not atomic:
+        切分 = '+'.join(f'{val}({typ})' for typ, val in pieces)
+        raise ManifestError(
+            f'包名 {name!r} 不能作为块命名空间（会被分词器切成多段：{切分}）。'
+            f'它会出现在 `从 blocks.{name}.<领域>.<块> 导入 X` 里，'
+            f'而点分路径每段只能是单个 token——否则块永远导不进来。请换个名字。')
     return name
 
 
@@ -264,20 +302,27 @@ def _validate(data: dict, path: Optional[str]) -> None:
         table = data.get(key)
         if table is not None and not isinstance(table, dict):
             raise ManifestError(f'清单「{key}」必须是对象{where}')
-    _validate_block_roots(data.get('块'), where)
+    _validate_block_roots(data.get('块'), where, name=data.get('名称', ''))
 
 
-def _validate_block_roots(raw, where: str) -> None:
+def _validate_block_roots(raw, where: str, name: str = '') -> None:
     """校验 `块` 字段（ADR-32 §2.1）：字符串列表，每条是包内相对路径。
 
     安全边界：块根路径来自**第三方包的清单**，是新增的外部输入面。绝对
     路径与 `..` 都会让安装器把块根指到包外，等于开一个目录穿越口子——
     与 `入口` 字段的逃逸防护同一口径，在这里一次拦住。
+
+    v0.19.0 W69：若 `name` 非空且 `raw` 非 None（即包带块），追加校验包名
+    能否充当命名空间。这是**唯一的入口**——普通包不受牵连，只有声明了 `块`
+    字段的包才被要求包名词法原子。
     """
     if raw is None:
         return
     if not isinstance(raw, list):
         raise ManifestError(f'清单「块」必须是数组{where}')
+    # W69：携带块的包，包名必须能当命名空间
+    if name:
+        validate_namespace_name(name)
     for item in raw:
         if not isinstance(item, str) or not item:
             raise ManifestError(f'清单「块」的每一项必须是非空字符串{where}')

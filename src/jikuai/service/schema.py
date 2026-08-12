@@ -67,7 +67,7 @@ PLAN_OPTIONAL = ('需求', '共享', '打印')
 
 #: `方案.步骤[i]` 字段。`导出名` 是调用名，`块` 是导入用的目录名，两者可不同。
 STEP_REQUIRED = ('块', '领域', '导出名')
-STEP_OPTIONAL = ('参数', '说明')
+STEP_OPTIONAL = ('参数', '说明', '命名空间')
 
 #: `执行结果` 字段。`错误` 只在失败时出现，成功时**不出现**（而非空串）。
 #: `诊断` 只在有位置信息时出现，供 Web 编辑框把 行/列 高亮出来（W19）。
@@ -145,13 +145,21 @@ def make_candidate(名称: str, 领域: str, 层级: int, 导出名: str, 描述
 
 def make_step(块: str, 领域: str, 导出名: str,
               参数: Optional[Sequence[str]] = None,
-              说明: Optional[str] = None) -> Dict[str, Any]:
-    """构造一条 `步骤`。`参数` 省略即交给粘合器 `--自动链式` 的类型图去推。"""
+              说明: Optional[str] = None,
+              命名空间: Optional[str] = None) -> Dict[str, Any]:
+    """构造一条 `步骤`。`参数` 省略即交给粘合器 `--自动链式` 的类型图去推。
+
+    `命名空间`（v0.19.0 W69）：块的来源包名，内置块**不传**（或传空串）。
+    粘合器据此在导入路径里插一段——`从 blocks.<命名空间>.<领域>.<块> 导入 X`。
+    与 `候选.命名空间` 同构：`None` 时不写键，旧方案的字典形状一字不变。
+    """
     步骤 = {'块': 块, '领域': 领域, '导出名': 导出名}
     if 参数 is not None:
         步骤['参数'] = list(参数)
     if 说明 is not None:
         步骤['说明'] = 说明
+    if 命名空间 is not None:
+        步骤['命名空间'] = 命名空间
     return 步骤
 
 
@@ -367,10 +375,16 @@ def candidate_from_hit(hit: Any, 层级: Optional[int] = None,
         层级 = level_table().get(hit.name, 0)
     if 导出名 is None:
         导出名 = export_table().get(hit.name) or hit.name
+    # v0.19.0 W69：命名空间从 `Hit` 直通候选。`getattr` 兜底是给「自造 hit-like
+    # 对象」的调用方（测试/桥接脚本）留的活口，不是给真 `Hit` 的——它必有该字段。
+    命名空间 = getattr(hit, 'namespace', '') or ''
     return make_candidate(
         名称=hit.name, 领域=hit.domain, 层级=层级, 导出名=导出名,
         描述=hit.description, 分数=hit.score,
         路径=getattr(hit, 'path', '') or '',
+        # 内置块传 None 而不是空串：`候选` 字典里干脆不出现这个键，
+        # 旧响应逐字节不变（三通道数字要能逐字比对，形状也一样）。
+        命名空间=命名空间 or None,
     )
 
 
@@ -429,7 +443,7 @@ def validate_plan(obj: Any, 位置: str = '方案') -> List[str]:
                 where = '%s.步骤[%d]' % (位置, i)
                 errs.extend(_check_keys(步, STEP_REQUIRED, STEP_OPTIONAL, where))
                 if isinstance(步, dict):
-                    for 名 in ('块', '领域', '导出名', '说明'):
+                    for 名 in ('块', '领域', '导出名', '说明', '命名空间'):
                         _check_str(步, 名, where, errs)
                     if '参数' in 步 and not isinstance(步['参数'], list):
                         errs.append('%s.参数 必须是数组' % where)

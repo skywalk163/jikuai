@@ -163,9 +163,14 @@ def test_发布装检索跑_全链路闭合(隔离环境, monkeypatch):
     assert '试倍' in 命中名, f'检索没找到第三方块，实际命中：{命中名}'
 
     # 内置块不该被第三方块挤掉——去重键是 (命名空间, 名称)，第三方块命名
-    # 空间是 `e2e试包`，内置块是空串，同名不同源不互斥
+    # 空间是 `钉板包`，内置块是空串，同名不同源不互斥
     描述 = retrieval.describe()
     assert 描述['块数'] > 100, '合并后总数应包含 100+ 内置块 + 1 第三方块'
+
+    # W69：命中里必须带上命名空间——这是 glue 拼三段导入路径的唯一来源
+    第三方 = next(h for h in 命中 if h.name == '试倍')
+    assert 第三方.namespace == '钉板包'
+    assert 第三方.as_dict()['命名空间'] == '钉板包'
 
     # 4) 跑：写一个宿主 .jk 导入并调用第三方块，验证执行侧仍然通
     main = os.path.join(proj, 'main.jk')
@@ -233,3 +238,73 @@ def test_第三方块扫描失败时降级为只含内置块(隔离环境, monke
     命中 = retrieval.retrieve('计算均值', top=5)
     # 就算第三方那路挂了，内置的「均值/平均/统计」类块也应该出来
     assert len(命中) >= 1
+
+
+# ---------------------------------------------------------------------------
+# W69 · 命名空间隔离：与内置同名的第三方块不该顶掉内置块，两者靠命名空间并存
+# ---------------------------------------------------------------------------
+
+def _造同名块包(base, 内置块名, 领域名):
+    """造一个块**故意与某内置块同名同域**的第三方包，命名空间为 `甲包`。
+
+    去重键是 (命名空间, 名称)：内置块命名空间空串、第三方是 `甲包`，键不同，
+    所以两条都该活下来。这正是「跨命名空间同名合法」在检索侧的落地验证。
+    """
+    pkg = os.path.join(base, '甲包')
+    _写(os.path.join(pkg, '包.json'), json.dumps({
+        '名称': '甲包', '版本': '1.0.0', '描述': 'W69 命名空间隔离测试包',
+        '块': ['blocks'],
+    }, ensure_ascii=False, indent=2) + '\n')
+    块目录 = os.path.join(pkg, 'blocks', '甲包', 领域名, 内置块名)
+    _写(os.path.join(块目录, '块.json'), json.dumps({
+        '名称': 内置块名, '版本': '0.1.0', '层级': 0, '领域': [领域名],
+        '描述': 'W69 隔离测试：与内置同名的第三方块，靠命名空间区分',
+        '输入': [{'名': '数值', '类型': '数'}],
+        '输出': {'类型': '数'},
+        '导出': ['甲值'], '依赖块': [],
+        '极快版本': '>=0.19.0',
+        '稳定性': 'experimental',
+    }, ensure_ascii=False, indent=2) + '\n')
+    _写(os.path.join(块目录, '%s.jk' % 内置块名),
+        '函数 甲值 接收 赵数：\n  返回 赵数。\n。\n\n导出 甲值。\n')
+    _写(os.path.join(pkg, 'main.jk'), '打印 "甲包"。\n')
+    return pkg
+
+
+def test_命名空间键名与块子系统同源():
+    """`retrieval._NAMESPACE_KEY` 刻意不 import `blocks.NAMESPACE_KEY`（守惰性
+    导入边界），本用例是那份「同值」承诺的唯一执行者——改一边漏另一边就红。
+    """
+    assert retrieval._NAMESPACE_KEY == B.NAMESPACE_KEY
+
+
+def test_命名空间隔离_同名第三方块不顶掉内置块(隔离环境, monkeypatch):
+    """选一个真实内置块名，造一个同名同域的第三方块，装完后检索这个名字：
+    内置块（空命名空间）与第三方块（命名空间=甲包）必须**两条都在**。
+    """
+    # 先无第三方地问一次，拿一个真实内置块名当靶子——避免把测试钉死在某个块名上
+    retrieval.reset_cache()
+    内置命中 = retrieval.retrieve('求和 累加 汇总 均值 统计', top=10)
+    assert 内置命中, '内置检索为空，环境异常'
+    靶 = 内置命中[0]
+    靶名, 靶域 = 靶.name, 靶.domain
+    assert 靶.namespace == '', '内置块命名空间应为空串'
+
+    源 = _造同名块包(隔离环境 / '源码', 靶名, 靶域)
+    proj = _造宿主(隔离环境, 依赖路径=源)
+    # 改宿主依赖名为 甲包
+    with open(os.path.join(proj, '包.json'), encoding='utf-8') as f:
+        宿主清单 = json.load(f)
+    宿主清单['依赖'] = {'甲包': {'路径': 源}}
+    with open(os.path.join(proj, '包.json'), 'w', encoding='utf-8', newline='\n') as f:
+        f.write(json.dumps(宿主清单, ensure_ascii=False, indent=2) + '\n')
+
+    I.install(load_manifest(proj))
+    monkeypatch.chdir(proj)
+    retrieval.reset_cache()
+
+    命中 = retrieval.retrieve('%s %s' % (靶名, 靶域), top=30)
+    同名命中 = [h for h in 命中 if h.name == 靶名]
+    命名空间集 = {h.namespace for h in 同名命中}
+    assert '' in 命名空间集, '内置块被第三方同名块顶掉了：%s' % 命名空间集
+    assert '甲包' in 命名空间集, '第三方同名块没进检索：%s' % 命名空间集

@@ -69,10 +69,12 @@
 | 条目 | 来源 | 优先级 | 目标版本 |
 |------|------|--------|----------|
 | ~~中央注册表 = MVP 占位~~ / ~~`jk 包 发布` 未落地~~ —— **认定错误，已于 v0.19.0 W61 纠偏**。本地注册表 + 发布 早在 v0.11.0 落地 | `src/jikuai/pkg/registry.py`、`cli.py` | — | v0.11.0 已完成（此前误记） |
-| HTTP 分发（远程注册表） —— `registry.py` docstring 自陈「HTTP 分发留到接入 token 鉴权 + 包签名之后」。纯本地注册表跨不了机器；`sources._fetch_registry` 目前只认 `JIKUAI_REGISTRY` / `~/.jikuai/注册表` 下的本地索引 | `src/jikuai/pkg/registry.py`、`sources.py` | 中 | v0.20.0（签名先行、传输在后） |
-| 块 ↔ 包 桥接 —— 块靠 `JIKUAI_PKG_ROOTS` 手配环境变量发现，包装到 `极快_包/`，两套体系互不相通。ADR-27 §4 末尾承认此桥接未做。**v0.19.0 W63 已定 `docs/ADR-32-块包格式.md`**（`包.json` 加可选 `块` 字段声明块根 + 安装器维护 `极快_包/.块根.json` 索引让 `extra_roots()` 合并读取），W65-W66 实现 | `docs/ADR-32-块包格式.md`、`src/jikuai/pkg/blocks.py` | 中 | v0.19.0（设计已定，待实现） |
+| HTTP 分发（远程注册表） —— `registry.py` docstring 自陈「HTTP 分发留到接入 token 鉴权 + 包签名之后」。纯本地注册表跨不了机器；`sources._fetch_registry` 目前只认 `JIKUAI_REGISTRY` / `~/.jikuai/注册表` 下的本地索引。**v0.20.0 W73 已定 `docs/ADR-33-包签名.md`**（Ed25519 纯标准库实现 + 校验和格式统一），签名前置就绪，M19 W74-W75 实现发布/校验，M20 才碰 HTTP | `src/jikuai/pkg/registry.py`、`sources.py` | 中 | v0.20.0 M20（签名先行、传输在后） |
+| ~~校验和格式不一致~~ —— **v0.20.0 W73 已清**。`registry.publish` 曾存裸 hex、`installer` 往 `包.锁` 存 `sha256:<hex>`；统一为带前缀。动因不是好看：ADR-33 的签名对象是校验和字符串，两端格式不同会签出不同签名导致验签必失败 | `docs/ADR-33-包签名.md` | — | v0.20.0 W73 已完成 |
+| 包签名（非对称）—— **ADR-33 已定稿**，`src/jikuai/pkg/_ed25519.py`（RFC 8032 纯标准库，实测 sign 7.7ms / verify 6.5ms）+ RFC 8032 test vectors 已入库。待做：`jk 包 密钥` 子命令族、`jk 包 发布 --签名`、`jk 包 装` 验签拒装 | `docs/ADR-33-包签名.md` | 高 | v0.20.0 M19（W74-W75） |
 | 全局缓存共享 —— 当前每个项目独立 `极快_包/` | `docs/包管理.md` | 低 | 待定 |
 | git 依赖的 commit 级锁定 —— 现在只锁到标签 | `docs/包管理.md` | 低 | 待定 |
+| 块 ↔ 包 桥接 —— 块靠 `JIKUAI_PKG_ROOTS` 手配环境变量发现，包装到 `极快_包/`，两套体系互不相通。ADR-27 §4 末尾承认此桥接未做。**v0.19.0 W63 已定 `docs/ADR-32-块包格式.md`**（`包.json` 加可选 `块` 字段声明块根 + 安装器维护 `极快_包/.块根.json` 索引让 `extra_roots()` 合并读取），W65-W66 实现 | `docs/ADR-32-块包格式.md`、`src/jikuai/pkg/blocks.py` | 中 | v0.19.0（设计已定，待实现） |
 
 ## 4. 块生态
 

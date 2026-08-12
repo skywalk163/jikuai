@@ -122,13 +122,13 @@ def test_发布装检索跑_全链路闭合(隔离环境, monkeypatch):
     assert 演练.dry_run is True
     assert 演练.file_count >= 2         # 至少 包.json + 块.json + .jk
 
-    # ⚠️ 钉住一处**两个子系统格式不一致**：`registry.publish` 的 `校验和` 是
-    # 裸 sha256 十六进制（64 字符无前缀），而 `installer.install` 往 `包.锁`
-    # 里写的是带前缀的 `sha256:<hex>`（installer.py:264 `f'sha256:{digest}'`）。
-    # 底层都是 `sources.compute_checksum` 同一个函数，只有包装层不同。
-    # 现在只是不好看；等 v0.20.0 做 HTTP 分发要跨端比对校验和时会变成真 bug。
-    # 若哪天统一了格式，本断言会红——那是**期望的**提醒，改这里同时删掉本注释。
-    assert len(演练.checksum) == 64 and not 演练.checksum.startswith('sha256:')
+    # v0.20.0 W73：`registry.publish` 与 `installer` 的校验和格式**已统一**为
+    # `sha256:<hex>`（此前 publish 存裸 hex、installer 往 `包.锁` 存带前缀，
+    # 底层同一个 `sources.compute_checksum`，只有包装层不同）。统一的动因不是
+    # 好看：M19 做包签名 + M20 做 HTTP 分发时要跨端比对校验和，两种格式会
+    # 误判成「不匹配」。前缀即算法标识，将来换算法有位置放。
+    assert 演练.checksum.startswith('sha256:')
+    assert len(演练.checksum) == len('sha256:') + 64
 
     正式 = registry.publish(manifest, dry_run=False)
     assert 正式.dry_run is False

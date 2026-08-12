@@ -300,7 +300,11 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
         file_count, copy_warnings = _copy_source(manifest.root, staging)
         warnings.extend(copy_warnings)
         from .sources import compute_checksum
-        checksum, _size = compute_checksum(staging)
+        digest, _size = compute_checksum(staging)
+        # v0.20.0 W73：统一带 `sha256:` 前缀，与 installer 往 `包.锁` 写的格式
+        # 一致（此前 publish 存裸 hex、installer 存 `sha256:<hex>`，HTTP 分发
+        # 跨端比对会因格式不同误判不匹配）。前缀即算法标识，为将来换算法留位。
+        checksum = 'sha256:' + digest
 
         if dry_run:
             return PublishReport(name, version, category, checksum,

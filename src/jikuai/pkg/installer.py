@@ -33,6 +33,7 @@ from .lockfile import Lockfile, save_lockfile
 from .manifest import Manifest, ManifestError, load_manifest
 from .resolver import ResolvedNode, resolve
 from .sources import FetchedSource, compute_checksum
+from . import trust
 
 __all__ = [
     'PACKAGES_DIR', 'BLOCK_ROOTS_INDEX', 'InstallError', 'InstallReport',
@@ -60,13 +61,17 @@ class InstallError(Exception):
 class InstallReport:
     """一次安装的结果摘要，供 CLI 渲染。"""
 
-    __slots__ = ('installed', 'unchanged', 'removed', 'lock_path')
+    __slots__ = ('installed', 'unchanged', 'removed', 'lock_path', 'warnings')
 
     def __init__(self):
         self.installed: List[Tuple[str, str]] = []   # (名称, 版本)
         self.unchanged: List[Tuple[str, str]] = []
         self.removed: List[str] = []
         self.lock_path: Optional[str] = None
+        #: 非致命告警，由 CLI 打到 stderr（v0.20.0 W75：未签名包过渡期告警）。
+        #: 走报告而不是在这里直接 print —— installer 是库，I/O 归 CLI，
+        #: 否则 LSP/DAP 以库形式复用时会往用户终端乱吐。
+        self.warnings: List[str] = []
 
     @property
     def total(self) -> int:
@@ -245,6 +250,52 @@ def read_block_roots_index(base: str) -> List[str]:
     return 结果
 
 
+def _verify_registry_signature(node: ResolvedNode,
+                               warnings: List[str]) -> None:
+    """校验一个注册表来源包的完整性与签名（v0.20.0 W75，ADR-33 §2.7）。
+
+    三道检查，前两道**硬拒**（抛 InstallError），第三道过渡期只告警：
+
+    1. **校验和比对**：索引里记的 `校验和` 与本地重算的必须一致。v0.19.0
+       之前 installer 只算不比（没有 verify-on-read），快照被就地改一个字节
+       都装得进来——这道检查独立于签名，是包完整性的地板。
+    2. **签名验证**：有签名就必须验得过（TOFU 公钥 + 白名单，见 trust.py）。
+       验不过说明包内容或签名被动过，拒装。
+    3. **未签名**：v0.20.0 Warn 但放行，v0.21.0 起拒装。理由见 ADR-33 §2.7
+       ——注册表里现在全是 v0.19.0 及之前发的未签包，一上线就硬拒等于把既有
+       生态一次性打死；但从第一天就 Warn，静默放行会让所有人以为不签也没事。
+
+    非注册表来源（路径 / 仓库）直接返回：它们没有索引条目，没有签名可验。
+    """
+    src = node.source
+    if src.kind != '注册表':
+        return
+
+    coord = f'{node.name}@{node.version}'
+
+    # 1. 校验和比对
+    if src.expected_checksum and src.expected_checksum != node.checksum:
+        raise InstallError(
+            f'{coord} 完整性校验失败：注册表索引记的校验和是 '
+            f'{src.expected_checksum}，本地重算得到 {node.checksum}。'
+            f'快照可能被改过或索引损坏，拒装')
+
+    # 2 / 3. 签名
+    if not (src.signer and src.signature):
+        warnings.append(
+            f'{coord} 未签名（注册表索引里没有「签名者」/「签名」字段）。'
+            f'v0.21.0 起将拒装未签名包，请联系包作者用 '
+            f'`jk 包 发布 --签名 <别名>` 重发')
+        return
+
+    from . import registry
+    try:
+        trust.verify_signature(src.signer, src.signature, node.checksum,
+                               registry.registry_root())
+    except trust.TrustError as e:
+        raise InstallError(f'{coord} 签名校验失败：{e}') from None
+
+
 def install(root: Manifest, include_dev: bool = False,
             prune: bool = True) -> InstallReport:
     """解析并安装根清单的全部依赖，写回锁文件。
@@ -271,6 +322,10 @@ def install(root: Manifest, include_dev: bool = False,
         for node in sorted(nodes, key=lambda n: n.name):
             digest, _size = compute_checksum(node.source.root)
             node.checksum = f'sha256:{digest}'
+
+            # v0.20.0 W75（ADR-33）：装包端验签。仅对注册表来源做，路径/仓库
+            # 来源没有索引条目也就没有签名可验，对它们发告警是噪声。
+            _verify_registry_signature(node, report.warnings)
 
             if before.get(node.name) == node.version:
                 # 版本相同也重装：路径依赖的源码可能已被就地改过，

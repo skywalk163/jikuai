@@ -53,7 +53,8 @@ __all__ = [
     'RegistryError', 'PublishReport',
     'INDEX_NAME', 'CATEGORY_DIR', 'PACKAGE_DIR', 'KEY_DIR', 'DEFAULT_CATEGORY',
     'registry_root', 'load_index', 'save_index', 'registry_key_path',
-    'publish', 'lookup', 'list_packages', 'search', 'unpublish',
+    'publish', 'lookup', 'lookup_signature',
+    'list_packages', 'search', 'unpublish',
 ]
 
 #: 主索引文件名。
@@ -493,6 +494,31 @@ def lookup(name: str, constraint: Optional[str] = None,
     if not os.path.isfile(os.path.join(snapshot, MANIFEST_NAME)):
         raise RegistryError(f'{name}@{chosen} 的快照里缺少 {MANIFEST_NAME}')
     return chosen, snapshot
+
+
+def lookup_signature(name: str, version: str,
+                     root: Optional[str] = None) -> Tuple[str, str, str]:
+    """取某个已发布版本的 `(签名者, 签名, 校验和)`（v0.20.0 W75）。
+
+    三者都是字符串，缺失即空串——**未签名的老条目返回 `('', '', 校验和)`**，
+    校验和也可能是空串（理论上不该，但索引可能被手工改坏，装包端要能兜住）。
+
+    为什么单开一个函数而不是拓宽 `lookup()` 的返回值：`lookup()` 返回
+    `(版本, 快照目录)` 已经被 sources / 测试多处解包，改成三元组是破坏性变更；
+    而签名字段只有装包端验签这一条路径要用，单独取更省一次分片读（`lookup`
+    只读主索引，不读分片）。
+    """
+    base = registry_root(root)
+    validate_package_name(name)
+    index = load_index(base)
+    entry = (index.get('索引') or {}).get(name)
+    if entry is None:
+        raise RegistryError(f'注册表里没有包 {name}（注册表根：{base}）')
+    category = entry.get('分类') or DEFAULT_CATEGORY
+    detail = (_load_category(base, category).get(name) or {}).get(version) or {}
+    return (str(detail.get('签名者') or ''),
+            str(detail.get('签名') or ''),
+            str(detail.get('校验和') or ''))
 
 
 def list_packages(root: Optional[str] = None) -> Dict[str, dict]:

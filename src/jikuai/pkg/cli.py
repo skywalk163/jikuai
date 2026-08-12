@@ -422,6 +422,17 @@ def _print_install_report(report) -> None:
         print(f'  - {name}（已移除）')
     if report.lock_path:
         print(f'  锁文件：{os.path.basename(report.lock_path)}')
+    _print_install_warnings(report)
+
+
+def _print_install_warnings(report) -> None:
+    """把安装告警打到 stderr（v0.20.0 W75：未签名包过渡期告警）。
+
+    走 stderr 而不是 stdout：告警不属于「装了哪些包」这份可被脚本消费的
+    输出，混进去会让 `jk 包 装 | grep` 之类的管道被污染。
+    """
+    for w in getattr(report, 'warnings', ()):
+        print(f'  ⚠ {w}', file=sys.stderr)
 
 
 _DISPATCH = {

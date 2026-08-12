@@ -37,10 +37,13 @@ class SourceError(Exception):
 class FetchedSource:
     """一次抓取的结果：包源码根目录 + 清单 + 若干坐标信息。"""
 
-    __slots__ = ('root', 'manifest', 'kind', 'origin', 'ephemeral')
+    __slots__ = ('root', 'manifest', 'kind', 'origin', 'ephemeral',
+                 'signer', 'signature', 'expected_checksum')
 
     def __init__(self, root: str, manifest: Manifest, kind: str,
-                 origin: str, ephemeral: bool):
+                 origin: str, ephemeral: bool,
+                 signer: str = '', signature: str = '',
+                 expected_checksum: str = ''):
         self.root = os.path.abspath(root)
         self.manifest = manifest
         self.kind = kind                 # 路径 / 仓库 / 注册表
@@ -48,6 +51,12 @@ class FetchedSource:
         #: `True` 表示 root 位于临时目录，安装完必须清理；`False` 表示
         #: 直接指向用户已有目录（比如本地路径依赖），**不能**删除。
         self.ephemeral = ephemeral
+        #: 以下三项只有 `注册表` 来源会填（v0.20.0 W75，ADR-33）。
+        #: 路径/仓库来源没有索引条目，也就没有签名可验——装包端据此
+        #: 只对注册表来源做验签，不会对本地路径依赖发无意义的告警。
+        self.signer = signer                        # 签名者别名，未签名为空
+        self.signature = signature                  # base64 的 64 字节签名
+        self.expected_checksum = expected_checksum  # 索引里记的 `sha256:<hex>`
 
 
 # ---- 路径工具 ---------------------------------------------------------
@@ -153,8 +162,18 @@ def _fetch_registry(dep: Dependency, _base_dir: str) -> FetchedSource:
         raise SourceError(
             f'注册表包名不匹配：请求 {dep.name}，'
             f'但快照清单「名称」是 {manifest.name}')
+    # v0.20.0 W75：顺手把索引条目里的签名字段带出来，交给 installer 验签。
+    # 索引损坏导致读不到不在这里拦——装包端会因「无签名」走 Warn/拒装分支，
+    # 抓取阶段就抛错反而会让用户以为包不存在。
+    try:
+        signer, signature, expected = registry.lookup_signature(
+            dep.name, version)
+    except registry.RegistryError:
+        signer, signature, expected = '', '', ''
     # 快照是注册表的只读副本，绝不能删（ephemeral=False）。
-    return FetchedSource(snapshot, manifest, '注册表', dep.name, ephemeral=False)
+    return FetchedSource(snapshot, manifest, '注册表', dep.name,
+                         ephemeral=False, signer=signer,
+                         signature=signature, expected_checksum=expected)
 
 
 _FETCHERS = {

@@ -27,6 +27,8 @@ if _SRC not in sys.path:
 from jikuai.pkg import _ed25519 as ed                      # noqa: E402
 from jikuai.pkg import keys                                 # noqa: E402
 from jikuai.pkg import registry                             # noqa: E402
+from jikuai.pkg import trust                                # noqa: E402
+from jikuai.pkg import installer as I                       # noqa: E402
 from jikuai.pkg.manifest import MANIFEST_NAME, load_manifest  # noqa: E402
 
 
@@ -36,9 +38,15 @@ from jikuai.pkg.manifest import MANIFEST_NAME, load_manifest  # noqa: E402
 
 @pytest.fixture
 def 隔离环境(tmp_path, monkeypatch):
-    """每个测试在独立的密钥根 + 注册表根中运行，返回 tmp_path。"""
+    """每个测试在独立的密钥根 + 注册表根 + 信任库中运行，返回 tmp_path。
+
+    信任库必须隔离：TOFU pin 是**跨进程持久**的，用真实 `~/.jikuai/信任/`
+    会让第一个测试 pin 的公钥污染后面所有测试（也会污染开发者本机）。
+    """
     monkeypatch.setenv(keys.KEY_ROOT_ENV, str(tmp_path / '密钥'))
     monkeypatch.setenv('JIKUAI_REGISTRY', str(tmp_path / '注册表'))
+    monkeypatch.setenv(trust.TRUST_ROOT_ENV, str(tmp_path / '信任'))
+    monkeypatch.delenv(trust.TRUSTED_SIGNERS_ENV, raising=False)
     return tmp_path
 
 
@@ -57,6 +65,24 @@ def _造包(tmp_path, name='签名试包', version='0.1.0'):
                                encoding='utf-8', newline='\n')
     (pkg / 'README.md').write_text('# 签名试包\n', encoding='utf-8')
     return str(pkg)
+
+
+def _造宿主(tmp_path, 依赖名='签名试包', 约束='*'):
+    """造一个从**注册表**取依赖的宿主工程，返回其路径。
+
+    刻意用版本约束而不是 `--路径`：只有注册表来源才会走
+    `sources._fetch_registry`，也才有签名可验（路径依赖没有索引条目）。
+    """
+    proj = tmp_path / '宿主'
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / MANIFEST_NAME).write_text(json.dumps({
+        '名称': '宿主', '版本': '0.1.0', '描述': 'W75 装包端验签宿主',
+        '入口': 'main.jk', '依赖': {依赖名: 约束},
+    }, ensure_ascii=False, indent=2), encoding='utf-8', newline='\n')
+    (proj / 'main.jk').write_text('打印("好")\n', encoding='utf-8',
+                                  newline='\n')
+    return str(proj)
+
 
 
 # ---------------------------------------------------------------------------
@@ -218,3 +244,144 @@ def test_合法别名通过():
 def test_非法别名被拒(bad):
     with pytest.raises(ValueError):
         keys.validate_alias(bad)
+
+
+# ---------------------------------------------------------------------------
+# W75 · 装包端验签（ADR-33 §2.5 / §2.7）
+# ---------------------------------------------------------------------------
+
+def _发布带签名(隔离环境, alias='甲'):
+    """生成密钥 → 发布签名包，返回 PublishReport。"""
+    keys.generate_keypair(alias)
+    return registry.publish(load_manifest(_造包(隔离环境)),
+                            dry_run=False, signer=alias)
+
+
+def test_装签名包_验签通过且首次pin公钥(隔离环境):
+    报告发布 = _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+
+    报告 = I.install(load_manifest(proj))
+    assert 报告.total == 1
+    assert 报告.warnings == []          # 签过名就不该有未签名告警
+    assert os.path.isdir(os.path.join(proj, I.PACKAGES_DIR, '签名试包'))
+
+    # TOFU：公钥被 pin 进信任库，且与发布方公钥一致
+    pinned = os.path.join(trust.trust_root(), '甲.公钥')
+    assert os.path.isfile(pinned)
+    with open(pinned, encoding='utf-8') as f:
+        assert base64.b64decode(f.read().strip()) == keys.load_public_key('甲')
+    # 签名确实是对这个校验和签的
+    assert 报告发布.checksum.startswith('sha256:')
+
+
+def test_装未签名包_告警但放行(隔离环境):
+    registry.publish(load_manifest(_造包(隔离环境)), dry_run=False)
+    proj = _造宿主(隔离环境)
+
+    报告 = I.install(load_manifest(proj))
+    assert 报告.total == 1              # v0.20.0 过渡期：放行
+    assert len(报告.warnings) == 1
+    assert '未签名' in 报告.warnings[0]
+    assert 'v0.21.0' in 报告.warnings[0]
+
+
+def test_公钥变更_拒装(隔离环境):
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    I.install(load_manifest(proj))       # 首次装：pin 公钥
+
+    # 攻击者换掉注册表里的公钥（并配一个用新私钥重签的签名也没用——
+    # pin 过的公钥就是权威，对不上直接拒）
+    reg_pk = registry.registry_key_path(registry.registry_root(), '甲')
+    with open(reg_pk, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(base64.b64encode(b'\x01' * 32).decode() + '\n')
+
+    with pytest.raises(I.InstallError, match='公钥'):
+        I.install(load_manifest(proj))
+
+
+def test_签名被篡改_拒装(隔离环境):
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+
+    # 直接改分片里的签名字段（长度合法但内容错）
+    base = registry.registry_root()
+    shard_path = registry._category_path(base, '通用')
+    with open(shard_path, encoding='utf-8') as f:
+        shard = json.load(f)
+    shard['签名试包']['0.1.0']['签名'] = base64.b64encode(b'\x00' * 64).decode()
+    with open(shard_path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(shard, f, ensure_ascii=False)
+
+    with pytest.raises(I.InstallError, match='签名校验失败'):
+        I.install(load_manifest(proj))
+
+
+def test_校验和不符_拒装(隔离环境):
+    """索引里的校验和与快照实际内容不符 → 硬拒（独立于签名的完整性地板）。"""
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+
+    # 篡改注册表快照里的源码（校验和随之变化，与索引记录不再一致）
+    snapshot = os.path.join(registry.registry_root(), '包', '签名试包', '0.1.0')
+    with open(os.path.join(snapshot, '主.jk'), 'a', encoding='utf-8') as f:
+        f.write('打印("坏")\n')
+
+    with pytest.raises(I.InstallError, match='完整性校验失败'):
+        I.install(load_manifest(proj))
+
+
+def test_白名单外的签名者_拒装(隔离环境, monkeypatch):
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    monkeypatch.setenv(trust.TRUSTED_SIGNERS_ENV, '乙' + os.pathsep + '丙')
+
+    with pytest.raises(I.InstallError, match='白名单'):
+        I.install(load_manifest(proj))
+
+
+def test_白名单内的签名者_放行(隔离环境, monkeypatch):
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    monkeypatch.setenv(trust.TRUSTED_SIGNERS_ENV, '乙' + os.pathsep + '甲')
+
+    报告 = I.install(load_manifest(proj))
+    assert 报告.total == 1
+
+
+def test_白名单未设置返回None_设空则全拒(隔离环境, monkeypatch):
+    monkeypatch.delenv(trust.TRUSTED_SIGNERS_ENV, raising=False)
+    assert trust.trusted_signers() is None
+    assert trust.is_signer_allowed('随便谁') is True
+
+    monkeypatch.setenv(trust.TRUSTED_SIGNERS_ENV, '')
+    assert trust.trusted_signers() == set()
+    assert trust.is_signer_allowed('甲') is False
+
+
+def test_路径依赖不发未签名告警(隔离环境):
+    """路径来源没有索引条目，对它告警是噪声（会淹掉真正该看的注册表告警）。"""
+    源 = _造包(隔离环境)
+    proj = 隔离环境 / '宿主'
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / MANIFEST_NAME).write_text(json.dumps({
+        '名称': '宿主', '版本': '0.1.0', '描述': 'x', '入口': 'main.jk',
+        '依赖': {'签名试包': {'路径': 源}},
+    }, ensure_ascii=False, indent=2), encoding='utf-8', newline='\n')
+    (proj / 'main.jk').write_text('打印("好")\n', encoding='utf-8')
+
+    报告 = I.install(load_manifest(str(proj)))
+    assert 报告.total == 1
+    assert 报告.warnings == []
+
+
+def test_信任库缺公钥且注册表也没有_拒装(隔离环境):
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    # 管理员误删了注册表里的公钥，信任库又还没 pin 过 → 无从建立信任
+    os.remove(registry.registry_key_path(registry.registry_root(), '甲'))
+
+    with pytest.raises(I.InstallError, match='没有公钥'):
+        I.install(load_manifest(proj))
+

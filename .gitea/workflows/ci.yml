@@ -19,7 +19,8 @@ jobs:
     runs-on: freebsd
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # 固定走本地 actions/checkout，避免 Gitea 对裸写 uses 的解析偶发回落到 github.com
+        uses: http://192.168.1.5:3000/actions/checkout@v4
 
       - name: 准备 Python 环境 (venv)
         run: |

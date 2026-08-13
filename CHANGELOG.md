@@ -1,5 +1,67 @@
 # 极快 JiKuai · 变更日志
 
+## v0.21.0（2026-08-13）· 安全审计前置 + 远程发布闭环
+
+> WBS 见 `docs/路线图-v0.21.md`；ADR 见 `docs/ADR-35-远程发布协议.md`；审计报告见 `docs/安全审计-v0.21.md`。
+> 全量回归 **2247 passed / 34 skipped**；契约门禁 **G10-G19 全绿**（`scripts/check_stdlib_contract.py` exit 0）。
+> v0.20.0 只打通了「远程**读**」，本轮补上「远程**写**」——包管理从此是完整的双向链路。
+
+### Breaking Change（先看这段）
+
+1. **`JIKUAI_REGISTRY` 指向 URL 时 `jk 包 发布` 语义变了**。v0.20.0 里远程注册表是只读的，发布必然落本地；现在 `registry.publish()` 顶上分派：URL → 走 `POST <base>/publish`，本地路径 → 原路径一字不变。远程分支**强制 `--签名 <别名>`**（未签名当场拒，请求都不发）且**一律拒 `--允许覆盖`**（要重发只能升版本号，ADR-35 §2.4）。靠 `JIKUAI_REGISTRY` 指远端又指望发布落本地的脚本会报错——这是刻意的。
+2. **`RegistryBackend` 新增 `publish_package(payload)`**。基类给了默认实现（抛 `UnsupportedOperation`），所以自定义后端不改也能跑；但 `LocalBackend` 明确拒收它——本地发布请直接用 `registry.publish()`。`HttpBackend` 的 `write_text`/`write_bytes`/`remove` **仍然拒**：远程写只开这一个业务级口子，不开逐文件写（多客户端对 `索引.json` 做 read-modify-write 会撕裂索引，唯一写者必须是服务端）。
+3. **`_safe_extract_targz` 现在有解压限额**（W86/F2）。`JIKUAI_PKG_MAX_ARCHIVE_BYTES` / `JIKUAI_PKG_MAX_TOTAL_BYTES` / `JIKUAI_PKG_MAX_MEMBERS` 三道；此前只防路径逃逸不防解压炸弹。踩到限额的**超大包从此装不上**（默认值见 `docs/包管理.md`）。
+4. **`HttpBackend._request` 现在有响应体上限**（W86/F3）。`JIKUAI_REGISTRY_MAX_RESPONSE`；恶意/故障远端返回无限流不再吃满内存。
+5. **`.块根.json` 读侧不再信任「路径」字段**（W86/F1，**真缺陷**）。写侧一直是可信的，但读侧直接拿字段拼路径 —— 手改该文件即可让块根逃出 `极快_包/`。现在读侧强校验落在包目录内，逃逸条目静默忽略。
+6. **新增门禁 G19「安全不变量」**。`scripts/check_security_invariants.py` 静态断言上面三条 defense-in-depth 长在原处（回归测试能证明行为对，但删掉限额只要顺手改测试就绿了——门禁盯的是代码本身）。
+
+**迁移建议**：先跑 `python scripts/check_stdlib_contract.py` 看十门哪条红；发布脚本确认 `JIKUAI_REGISTRY` 指向与预期目标一致；版本号只动 `_version.py`。
+
+### M22 · 安全审计前置（W85-W88）
+
+- **W85 取证**：按 OWASP + STRIDE 过三块面——路径解析、依赖获取与解压、动态代码执行。产出 `docs/安全审计-v0.21.md`
+- **W86 三处修复**：F1 `.块根.json` 读侧路径校验（`module_loader.py`）、F2 解压三道限额（`pkg/sources.py`）、F3 响应体上限（`pkg/backend.py`）
+- **W87 门禁 G19**：`check_security_invariants.py` 串进 `check_stdlib_contract.py`；`tests/test_w86_security.py` + `tests/test_check_security_invariants.py`
+- **明确不动的取舍**：ADR 已声明过的几处（如 TOFU 首次信任窗口、明文 http 需显式 `JIKUAI_REGISTRY_INSECURE`）按原设计保留，审计报告 §5 逐条记账，不在本轮改
+
+### M23 · 远程发布（W89-W93 · ADR-35）
+
+**W89 协议**：`docs/ADR-35-远程发布协议.md` 定完 ADR-34 §2.6 悬着的五件事——传输、鉴权、覆盖、配额、审计。
+
+- `POST <base>/publish`，JSON body（UTF-8，字段名中文），**归档走 base64 内联**。选 base64 不选 multipart：3.13 移除 `cgi`，标准库没有服务端 multipart 解析器；内联让一次请求成为可在落盘前整体校验的原子单元
+- 鉴权路径用 ASCII（`/publish`），注册表**文件**路径仍中文——运维面（nginx conf、curl、access log）留 ASCII，与产品语言不冲突
+
+**W90-W91 服务端**：`tools/registry-server/`（`auth.py` / `audit.py` / `server.py`），零第三方依赖，`http.server`。
+
+- `授权.json`：token **只存 sha256 hex**，比对走 `hmac.compare_digest`，且遍历全部条目不提前 break（避免时序侧信道）
+- **token ↔ 签名者 ↔ 包名白名单三重绑定**。`可发布` 支持确切名或 `前缀-*`，**不认单独 `*`**
+- **服务端用自己登记的公钥验签，绝不用 payload 里带的公钥**——否则自签自证等于装饰
+- 三层配额：请求体 32 MiB（`JIKUAI_REGISTRY_SERVER_MAX_BODY`）、单包 16 MiB、20 次/小时（滑动窗）
+- `审计.jsonl` append-only，**拒绝也记**，**永不记 token**
+- 服务端**没有私钥**：两步落盘——先 `registry.publish()` 落无签名快照，再把客户端签名注入索引分片 + 写 `密钥/<签名者>.公钥`，全程一把 `threading.Lock`。结果与本地签名发布逐字节一致
+- 错误响应（400/401/403/409/413/429/500）**不泄露服务端文件路径**
+
+**W92 客户端**：`HttpBackend.publish_package()` + `registry.publish()` 远程分支 + `jk 包 发布` 打印目标类型（本地/远程）。`--演练` 只算不发。
+
+**W93 端到端**：`tests/test_pkg_remote_publish_e2e.py` 起**真进程**跑发布 → 装 → 验签 + TOFU 钉扎；六类反例——越权、覆盖、未签名（客户端侧 + 裸 POST 服务端侧各一）、伪造签名、协议版本不符、错误不泄露路径。
+
+**测试**：`test_registry_server_auth.py` 13 例 + `test_pkg_remote_publish.py` 20 例 + `test_pkg_remote_publish_e2e.py` 14 例。
+
+### 文档与门禁
+
+- `docs/ADR-35-远程发布协议.md`（新，状态「已实施」）
+- `docs/包管理.md` 新增「远程发布」节（客户端用法、三条硬规则、服务端 CLI、`授权.json` 示例与四条鉴权约束）+「解压限额」节
+- **G18 扫描范围扩到 `tools/registry-server/server.py`** —— 门禁的边界是「文档承诺过没有」，不是 `src/` 与 `tools/` 的目录归属。`JIKUAI_REGISTRY_SERVER_MAX_BODY` 定义在 `tools/` 下，写进文档后 G18 一度报「文档写了但代码没引用」，说明此前的扫描集画错了线
+- 顺手清 M22 遗留：`check_security_invariants.main()` 的 `argv` 约定与 G16/G17 兄弟门禁对齐（此前多切了一层程序名，`--quiet` 被吞，G19 的中文行漏进 `--json` 输出）
+- `docs/BACKLOG.md`「远程发布」条目关闭
+
+### 已知限制 · 明确不做
+
+- **TLS / HTTP-2 / 多进程写 / 公钥轮换**：ADR-35 明确划到下一轮。当前服务端是单进程 + 一把写锁，生产部署请挡在反代后面
+- **无覆盖开关**是设计而非缺口。远程覆盖需要分布式协调，代价远超「升版本号」的收益
+
+---
+
 ## v0.20.0（2026-08-12）· HTTP 远程注册表 + 包签名 + 可信跨机分发
 
 > WBS 见 `docs/路线图-v0.19-v0.20.md`；ADR 见 `docs/ADR-33-包签名.md` + `docs/ADR-34-远程HTTP注册表.md`。

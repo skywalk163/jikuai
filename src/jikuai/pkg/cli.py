@@ -32,6 +32,7 @@ from .resolver import ResolveError
 from . import registry
 from . import semver
 from . import keys
+from .backend import is_remote
 
 __all__ = ['main', 'run']
 
@@ -46,9 +47,10 @@ _USAGE = f"""极快包管理 用法：
   jk 包 列表                   列出已安装的包
   jk 包 运行 <脚本名>          执行清单「脚本」里的命令
   jk 包 发布 [--确认] [--分类 X] [--允许覆盖] [--签名 别名]
-                               发布当前包到本地注册表。
-                               **默认演练**（只体检不落盘），加 --确认 才真发布
-                               --签名 用该别名的私钥签校验和（见 密钥 子命令）
+                               发布当前包到注册表。`JIKUAI_REGISTRY` 决定目标：
+                               本地路径 → 落到本地注册表；`https://...` → 走
+                               远程发布（ADR-35，强制 --签名，不接受 --允许覆盖）。
+                               **默认演练**（只体检不落盘/推送），加 --确认 才真发布
   jk 包 搜索 [关键词]          搜索本地注册表里的包
   jk 包 注册表                 显示注册表根目录与统计
   jk 包 密钥 生成 <别名>       生成 Ed25519 签名密钥对
@@ -310,22 +312,24 @@ def _cmd_publish(args: List[str]) -> int:
         return _err(str(e))
     for w in report.warnings:
         print(f'  ⚠ {w}')
+    远程 = is_remote(registry.registry_root())
+    目标名 = '远程注册表' if 远程 else '本地注册表'
     if report.dry_run:
-        print(f'[演练] {report.name}@{report.version}（分类：{report.category}）')
+        print(f'[演练] {report.name}@{report.version}（分类：{report.category}）→ {目标名}')
         print(f'  文件数：{report.file_count}  校验和：{report.checksum[:12]}…')
         if report.signature:
             print(f'  签名者：{report.signer}  签名：{report.signature[:12]}…')
-        print('  演练完成，未落盘。确认无误后加 --确认 正式发布。')
+        print('  演练完成，未落盘/未推送。确认无误后加 --确认 正式发布。')
     else:
         verb = '已覆盖发布' if report.overwritten else '已发布'
-        print(f'{verb} {report.name}@{report.version}（分类：{report.category}）')
+        print(f'{verb} {report.name}@{report.version}（分类：{report.category}）→ {目标名}')
         print(f'  文件数：{report.file_count}  校验和：{report.checksum[:12]}…')
         if report.signature:
             print(f'  签名者：{report.signer}  签名：{report.signature[:12]}…')
         else:
             print('  ⚠ 未签名发布。v0.21.0 起装未签名包会被拒，'
                   '建议加 --签名 <别名>')
-        print(f'  快照：{report.target}')
+        print(f'  {"远端" if 远程 else "快照"}：{report.target}')
     return 0
 
 

@@ -38,13 +38,16 @@
 """
 
 import base64
+import io
 import json
 import os
 import shutil
 import tarfile
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from . import semver
+from . import backend as backend_mod
 from .backend import (
     BackendError, LocalBackend, RegistryBackend,
     get_backend, is_remote, join_rel,
@@ -350,20 +353,144 @@ def _publish_checklist(manifest: Manifest) -> List[str]:
     return warnings
 
 
+def _build_publish_payload(manifest: Manifest, category: str,
+                           signer: str) -> Tuple[dict, str, str, int, List[str]]:
+    """做快照 → 算校验和 → 签名 → 打 tar.gz，产出 ADR-35 §2.2 的发布报文。
+
+    这段与本地 `publish()` 的快照/校验和/签名逻辑同源，但产出的是**可跨进程
+    传输的报文**而非磁盘落点。返回 (报文 dict, 校验和, 签名 base64, 文件数, 警告)。
+
+    远程发布**强制签名**（ADR-35 §2.8）：写端没有存量兼容负担，未签名一律拒。
+    """
+    from . import keys as _keys
+    from . import _ed25519 as _ed
+    from .sources import compute_checksum
+
+    _keys.validate_alias(signer)
+    seed = _keys.load_private_key(signer)
+    pubkey_bytes = _keys.load_public_key(signer)
+
+    warnings = _publish_checklist(manifest)
+    name = manifest.name
+    version = manifest.version
+
+    staging = tempfile.mkdtemp(prefix='jikuai-publish-')
+    try:
+        # 快照落到 <staging>/<版本>/，与本地快照目录结构一致，归档成员以
+        # 版本号为根，解压端据此还原（与 _archive_snapshot 同约定）。
+        snapshot_dir = os.path.join(staging, version)
+        os.makedirs(snapshot_dir, exist_ok=True)
+        file_count, copy_warnings = _copy_source(manifest.root, snapshot_dir)
+        warnings.extend(copy_warnings)
+
+        digest, _size = compute_checksum(snapshot_dir)
+        checksum = 'sha256:' + digest
+        signature_b64 = base64.b64encode(
+            _ed.sign(seed, checksum.encode('utf-8'))).decode('ascii')
+
+        # tar.gz 到内存，base64 塞进报文（ADR-35 §2.2）。
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+            tf.add(snapshot_dir, arcname=version)
+        archive_b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    entry_detail = {
+        '名称': name,
+        '版本': version,
+        '描述': manifest.description,
+        '入口': manifest.entry,
+        '分类': category,
+        '校验和': checksum,
+        '文件数': file_count,
+        '依赖': {n: d.to_spec() for n, d
+                 in manifest.dependencies(include_dev=False).items()},
+        '极快版本': manifest.jikuai_requirement,
+        '快照': join_rel(PACKAGE_DIR, name, version),
+    }
+    payload = {
+        '协议': backend_mod.PUBLISH_PROTOCOL,
+        '名称': name,
+        '版本': version,
+        '分类': category,
+        '校验和': checksum,
+        '签名者': signer,
+        '签名': signature_b64,
+        '条目': entry_detail,
+        '公钥': base64.b64encode(pubkey_bytes).decode('ascii'),
+        '归档': archive_b64,
+    }
+    return payload, checksum, signature_b64, file_count, warnings
+
+
+def _publish_remote(manifest: Manifest, base: str, category: Optional[str],
+                    dry_run: bool, allow_overwrite: bool,
+                    signer: Optional[str]) -> PublishReport:
+    """远程发布分支（ADR-35）。客户端做快照/签名/打包，服务端负责落盘与索引。"""
+    name = validate_package_name(manifest.name)
+    version = manifest.version
+    semver.parse_version(version)
+    category = _validate_category(
+        category or manifest.to_dict().get('分类') or DEFAULT_CATEGORY)
+
+    # 远程强制签名：写端无存量兼容负担，未签名一律拒（ADR-35 §2.8，比读侧的
+    # 「过渡告警」更严）。这里在客户端就拦，不白跑一趟网络。
+    if not signer:
+        raise RegistryError(
+            f'远程发布（{base}）必须签名：请加 --签名 <别名>。'
+            f'远程注册表拒收未签名包（ADR-35 §2.8）')
+    # 远程覆盖一律拒，不接受 allow_overwrite（ADR-35 §2.4）：已发布版本被覆盖
+    # 会让下游锁文件校验和失效，且失败点在使用者那边。
+    if allow_overwrite:
+        raise RegistryError(
+            '远程注册表不支持覆盖已发布版本（ADR-35 §2.4）：'
+            '要重发请提升版本号。--允许覆盖 只对本地注册表有效')
+
+    payload, checksum, signature_b64, file_count, warnings = \
+        _build_publish_payload(manifest, category, signer)
+
+    if dry_run:
+        return PublishReport(name, version, category, checksum, file_count,
+                             base, True, False, warnings, signer, signature_b64)
+
+    bk = get_backend(base)
+    try:
+        resp = bk.publish_package(payload)
+    except BackendError as e:
+        raise RegistryError(str(e)) from None
+
+    # 服务端回的校验和应与客户端一致；不一致说明传输/服务端出问题。
+    server_checksum = resp.get('校验和') if isinstance(resp, dict) else None
+    if server_checksum and server_checksum != checksum:
+        raise RegistryError(
+            f'服务端回报的校验和 {server_checksum} 与本地 {checksum} 不一致，'
+            f'发布结果存疑，请核对')
+    return PublishReport(name, version, category, checksum, file_count,
+                         base, False, False, warnings, signer, signature_b64)
+
+
 def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
             category: Optional[str] = None, dry_run: bool = True,
             allow_overwrite: bool = False,
             signer: Optional[str] = None) -> PublishReport:
-    """把一个包发布到本地注册表。
+    """把一个包发布到注册表（本地目录，或 v0.21.0 起的远程 HTTP 注册表）。
 
-    `dry_run` **默认为真**：发布是不可逆动作，默认演练、显式才落盘。
+    `dry_run` **默认为真**：发布是不可逆动作，默认演练、显式才落盘/推送。
     `allow_overwrite` 为假（默认）时，`名称@版本` 已存在即报错。
     `signer` 非 None 时用该别名的私钥签校验和，签名与签名者写入索引条目。
+
+    v0.21.0 M23（ADR-35）：注册表定位符是 `https://...` 时走**远程发布**
+    —— 客户端只负责做快照、算校验和、签名、打包，落盘与索引一致性由服务端
+    保证（ADR-35 §2.8）。远程分支**强制签名**且**不接受 `allow_overwrite`**。
     """
     if manifest is None:
         manifest = load_manifest()
     base = registry_root(root)
-    backend = _local(base)          # 发布是本地动作（ADR-34 §2.1）
+    if is_remote(base):
+        return _publish_remote(manifest, base, category, dry_run,
+                               allow_overwrite, signer)
+    backend = _local(base)          # 本地发布（ADR-34 §2.1）
     name = validate_package_name(manifest.name)
     version = manifest.version
     semver.parse_version(version)

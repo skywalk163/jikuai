@@ -39,7 +39,7 @@ from typing import Dict, Optional
 __all__ = [
     'BackendError', 'UnsupportedOperation',
     'TOKEN_ENV', 'TIMEOUT_ENV', 'INSECURE_ENV', 'CREDENTIALS_NAME',
-    'DEFAULT_TIMEOUT',
+    'DEFAULT_TIMEOUT', 'PUBLISH_PATH', 'PUBLISH_PROTOCOL',
     'RegistryBackend', 'LocalBackend', 'HttpBackend',
     'is_remote', 'get_backend', 'resolve_token',
 ]
@@ -54,6 +54,13 @@ INSECURE_ENV = 'JIKUAI_REGISTRY_INSECURE'
 CREDENTIALS_NAME = '凭证.json'
 #: 默认请求超时（秒）。
 DEFAULT_TIMEOUT = 30.0
+#: 远程发布端点（ADR-35 §2.2）。刻意用 ASCII 而非中文：这是**运维面**
+#: （nginx 反代配置、curl 排障、访问日志、告警规则都要写这个串），
+#: percent 编码的中文路径在那些场景里纯是负担。注册表内的**文件**路径
+#: 仍是中文（`索引.json` / `分类/` / `密钥/` / `包/`），那些是数据布局。
+PUBLISH_PATH = '/publish'
+#: 发布报文协议版本（ADR-35 §2.2）。服务端不认就 400 明说，不猜字段。
+PUBLISH_PROTOCOL = 1
 #: 单次 HTTP 响应体大小上限（v0.21.0 W86 安全审计）。防止恶意注册表推送超大
 #: 响应让客户端 OOM。与 sources._MAX_TOTAL_BYTES 对齐（归档解压后上限 256 MiB，
 #: 压缩前一般远小于此），这里卡 512 MiB 给足余量——若归档本身大于此上限，
@@ -147,6 +154,19 @@ class RegistryBackend:
 
     def remove(self, rel: str) -> None:
         raise UnsupportedOperation(f'{type(self).__name__} 不支持删除')
+
+    # -- 发布（ADR-35 §2.8：远程写的粒度是「发布一个包」这个业务动作） --
+    def publish_package(self, payload: Dict[str, object]) -> Dict[str, object]:
+        """把一个已签名的包报文推给注册表。只有 `HttpBackend` 实现。
+
+        **为什么不是让 `write_text` 能写**（ADR-35 §2.8）：逐文件可写意味着
+        客户端要自己「下索引 → 改 → 上传索引」，两个作者同时发布就会互相
+        覆盖掉对方的索引条目（读-改-写竞态），而客户端之间没有任何协调手段。
+        索引一致性只能由**唯一写者**保证，那个写者必须在服务端。
+        """
+        raise UnsupportedOperation(
+            f'{type(self).__name__} 不支持远程发布；'
+            f'本地注册表请直接用 registry.publish()')
 
     # -- 诊断 --
     def describe(self, rel: str = '') -> str:
@@ -345,6 +365,66 @@ class HttpBackend(RegistryBackend):
 
     def remove(self, rel: str) -> None:
         raise UnsupportedOperation('远程注册表暂不支持删除，见 ADR-34 §2.6（M21）')
+
+    def publish_package(self, payload: dict) -> dict:
+        """POST /publish，推包到远程注册表（ADR-35 §2.8）。
+
+        报文是完整的 JSON dict（ADR-35 §2.2 定义），含 base64 归档。
+        返回服务端的成功响应 dict；任何非 200 都转为 `BackendError`。
+        """
+        data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        url = f'{self._base}{PUBLISH_PATH}'
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json; charset=utf-8')
+        req.add_header('User-Agent', 'jikuai-pkg')
+        if self._token:
+            try:
+                self._token.encode('latin-1')
+            except UnicodeEncodeError:
+                raise BackendError(
+                    '注册表 token 含非 latin-1 字符，无法放进 HTTP 头；'
+                    'token 通常是 ASCII 串，请检查配置') from None
+            req.add_header('Authorization', f'Bearer {self._token}')
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                body = resp.read(self._max_response)
+                try:
+                    return json.loads(body.decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return {'结果': '已发布'}
+        except urllib.error.HTTPError as e:
+            # 读取错误体
+            reason = ''
+            try:
+                err_body = e.read(65536).decode('utf-8')
+                err_data = json.loads(err_body)
+                reason = err_data.get('错误', '')
+            except Exception:
+                pass
+            if e.code == 401:
+                hint = ('已带 token 但仍被拒' if self._token else
+                        f'未提供凭证；设 {TOKEN_ENV} 或 ~/.jikuai/{CREDENTIALS_NAME}')
+                raise BackendError(
+                    f'发布鉴权失败（HTTP 401）：{hint}'
+                    + (f'。{reason}' if reason else '')) from None
+            if e.code == 403:
+                raise BackendError(
+                    f'发布被拒（HTTP 403）：{reason or "越权"}') from None
+            if e.code == 409:
+                raise BackendError(
+                    f'版本已存在（HTTP 409）：{reason or "已发布版本不允许覆盖，请提升版本号"}') from None
+            if e.code == 413:
+                raise BackendError(
+                    f'包体过大（HTTP 413）：{reason or "超出服务端配额"}') from None
+            if e.code == 429:
+                raise BackendError(
+                    f'发布过于频繁（HTTP 429）：{reason or "触发频次限额"}') from None
+            raise BackendError(
+                f'远程发布失败（HTTP {e.code}）：{reason or url}') from None
+        except urllib.error.URLError as e:
+            raise BackendError(f'注册表不可达：{url}（{e.reason}）') from None
+        except OSError as e:
+            raise BackendError(f'远程发布失败：{url}（{e}）') from None
 
     def describe(self, rel: str = '') -> str:
         return self._base if not rel else self.url_of(rel)

@@ -31,13 +31,23 @@ version = {attr = "jikuai._version.__version__"}
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-# W94（v0.22.0 · M24）：覆盖率基线。
+# W94（v0.21.0 · M24）：覆盖率基线。
 # 只量 src/jikuai/（运行时），lsp/、tools/、scripts/、benches/ 不进基线——
 # 那些是「靠 e2e/契约门禁自证」的边缘（服务端脚本、门禁工具、bench）。
 # 分支覆盖打开，因为大量控制流分支存在于 lexer/parser/interpreter。
+#
+# W97（v0.22.0 · M25）：**必须开 parallel** —— 全仓有 17 个测试文件用
+# `subprocess` 起子进程（LSP `python -m jikuai_lsp`、注册表服务端、CLI 跑 .jk）。
+# coverage 默认只记父进程，v0.21.0 那次基线因此把 completion.py 记成 25.8%，
+# 而它其实在 LSP 子进程里被整条打过。parallel 让每个进程写各自的
+# `.coverage.<host>.<pid>`，再靠 `coverage combine` 汇总。
+# 子进程还需要在启动时调 `coverage.process_startup()`——见
+# `scripts/coverage_baseline.py`（装 .pth 钩子）与 `tests/conftest.py`（传环境变量）。
 [tool.coverage.run]
 source = ["src/jikuai"]
 branch = true
+parallel = true
+sigterm = true
 omit = [
     # C 后端生成的 runtime 头由生成器写盘、由 gcc 消费；Python 覆盖率不适用。
     "src/jikuai/aot/runtime.h",
@@ -48,8 +58,10 @@ omit = [
 skip_empty = true
 show_missing = false
 precision = 1
-# 门禁刻意不预设百分比阈值（W94 纪律）：先看基线，再决定 v0.22+ 的目标。
-# fail_under = 0
+# W94 立的纪律：点阈值优先于面阈值，不追 95%（拍数字容易催生为覆盖率而写的
+# 空测试）。W97 重测后真实基线 83.4%，已在 80 之上，故直接设 80 留 3.4 个点
+# 缓冲吸收正常波动。**不进 G10-G19 门禁体系** —— 覆盖率是趋势指标不是契约。
+fail_under = 80
 exclude_lines = [
     "pragma: no cover",
     "raise NotImplementedError",

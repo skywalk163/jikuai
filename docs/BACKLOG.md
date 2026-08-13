@@ -75,6 +75,7 @@
 | 包签名（非对称）—— **v0.20.0 W73-W76 已完成**。ADR-33 已实施：`_ed25519.py`（RFC 8032 纯标准库）+ `keys.py` 密钥管理 + `trust.py` TOFU 信任库 + `registry.publish(signer=)` 签校验和 + `installer._verify_registry_signature` 三道检查（完整性/签名/未签名过渡告警）+ CLI `密钥` 子命令族与 `发布 --签名` + G17/G18 门禁。`test_pkg_signing.py` 28 用例 | `docs/ADR-33-包签名.md`、`src/jikuai/pkg/{_ed25519,keys,trust,registry,installer,cli}.py` | — | v0.20.0 M19（W73-W76 已完成） |
 | 全局缓存共享 —— 当前每个项目独立 `极快_包/` | `docs/包管理.md` | 低 | 待定 |
 | git 依赖的 commit 级锁定 —— 现在只锁到标签 | `docs/包管理.md` | 低 | 待定 |
+| `sources._iter_source_files` 死代码 —— `if fn.endswith('.tmp'): continue` 不可达：上一行已限定 `fn` 以 `.jk`/`.py`/`.json` 结尾，不存在同时以 `.tmp` 结尾的文件名。v0.22.0 W99 补覆盖时发现，当时未改（不在范围内） | `src/jikuai/pkg/sources.py` | 低 | 待清理 |
 | 块 ↔ 包 桥接 —— 块靠 `JIKUAI_PKG_ROOTS` 手配环境变量发现，包装到 `极快_包/`，两套体系互不相通。ADR-27 §4 末尾承认此桥接未做。**v0.19.0 W63 已定 `docs/ADR-32-块包格式.md`**（`包.json` 加可选 `块` 字段声明块根 + 安装器维护 `极快_包/.块根.json` 索引让 `extra_roots()` 合并读取），W65-W66 实现 | `docs/ADR-32-块包格式.md`、`src/jikuai/pkg/blocks.py` | 中 | v0.19.0（设计已定，待实现） |
 
 ## 4. 块生态

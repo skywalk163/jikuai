@@ -15,7 +15,7 @@ jikuai = "jikuai.main:main"
 jk = "jikuai.main:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "coverage[toml]>=7.0"]
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -30,3 +30,29 @@ version = {attr = "jikuai._version.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# W94（v0.22.0 · M24）：覆盖率基线。
+# 只量 src/jikuai/（运行时），lsp/、tools/、scripts/、benches/ 不进基线——
+# 那些是「靠 e2e/契约门禁自证」的边缘（服务端脚本、门禁工具、bench）。
+# 分支覆盖打开，因为大量控制流分支存在于 lexer/parser/interpreter。
+[tool.coverage.run]
+source = ["src/jikuai"]
+branch = true
+omit = [
+    # C 后端生成的 runtime 头由生成器写盘、由 gcc 消费；Python 覆盖率不适用。
+    "src/jikuai/aot/runtime.h",
+    "src/jikuai/aot/runtime.c",
+]
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = false
+precision = 1
+# 门禁刻意不预设百分比阈值（W94 纪律）：先看基线，再决定 v0.22+ 的目标。
+# fail_under = 0
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

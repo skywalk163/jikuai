@@ -2,9 +2,12 @@
 #
 # 触发：push / pull_request 到 main。
 #
-# 关键目标（T1 CI 加固 + W35 双平台矩阵）：
+# 关键目标（T1 CI 加固 + W35 双平台矩阵 + W95 四平台矩阵）：
 #   1. 在 Python 3.10 / 3.11 / 3.12 矩阵（ubuntu）上跑全部 pytest 用例；
-#      Windows 侧跑 Python 3.12 单版本（见下方第 4 点）。
+#      Windows 侧跑 Python 3.12 单版本（见下方第 4 点）；
+#      macOS 侧跑 Python 3.12 单版本（W95 · v0.21.0 补齐，clang 在位 AOT 真跑）；
+#      FreeBSD 侧由自建 Gitea Actions runner 承载（见 .gitea/workflows/ci.yml）。
+#      —— 四平台 = ubuntu / windows / macos / freebsd。
 #   2. **确保 AOT 端到端二进制测试真正运行、而非跳过**（仅 Linux job）。
 #      这些用例通过 shutil.which('gcc'|'clang'|'cc'|'cl') 探测 C 编译器：
 #        - tests/test_v0_8_0_aot_controlflow.py 的 8 条 @requires_cc 参数化用例
@@ -186,3 +189,50 @@ jobs:
       - name: Contract gates G10/G11/G12/G13/G13+/G14/G15
         shell: pwsh
         run: python scripts/check_stdlib_contract.py
+
+  # W95（v0.21.0 · M24）：macOS 平台守卫。补齐四平台矩阵。
+  # macOS runner 预装 clang（Apple Clang）；AOT 探测逻辑
+  # shutil.which('gcc'|'clang'|'cc'|'cl') 会命中 cc/clang，e2e 可跑。
+  test-macos:
+    name: Test (Python 3.12, macos)
+    runs-on: macos-latest
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package (editable) with dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      # macOS runner 预装 Apple Clang；cc 指向 clang。
+      - name: Verify C compiler visible to Python
+        run: |
+          python -c "import shutil, sys; cc = shutil.which('cc') or shutil.which('clang'); print('cc ->', cc); sys.exit(0 if cc else 1)"
+
+      - name: Run full test suite
+        run: python -m pytest -v
+
+      - name: Contract gates G10-G19
+        run: python scripts/check_stdlib_contract.py
+
+      # macOS 上 AOT e2e 也必须真跑（clang 在位）。
+      - name: Guard - AOT e2e tests must run (not skip)
+        run: |
+          python -m pytest -v -rs \
+            tests/test_v0_7_0_aot.py \
+            tests/test_v0_8_0_aot_controlflow.py \
+            | tee aot_run.log
+          if grep -q "skipped" aot_run.log; then
+            echo "::error::AOT 端到端用例出现 skip——macOS clang 环境下不应跳过。"
+            exit 1
+          fi
+          echo "AOT 端到端用例全部运行，无跳过。"

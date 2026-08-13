@@ -154,19 +154,40 @@ def test_公钥落入注册表密钥目录(隔离环境):
     assert base64.b64decode(reg_b64) == keys.load_public_key('甲')
 
 
-def test_同别名换身份被拒(隔离环境):
+def test_注册表公钥文件是追加而非拒写(隔离环境):
+    """v0.22.0 W101（ADR-36 §2.4）：注册表侧公钥文件改为「每行一把」，追加。
+
+    v0.21.0 及之前这里是「与已有公钥不等就拒写」。改掉的理由：注册表侧的
+    公钥文件是**分发渠道**（装包端 TOFU 首次拉取源），不是权威判据——
+    权威判据是客户端本地 pin。限制成「一个别名只能一把钥」正是轮换会炸掉
+    全部老包的根因。防「静默改身份」的职责在客户端 pin（见下面两个测试）。
+    """
     keys.generate_keypair('甲')
     manifest = load_manifest(_造包(隔离环境))
     registry.publish(manifest, dry_run=False, signer='甲')
 
-    # 手工把注册表里的公钥换成假的，模拟身份替换
+    真钥 = base64.b64encode(keys.load_public_key('甲')).decode()
     reg_pk_path = registry.registry_key_path(registry.registry_root(), '甲')
-    with open(reg_pk_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(base64.b64encode(b'\x00' * 32).decode() + '\n')
 
+    # 手工往注册表里塞一把别的公钥（模拟管理员登记轮换后的新钥）
+    假钥 = base64.b64encode(b'\x00' * 32).decode()
+    with open(reg_pk_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(假钥 + '\n')
+
+    # 再发一版：本次公钥不在列表里 → 追加，不再报错
     manifest2 = load_manifest(_造包(隔离环境, version='0.2.0'))
-    with pytest.raises(registry.RegistryError, match='不允许静默替换'):
-        registry.publish(manifest2, dry_run=False, signer='甲')
+    registry.publish(manifest2, dry_run=False, signer='甲')
+
+    with open(reg_pk_path, encoding='utf-8') as f:
+        行 = [l.strip() for l in f if l.strip()]
+    assert 行 == [假钥, 真钥]          # 先来的在前，新钥追加在后
+
+    # 幂等：同一把钥再发一次不会重复追加
+    manifest3 = load_manifest(_造包(隔离环境, version='0.3.0'))
+    registry.publish(manifest3, dry_run=False, signer='甲')
+    with open(reg_pk_path, encoding='utf-8') as f:
+        assert len([l for l in f if l.strip()]) == 2
+
 
 
 def test_演练带签名不落盘但报告有签名(隔离环境):
@@ -286,19 +307,123 @@ def test_装未签名包_告警但放行(隔离环境):
     assert 'v0.21.0' in 报告.warnings[0]
 
 
-def test_公钥变更_拒装(隔离环境):
+def test_注册表公钥被换_pin是权威_照样装得上(隔离环境):
+    """ADR-36 §2.4：pin 过之后**不再看注册表**，注册表侧被改无关紧要。
+
+    v0.21.0 的行为是「注册表公钥 != pin 就拒装」，那是错的：只要签名本身
+    还能被 pin 过的公钥验过，包就是没被动过的，注册表侧那个文件只是分发
+    渠道上的一份副本，改它不该影响已建立的信任。
+    """
     _发布带签名(隔离环境)
     proj = _造宿主(隔离环境)
     I.install(load_manifest(proj))       # 首次装：pin 公钥
+    真公钥 = trust.pinned_keys('甲')
+    assert len(真公钥) == 1
 
-    # 攻击者换掉注册表里的公钥（并配一个用新私钥重签的签名也没用——
-    # pin 过的公钥就是权威，对不上直接拒）
     reg_pk = registry.registry_key_path(registry.registry_root(), '甲')
     with open(reg_pk, 'w', encoding='utf-8', newline='\n') as f:
         f.write(base64.b64encode(b'\x01' * 32).decode() + '\n')
 
-    with pytest.raises(I.InstallError, match='公钥'):
+    报告 = I.install(load_manifest(proj))
+    assert 报告.total == 1
+    assert trust.pinned_keys('甲') == 真公钥      # 注册表那把没被并进来
+
+
+def test_注册表换公钥且包重签_拒装并指向密钥信任(隔离环境):
+    """真正的轮换/投毒场景：注册表有新公钥 + 包用新私钥重签，pin 还是旧钥。
+
+    此时签名验不过任何一把受信公钥 → 必须拒，且错误信息要指向显式动作
+    `jk 包 密钥 信任`（而不是含糊地说「签名失败」，那会把轮换当成攻击）。
+    """
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    I.install(load_manifest(proj))       # pin 旧公钥
+    旧公钥 = trust.pinned_keys('甲')
+
+    # 攻击者/轮换者：换注册表公钥 + 用新私钥对同一校验和重签
+    keys.generate_keypair('乙')
+    新公钥 = keys.load_public_key('乙')
+    reg_pk = registry.registry_key_path(registry.registry_root(), '甲')
+    with open(reg_pk, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(base64.b64encode(新公钥).decode() + '\n')
+
+    base = registry.registry_root()
+    shard_path = registry._category_path(base, '通用')
+    with open(shard_path, encoding='utf-8') as f:
+        shard = json.load(f)
+    条目 = shard['签名试包']['0.1.0']
+    条目['签名'] = base64.b64encode(
+        ed.sign(keys.load_private_key('乙'), 条目['校验和'].encode('utf-8'))
+    ).decode()
+    with open(shard_path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(shard, f, ensure_ascii=False)
+
+    with pytest.raises(I.InstallError, match='密钥 信任'):
         I.install(load_manifest(proj))
+    assert trust.pinned_keys('甲') == 旧公钥
+
+
+def test_轮换后老包仍验签通过(隔离环境):
+    """ADR-36 §3 反例 4：追加新公钥后，用旧钥签的老包不能失效。"""
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    I.install(load_manifest(proj))       # pin 旧公钥
+
+    keys.generate_keypair('乙')          # 冒充「甲轮换后的新钥」
+    新公钥 = base64.b64encode(keys.load_public_key('乙')).decode()
+    assert trust.trust_key('甲', 新公钥) is True
+    assert trust.trust_key('甲', 新公钥) is False        # 幂等
+    受信 = trust.pinned_keys('甲')
+    assert len(受信) == 2
+    assert base64.b64encode(受信[0]).decode() != 新公钥  # 主钥仍是第一行
+
+    assert I.install(load_manifest(proj)).total == 1     # 老包照样装
+
+    # 撤掉旧主钥后，老包立刻失效（撤信是真的生效，不是摆设）
+    trust.untrust_key('甲', base64.b64encode(受信[0]).decode())
+    assert trust.pinned_keys('甲') == [受信[1]]
+    with pytest.raises(I.InstallError):
+        I.install(load_manifest(proj))
+
+
+def test_撤信到一把不剩_回到未建立信任(隔离环境):
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    I.install(load_manifest(proj))
+    (pk,) = trust.pinned_keys('甲')
+
+    assert trust.untrust_key('甲', base64.b64encode(pk).decode()) is True
+    assert trust.pinned_keys('甲') == []
+    assert not os.path.exists(os.path.join(trust.trust_root(), '甲.公钥'))
+    # 再撤一次是 no-op
+    assert trust.untrust_key('甲', base64.b64encode(pk).decode()) is False
+
+    # 回到 TOFU 首次使用：从注册表重新 pin
+    assert I.install(load_manifest(proj)).total == 1
+    assert trust.pinned_keys('甲') == [pk]
+
+
+def test_pin文件多行带注释_全部受信(隔离环境):
+    """手工编辑场景：空行与 # 注释不该把 pin 文件搞成非法格式。"""
+    _发布带签名(隔离环境)
+    proj = _造宿主(隔离环境)
+    I.install(load_manifest(proj))
+    (pk,) = trust.pinned_keys('甲')
+
+    keys.generate_keypair('乙')
+    另一把 = base64.b64encode(keys.load_public_key('乙')).decode()
+    with open(os.path.join(trust.trust_root(), '甲.公钥'),
+              'w', encoding='utf-8', newline='\n') as f:
+        f.write('# 2026-08 轮换前的旧钥\n')
+        f.write(base64.b64encode(pk).decode() + '\n')
+        f.write('\n')
+        f.write('# 新钥\n')
+        f.write(另一把 + '\n')
+        f.write(另一把 + '\n')          # 重复行被去重
+
+    受信 = trust.pinned_keys('甲')
+    assert len(受信) == 2 and 受信[0] == pk
+    assert I.install(load_manifest(proj)).total == 1
 
 
 def test_签名被篡改_拒装(隔离环境):

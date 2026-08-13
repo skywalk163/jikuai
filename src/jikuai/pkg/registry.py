@@ -559,20 +559,27 @@ def publish(manifest: Optional[Manifest] = None, root: Optional[str] = None,
     _archive_snapshot(dest, _package_path(base, name, version) + ARCHIVE_SUFFIX)
 
     # 有签名：把公钥落到注册表 `密钥/<签名者>.公钥`（TOFU 首次拉取源）。
-    # 与已存在的公钥字节不等 → 拒写，避免同一别名被静默改身份 —— 别名换身份
-    # 必须换名字，管理员端做的动作应是「删旧公钥、审新公钥」而非静默覆盖。
+    # 格式是「每行一把 base64 公钥」，本次公钥不在列表里就**追加**（ADR-36 §2.4）。
+    #
+    # v0.21.0 及之前这里是「与已有公钥不等就拒写」，v0.22.0 W101 改为追加。
+    # 理由：注册表侧的公钥文件是**分发渠道**（装包端 TOFU 首次拉取的来源），
+    # 不是权威判据——权威判据是客户端本地的 pin 列表。把分发渠道限制成
+    # 「一个别名只能有一把钥」正是 v0.21 轮换会炸掉全部老包的根因。
+    # 防「静默改身份」的职责在**客户端 pin**（trust.py 严守：已 pin 的别名
+    # 绝不自动接受注册表侧的新公钥，必须 `jk 包 密钥 信任` 显式追加），
+    # 放在注册表文件上只会既拦不住有写权限的人、又堵死正当的轮换。
     if signer is not None and signature_b64:
         pk_rel = key_rel(signer)
-        pk_b64_line = base64.b64encode(pubkey_bytes).decode('ascii') + '\n'
+        本钥 = base64.b64encode(pubkey_bytes).decode('ascii')
         existing_pk = backend.read_text(pk_rel)
+        已有钥 = []
         if existing_pk is not None:
-            if existing_pk.strip() != pk_b64_line.strip():
-                raise RegistryError(
-                    f'注册表里已有别名 {signer!r} 的公钥，且与本次不一致；'
-                    f'签名身份不允许静默替换。要换身份请先删 '
-                    f'{backend.describe(pk_rel)}，或改用另一个别名')
-        else:
-            backend.write_text(pk_rel, pk_b64_line)
+            已有钥 = [行.strip() for 行 in existing_pk.splitlines()
+                     if 行.strip() and not 行.strip().startswith('#')]
+        if 本钥 not in 已有钥:
+            已有钥.append(本钥)
+            backend.write_text(pk_rel, ''.join(k + '\n' for k in 已有钥))
+
 
     # 写分片：包名 → 版本 → 条目详情
     shard = _load_category(base, category)

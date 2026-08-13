@@ -124,12 +124,16 @@ class _响应(Exception):
 # 请求处理器工厂
 # ---------------------------------------------------------------------------
 
-def _make_handler(注册表根, 授权配置, 审计路径, 写锁, max_body):
+def _make_handler(注册表根, 授权源, 审计路径, 写锁, max_body):
     """闭包出一个绑定运行时状态的 `BaseHTTPRequestHandler` 子类。
 
     不用类属性/全局：便于测试起多个实例互不干扰。
+
+    `授权源` 是 `AuthProvider`（不是 `AuthConfig`）——每次处理写请求时向它
+    要一份当前配置，从而支持 `授权.json` 的热重载（ADR-36 §2.3）。
     """
     注册表根_abs = os.path.abspath(注册表根)
+
 
     class 处理器(BaseHTTPRequestHandler):
         server_version = 'JiKuaiRegistry/0.21'
@@ -263,7 +267,11 @@ def _make_handler(注册表根, 授权配置, 审计路径, 写锁, max_body):
                 raise _响应(400, '「归档」字段为空')
 
             # 3. 认证（Authorization: Bearer <token>）
+            #    先向 AuthProvider 要一份当前配置：`授权.json` 若有改动，
+            #    这一步就地热重载（ADR-36 §2.3），撤销 token 立刻生效。
+            授权配置 = 授权源.current()
             auth头 = self.headers.get('Authorization') or ''
+
             if not auth头.startswith('Bearer '):
                 raise _响应(401, '缺少 `Authorization: Bearer <token>` 头')
             raw_token = auth头[len('Bearer '):].strip()
@@ -403,21 +411,24 @@ def _make_handler(注册表根, 授权配置, 审计路径, 写锁, max_body):
                     分片_rel,
                     json.dumps(分片, ensure_ascii=False, indent=2) + '\n')
 
-                # 写公钥：`密钥/<签名者>.公钥` = base64 公钥 + 换行。
-                # 与 registry.publish(signer=...) 的落盘格式对齐，装包端
-                # TOFU 直接读取。已存在且不一致 → 拒（防身份静默替换）。
+                # 写公钥：`密钥/<签名者>.公钥` = 每行一把 base64 公钥。
+                # 与 registry/trust 的多公钥格式对齐（ADR-36 §2.4）。
+                # 公钥来自 `授权.json` 登记的那把（管理员显式授权），不是报文。
+                # 已有该公钥 → 什么都不做；未含该公钥 → **追加**（支持轮换：
+                # 管理员在 授权.json 换 `公钥` 字段后，新钥随下一次发布并入）。
+                # 绝不 409 拒——注册表侧只是把管理员已授权的事实分发出去。
                 pk_rel = _registry.key_rel(entry.signer)
-                pk_line = base64.b64encode(entry.public_key_bytes).decode(
-                    'ascii') + '\n'
+                本钥 = base64.b64encode(entry.public_key_bytes).decode('ascii')
                 旧pk = 后端.read_text(pk_rel)
+                已有钥 = []
                 if 旧pk is not None:
-                    if 旧pk.strip() != pk_line.strip():
-                        raise _响应(
-                            409,
-                            f'签名者 {entry.signer!r} 已登记不同公钥；'
-                            f'签名身份不允许静默替换，请联系管理员')
-                else:
-                    后端.write_text(pk_rel, pk_line)
+                    已有钥 = [行.strip() for 行 in 旧pk.splitlines()
+                             if 行.strip() and not 行.strip().startswith('#')]
+                if 本钥 not in 已有钥:
+                    已有钥.append(本钥)
+                    后端.write_text(pk_rel,
+                                    ''.join(k + '\n' for k in 已有钥))
+
             except _响应:
                 raise
             except Exception:                           # noqa: BLE001
@@ -503,16 +514,23 @@ def build_server(注册表, 授权, host=DEFAULT_HOST, port=DEFAULT_PORT,
         os.makedirs(根, exist_ok=True)
 
     if isinstance(授权, _auth_mod.AuthConfig):
-        配置 = 授权
+        # 测试直接塞配置：没有文件可 stat，热重载自然是 no-op。
+        授权源 = _auth_mod.AuthProvider.from_config(授权)
+    elif isinstance(授权, _auth_mod.AuthProvider):
+        授权源 = 授权
     else:
-        配置 = _auth_mod.load_auth_config(授权)
+        授权源 = _auth_mod.AuthProvider.from_path(授权)
 
     if max_body is None:
         max_body = _读上限(MAX_BODY_ENV, DEFAULT_MAX_BODY)
 
     写锁 = threading.Lock()
-    处理器 = _make_handler(根, 配置, 审计路径, 写锁, max_body)
-    return ThreadingHTTPServer((host, port), 处理器)
+    处理器 = _make_handler(根, 授权源, 审计路径, 写锁, max_body)
+    srv = ThreadingHTTPServer((host, port), 处理器)
+    # 挂到实例上，供 CLI 打横幅与测试断言重载次数用。
+    srv.授权源 = 授权源
+    return srv
+
 
 
 def _读上限(名, 默认):

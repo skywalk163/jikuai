@@ -439,6 +439,94 @@ def test_密钥_列表标出残缺态(隔离环境, capsys):
 
 
 # ---------------------------------------------------------------------------
+# v0.22.0 · W101 · `密钥 信任` / `密钥 撤信`（ADR-36 §2.4）
+# ---------------------------------------------------------------------------
+
+def _一把公钥(隔离环境, 别名):
+    """生成一对密钥并返回其 base64 公钥。"""
+    assert run(['密钥', '生成', 别名]) == 0
+    import base64
+    return base64.b64encode(keys.load_public_key(别名)).decode('ascii')
+
+
+@pytest.mark.parametrize('子命令', ['信任', 'trust'])
+def test_密钥_信任_追加并幂等(隔离环境, capsys, 子命令):
+    pub = _一把公钥(隔离环境, '甲')
+    capsys.readouterr()
+
+    assert run(['密钥', 子命令, '乙方', pub]) == 0
+    out = capsys.readouterr().out
+    assert '已把公钥追加进「乙方」的信任列表' in out
+    assert '当前受信公钥数：1' in out
+    assert trust.pinned_keys('乙方') == [keys.load_public_key('甲')]
+
+    # 再来一次是幂等的
+    assert run(['密钥', 子命令, '乙方', pub]) == 0
+    assert '已在「乙方」的信任列表里' in capsys.readouterr().out
+    assert len(trust.pinned_keys('乙方')) == 1
+
+
+def test_密钥_信任_两把公钥并存(隔离环境, capsys):
+    """轮换语义：追加不替换，第一行仍是原主公钥。"""
+    第一把 = _一把公钥(隔离环境, '旧')
+    第二把 = _一把公钥(隔离环境, '新')
+    capsys.readouterr()
+    assert run(['密钥', '信任', '甲方', 第一把]) == 0
+    assert run(['密钥', '信任', '甲方', 第二把]) == 0
+    assert '当前受信公钥数：2' in capsys.readouterr().out
+    受信 = trust.pinned_keys('甲方')
+    assert 受信 == [keys.load_public_key('旧'), keys.load_public_key('新')]
+
+
+@pytest.mark.parametrize('子命令', ['撤信', 'untrust', 'revoke'])
+def test_密钥_撤信_移除并报剩余(隔离环境, capsys, 子命令):
+    第一把 = _一把公钥(隔离环境, '甲')
+    第二把 = _一把公钥(隔离环境, '乙')
+    assert run(['密钥', '信任', '丙方', 第一把]) == 0
+    assert run(['密钥', '信任', '丙方', 第二把]) == 0
+    capsys.readouterr()
+
+    assert run(['密钥', 子命令, '丙方', 第一把]) == 0
+    out = capsys.readouterr().out
+    assert '已从「丙方」的信任列表移除该公钥' in out
+    assert '剩余受信公钥数：1' in out
+    assert trust.pinned_keys('丙方') == [keys.load_public_key('乙')]
+
+    # 撤到一把不剩 → 提示回到 TOFU
+    assert run(['密钥', 子命令, '丙方', 第二把]) == 0
+    out = capsys.readouterr().out
+    assert '剩余受信公钥数：0' in out
+    assert '首次信任（TOFU）' in out
+    assert trust.pinned_keys('丙方') == []
+
+
+def test_密钥_撤信_列表里没有这把(隔离环境, capsys):
+    pub = _一把公钥(隔离环境, '甲')
+    capsys.readouterr()
+    assert run(['密钥', '撤信', '没信过', pub]) == 0
+    assert '没有这把公钥' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('子命令', ['信任', '撤信'])
+def test_密钥_信任撤信_缺参(隔离环境, capsys, 子命令):
+    assert run(['密钥', 子命令]) == 1
+    assert run(['密钥', 子命令, '只有别名']) == 1
+    err = capsys.readouterr().err
+    assert f'密钥 {子命令} 需要别名与公钥' in err
+
+
+def test_密钥_信任_坏公钥被拒(隔离环境, capsys):
+    assert run(['密钥', '信任', '甲', '这不是base64!!!']) == 1
+    assert '公钥' in capsys.readouterr().err
+    # 长度对不上也拒（合法 base64 但只有 16 字节）
+    import base64
+    短 = base64.b64encode(b'\x00' * 16).decode('ascii')
+    assert run(['密钥', '信任', '甲', 短]) == 1
+    assert '长度异常' in capsys.readouterr().err
+    assert trust.pinned_keys('甲') == []
+
+
+# ---------------------------------------------------------------------------
 # 顶层分发
 # ---------------------------------------------------------------------------
 

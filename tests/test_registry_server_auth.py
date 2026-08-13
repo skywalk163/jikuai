@@ -219,3 +219,153 @@ def test_令牌为空被拒(tmp_path):
                  encoding='utf-8', newline='\n')
     with pytest.raises(auth.AuthError, match='令牌'):
         auth.load_auth_config(str(p))
+
+
+# ---------------------------------------------------------------------------
+# v0.22.0 · W101 · 授权热重载（ADR-36 §2.3）的反例测试
+# ---------------------------------------------------------------------------
+
+def _条目(token, signer='甲', 可发布=('甲包',), 每小时次数=20,
+         单包字节=16777216):
+    return {
+        _token哈希(token): {
+            '签名者': signer,
+            '公钥': _公钥b64(),
+            '可发布': list(可发布),
+            '每小时次数': 每小时次数,
+            '单包字节': 单包字节,
+        }
+    }
+
+
+def _改写(path, 令牌):
+    """原地改写 授权.json，并强制推进 mtime。
+
+    显式 `os.utime` 而不是靠文件系统自然打戳：测试里两次写相隔微秒级，
+    某些平台/文件系统的 mtime 粒度粗到能把两次写看成同一时刻，那会让这批
+    测试变成看运气的抖动测试。热重载的判据本身（mtime_ns + size）是对的，
+    这里只是把「时钟确实走了」这个前提在测试里钉死。
+    """
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump({'协议': 1, '令牌': 令牌}, f, ensure_ascii=False, indent=2)
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+
+def test_撤销token后下一请求即失效(tmp_path):
+    """ADR-36 §3 反例 1：改完 授权.json 不重启，下一个请求就认不出旧 token。"""
+    path = _写配置(tmp_path, _条目('甲的token'))
+    源 = auth.AuthProvider.from_path(path)
+    assert 源.current().authenticate('甲的token') is not None
+
+    _改写(path, _条目('新的token'))                # 撤旧发新
+    assert 源.current().authenticate('甲的token') is None
+    assert 源.current().authenticate('新的token') is not None
+    assert 源.reload_count == 1                    # 只重载了一次，不是每次都读
+
+
+def test_重载不重置频次配额(tmp_path):
+    """ADR-36 §3 反例 2：改配置不能成为清空配额的后门。"""
+    path = _写配置(tmp_path, _条目('甲的token', 每小时次数=2))
+    源 = auth.AuthProvider.from_path(path)
+    条目 = 源.current().authenticate('甲的token')
+    assert 源.current().check_rate(条目) is None
+    assert 源.current().check_rate(条目) is None
+    assert 源.current().check_rate(条目) is not None    # 用尽
+
+    # 改一个与频次无关的字段触发重载
+    _改写(path, _条目('甲的token', 每小时次数=2, 单包字节=1024))
+    新条目 = 源.current().authenticate('甲的token')
+    assert 源.reload_count == 1
+    assert 新条目.max_package_bytes == 1024            # 新配置确实生效了
+    assert 源.current().check_rate(新条目) is not None  # 但配额没被清零
+
+
+def test_删掉的token连配额一起丢(tmp_path):
+    """被删除**并被观察到**再加回的 token 拿到干净窗口——它中间确实不存在过。
+
+    注意中间那次 `current()` 不能省：热重载是「请求驱动」的，删了又立刻加回、
+    期间没有任何请求进来，provider 根本没见过那个中间态，配额自然还留着。
+    那也是对的（更保守），但不是本测试要钉的那条语义。
+    """
+    path = _写配置(tmp_path, _条目('甲的token', 每小时次数=1))
+    源 = auth.AuthProvider.from_path(path)
+    条目 = 源.current().authenticate('甲的token')
+    assert 源.current().check_rate(条目) is None
+    assert 源.current().check_rate(条目) is not None
+
+    _改写(path, _条目('别的token'))                    # 甲的 token 消失
+    assert 源.current().authenticate('甲的token') is None   # 被观察到了
+    _改写(path, _条目('甲的token', 每小时次数=1))       # 又加回来
+    新条目 = 源.current().authenticate('甲的token')
+    assert 源.reload_count == 2
+    assert 源.current().check_rate(新条目) is None      # 干净窗口
+
+
+def test_坏JSON不致瘫_保留旧配置且持续重试(tmp_path):
+    """ADR-36 §3 反例 3：管理员手抖写坏 JSON，服务继续用旧配置顶着。"""
+    path = _写配置(tmp_path, _条目('甲的token'))
+    源 = auth.AuthProvider.from_path(path)
+    assert 源.current().authenticate('甲的token') is not None
+
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('{ 这不是 json')
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    assert 源.current().authenticate('甲的token') is not None   # 旧配置还在
+    assert 源.reload_count == 0
+    # 刻意不更新 stamp → 每次请求都会再试一遍，改对了立刻生效
+    _改写(path, _条目('修好的token'))
+    assert 源.current().authenticate('修好的token') is not None
+    assert 源.reload_count == 1
+
+
+def test_协议版本写错也算坏配置_保留旧的(tmp_path):
+    """坏配置不只是语法坏：语义校验失败（AuthError）也走保留旧配置这条路。"""
+    path = _写配置(tmp_path, _条目('甲的token'))
+    源 = auth.AuthProvider.from_path(path)
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump({'协议': 99, '令牌': _条目('甲的token')}, f,
+                  ensure_ascii=False)
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    assert 源.current().authenticate('甲的token') is not None
+    assert 源.reload_count == 0
+
+
+def test_文件被移走时保留旧配置(tmp_path):
+    """原子替换（写 tmp → rename）中间有个文件不存在的空窗，不能因此全拒。"""
+    path = _写配置(tmp_path, _条目('甲的token'))
+    源 = auth.AuthProvider.from_path(path)
+    os.remove(path)
+    assert 源.current().authenticate('甲的token') is not None
+    assert 源.reload_count == 0
+
+
+def test_未改动则不重载(tmp_path):
+    path = _写配置(tmp_path, _条目('甲的token'))
+    源 = auth.AuthProvider.from_path(path)
+    第一份 = 源.current()
+    assert 源.current() is 第一份           # 同一对象，没白读文件
+    assert 源.reload_count == 0
+
+
+def test_from_config不监视文件(tmp_path):
+    """直接塞配置构造的 provider 不该去 stat 任何东西。"""
+    配置 = _标准配置(tmp_path, token='甲的token')
+    源 = auth.AuthProvider.from_config(配置)
+    assert 源.current() is 配置
+    _改写(str(tmp_path / '授权.json'), _条目('新的token'))
+    assert 源.current() is 配置
+    assert 源.reload_count == 0
+
+
+def test_启动期配置坏直接抛(tmp_path):
+    """热重载的容忍只针对**运行期**：启动时读不出配置就该起不来。"""
+    p = tmp_path / '授权.json'
+    p.write_text('{ 坏的', encoding='utf-8', newline='\n')
+    with pytest.raises((auth.AuthError, ValueError)):
+        auth.AuthProvider.from_path(str(p))
+

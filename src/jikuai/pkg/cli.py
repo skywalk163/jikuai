@@ -32,7 +32,9 @@ from .resolver import ResolveError
 from . import registry
 from . import semver
 from . import keys
+from . import trust
 from .backend import is_remote
+
 
 __all__ = ['main', 'run']
 
@@ -56,7 +58,10 @@ _USAGE = f"""极快包管理 用法：
   jk 包 密钥 生成 <别名>       生成 Ed25519 签名密钥对
   jk 包 密钥 列表              列出本机已有的签名密钥
   jk 包 密钥 导出 <别名>       打印 base64 公钥（交给注册表管理员）
+  jk 包 密钥 信任 <别名> <公钥> 把一把公钥追加进本地信任库（密钥轮换，ADR-36）
+  jk 包 密钥 撤信 <别名> <公钥> 从本地信任库移除一把公钥（密钥泄露时用）
   jk 包 帮助                   显示本帮助
+
 
 英文别名：init / add / remove(rm) / install(i) / list(ls) / run /
           publish / search / registry / key / help
@@ -385,9 +390,47 @@ def _cmd_key(args: List[str]) -> int:
         except (ValueError, OSError) as e:
             return _err(str(e))
         print(b64)
+    elif sub in ('信任', 'trust'):
+        # ADR-36 §2.4：密钥轮换的显式动作——把一把公钥追加进本地信任库。
+        # 追加而非替换：旧公钥留着，用旧钥签的老包不受影响。
+        if len(rest) < 2:
+            return _err('密钥 信任 需要别名与公钥，例如：'
+                        'jk 包 密钥 信任 甲 <base64公钥>')
+        alias, pub_b64 = rest[0], rest[1]
+        try:
+            新增 = trust.trust_key(alias, pub_b64)
+        except (ValueError, trust.TrustError, OSError) as e:
+            return _err(str(e))
+        if 新增:
+            print(f'已把公钥追加进「{alias}」的信任列表')
+            print(f'  信任库根：{trust.trust_root()}')
+            print(f'  当前受信公钥数：{len(trust.pinned_keys(alias))}')
+            print('  旧公钥保留，用旧钥签的老包不受影响。')
+        else:
+            print(f'该公钥已在「{alias}」的信任列表里，无需重复添加')
+    elif sub in ('撤信', 'untrust', 'revoke'):
+        # 密钥泄露时用：从信任列表摘掉一把公钥。撤到一把不剩则回到未建立信任。
+        if len(rest) < 2:
+            return _err('密钥 撤信 需要别名与公钥，例如：'
+                        'jk 包 密钥 撤信 甲 <base64公钥>')
+        alias, pub_b64 = rest[0], rest[1]
+        try:
+            删了 = trust.untrust_key(alias, pub_b64)
+        except (ValueError, trust.TrustError, OSError) as e:
+            return _err(str(e))
+        if 删了:
+            剩余 = len(trust.pinned_keys(alias))
+            print(f'已从「{alias}」的信任列表移除该公钥')
+            print(f'  剩余受信公钥数：{剩余}')
+            if 剩余 == 0:
+                print('  信任列表已空，下次装该签名者的包会重新走首次信任（TOFU）。')
+        else:
+            print(f'「{alias}」的信任列表里没有这把公钥')
     else:
-        return _err(f'未知的密钥子命令：{sub}（可用：生成 / 列表 / 导出）')
+        return _err(f'未知的密钥子命令：{sub}'
+                    f'（可用：生成 / 列表 / 导出 / 信任 / 撤信）')
     return 0
+
 
 
 def _cmd_search(args: List[str]) -> int:

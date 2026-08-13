@@ -22,15 +22,19 @@ import fnmatch
 import hashlib
 import hmac
 import json
+import logging
 import os
 import threading
 import time
 from collections import deque
 
 __all__ = [
-    'AuthError', 'AuthConfig', 'load_auth_config',
+    'AuthError', 'AuthConfig', 'AuthProvider', 'load_auth_config',
     'PROTOCOL_VERSION', 'RATE_WINDOW_SEC',
 ]
+
+_LOG = logging.getLogger('jikuai.registry.auth')
+
 
 #: 授权配置文件的协议版本。结构演进时递增；读到更高版本直接拒。
 PROTOCOL_VERSION = 1
@@ -73,12 +77,32 @@ class AuthConfig:
     """`授权.json` 的运行时视图 + 频次计数。
 
     **线程安全**：查表是只读的（`_entries` 加载后不变），频次窗口写入用条目
-    自己的锁。**热重载不做**（ADR-35 §4）：改配置 = 重启进程。
+    自己的锁。**热重载由 `AuthProvider` 负责**（ADR-36 §2.3）——本类自身仍是
+    不可变快照，重载是「换一个新快照」而不是「原地改旧快照」。
     """
 
     def __init__(self, entries):
         # 字典：token_hash_hex → _Entry
         self._entries = dict(entries)
+
+    def carry_rate_windows_from(self, old):
+        """把旧配置里**仍然存在**的 token 的频次窗口搬到本配置上。
+
+        为什么必须搬（ADR-36 §2.3 第 2 条）：不搬的话，「改一下 `授权.json`」
+        就能把所有 token 的配额清零——配额形同虚设，而重载恰恰是管理员最
+        频繁的动作。被删掉的 token 连窗口一起丢，这是对的：它已经不存在了。
+
+        搬的是 deque 对象本身而不是拷贝内容：新条目此刻还没有任何请求写入，
+        直接接管旧队列最省事，也不存在两个条目共享同一队列的问题（旧配置
+        马上被丢弃）。
+        """
+        if not isinstance(old, AuthConfig):
+            return
+        for token_hash_hex, entry in self._entries.items():
+            旧 = old._entries.get(token_hash_hex)
+            if 旧 is not None:
+                entry._timestamps = 旧._timestamps
+
 
     # -- 认证 ---------------------------------------------------------------
 
@@ -185,6 +209,85 @@ def load_auth_config(path):
     for token_hash_hex, spec in raw_tokens.items():
         entries[token_hash_hex] = _build_entry(token_hash_hex, spec)
     return AuthConfig(entries)
+
+
+# ---------------------------------------------------------------------------
+# 热重载（ADR-36 §2.3）
+# ---------------------------------------------------------------------------
+
+def _stat_stamp(path):
+    """返回 `(st_mtime_ns, st_size)`；文件不存在或 stat 失败返回 None。
+
+    用 `mtime_ns` 而不是 `mtime`：秒级精度下「同一秒内改两次」会被漏掉，
+    而撤销 token 恰恰是那种会紧跟着改第二次的应急动作。
+    带上 `size` 是廉价的第二维度，防同 inode 原地改写但 mtime 未跳的边缘情形。
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+class AuthProvider:
+    """按需热重载 `授权.json` 的持有者（ADR-36 §2.3）。
+
+    **为什么是每请求 stat 而不是 SIGHUP 或 inotify**：`signal.SIGHUP` 在
+    Windows 上不存在，而本项目门禁是四平台，用它会做成只有一半平台可用的
+    功能；`inotify` / `ReadDirectoryChangesW` 要两套平台 API，换来的只是省掉
+    每请求一次 `stat`——对一个低频写端点，这个开销不值得讨论。
+
+    **失败语义：保留旧配置**。管理员把 JSON 写坏了、正写到一半被读到、
+    文件被临时移走——这些都不能让服务瘫。旧配置是**已经被审查过的**配置，
+    继续用它不引入新风险；反过来做（失败即全拒）会把一次手抖放大成一次停服。
+
+    从现成 `AuthConfig` 构造时**不监视任何文件**（测试直接塞配置），
+    `current()` 恒返回同一份。
+    """
+
+    __slots__ = ('_config', '_path', '_stamp', '_lock', 'reload_count')
+
+    def __init__(self, config, path=None):
+        self._config = config
+        self._path = path
+        self._lock = threading.Lock()
+        self._stamp = _stat_stamp(path) if path else None
+        #: 成功重载次数。测试与排障用，不参与任何判定。
+        self.reload_count = 0
+
+    @classmethod
+    def from_path(cls, path):
+        """从 `授权.json` 路径构造。启动期加载失败照旧抛 `AuthError`。"""
+        return cls(load_auth_config(path), path=path)
+
+    @classmethod
+    def from_config(cls, config):
+        """从现成配置构造，不监视文件。"""
+        return cls(config, path=None)
+
+    def current(self):
+        """返回当前生效的 `AuthConfig`，必要时先重载。"""
+        if self._path is None:
+            return self._config
+        with self._lock:
+            新戳 = _stat_stamp(self._path)
+            if 新戳 is None or 新戳 == self._stamp:
+                # 文件消失（被临时移走 / 正在原子替换的空窗）或没变：用旧的。
+                return self._config
+            try:
+                新配置 = load_auth_config(self._path)
+            except (AuthError, OSError) as e:
+                # **刻意不更新 _stamp**：这样下一次请求还会再试一遍。
+                # 管理员改到能读为止，服务期间一直用旧配置顶着。
+                _LOG.warning('授权配置重载失败，继续使用旧配置：%s', e)
+                return self._config
+            新配置.carry_rate_windows_from(self._config)
+            self._config = 新配置
+            self._stamp = 新戳
+            self.reload_count += 1
+            _LOG.info('授权配置已热重载（第 %d 次）', self.reload_count)
+            return self._config
+
 
 
 def _build_entry(token_hash_hex, spec):

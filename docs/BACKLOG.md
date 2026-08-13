@@ -74,6 +74,7 @@
 | ~~校验和格式不一致~~ —— **v0.20.0 W73 已清**。`registry.publish` 曾存裸 hex、`installer` 往 `包.锁` 存 `sha256:<hex>`；统一为带前缀。动因不是好看：ADR-33 的签名对象是校验和字符串，两端格式不同会签出不同签名导致验签必失败 | `docs/ADR-33-包签名.md` | — | v0.20.0 W73 已完成 |
 | 包签名（非对称）—— **v0.20.0 W73-W76 已完成**。ADR-33 已实施：`_ed25519.py`（RFC 8032 纯标准库）+ `keys.py` 密钥管理 + `trust.py` TOFU 信任库 + `registry.publish(signer=)` 签校验和 + `installer._verify_registry_signature` 三道检查（完整性/签名/未签名过渡告警）+ CLI `密钥` 子命令族与 `发布 --签名` + G17/G18 门禁。`test_pkg_signing.py` 28 用例 | `docs/ADR-33-包签名.md`、`src/jikuai/pkg/{_ed25519,keys,trust,registry,installer,cli}.py` | — | v0.20.0 M19（W73-W76 已完成） |
 | 全局缓存共享 —— 当前每个项目独立 `极快_包/` | `docs/包管理.md` | 低 | 待定 |
+| git 依赖的 commit 级锁定 —— 现在只锁到标签 | `docs/包管理.md` | 低 | 待定 |
 | 块 ↔ 包 桥接 —— 块靠 `JIKUAI_PKG_ROOTS` 手配环境变量发现，包装到 `极快_包/`，两套体系互不相通。ADR-27 §4 末尾承认此桥接未做。**v0.19.0 W63 已定 `docs/ADR-32-块包格式.md`**（`包.json` 加可选 `块` 字段声明块根 + 安装器维护 `极快_包/.块根.json` 索引让 `extra_roots()` 合并读取），W65-W66 实现 | `docs/ADR-32-块包格式.md`、`src/jikuai/pkg/blocks.py` | 中 | v0.19.0（设计已定，待实现） |
 
 ## 4. 块生态

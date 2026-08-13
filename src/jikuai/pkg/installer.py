@@ -38,7 +38,7 @@ from . import trust
 __all__ = [
     'PACKAGES_DIR', 'BLOCK_ROOTS_INDEX', 'InstallError', 'InstallReport',
     'packages_dir', 'install', 'uninstall', 'installed_packages',
-    'read_block_roots_index',
+    'read_block_roots_index', '安全块根路径',
 ]
 
 #: 依赖安装目录名。与 `包.json` / `包.锁` 同属中文命名族。
@@ -212,6 +212,41 @@ def _写块根索引(base: str, names) -> None:
     os.replace(tmp, index_path)
 
 
+def 安全块根路径(base: str, rel: str) -> Optional[str]:
+    """把 `.块根.json` 里的一条 `路径` 归一成绝对路径，越界则返回 None。
+
+    v0.21.0 W86（安全审计）新增。**读侧兜底**：此前写侧 `_收集块根` 校验了
+    归属（`manifest._validate_block_roots` + `commonpath`），读侧却完全信任
+    索引内容——不拦 `..`、不拦绝对路径、不做归属检查。这个不对称是真缺口而
+    不是洁癖：`.块根.json` 是**可随项目分发的产物**（vendor 依赖目录进版本库
+    的团队会把它一起带走），而它解析出的目录会进 `module_loader` 的搜索路径，
+    命中 `.jk` 后同目录同名 `.py` 会被 `exec_module` 执行（ADR-16 §3.3）。
+    即索引文件是一个**指向任意目录的代码执行重定向原语**，读侧必须自证。
+
+    拒绝三类：绝对路径、含 `..` 段、归一后落在 `base` 之外。
+    返回 None 而不抛异常——与本函数调用方「跳过坏条目、不因可选索引挡住
+    `导入`」的既有强度一致（见 `read_block_roots_index` docstring）。
+    """
+    if not isinstance(rel, str) or not rel:
+        return None
+    unified = rel.replace('\\', '/')
+    if unified.startswith('/') or os.path.isabs(rel) or os.path.isabs(unified):
+        return None
+    if any(seg == '..' for seg in unified.split('/')):
+        return None
+    base_abs = os.path.abspath(base)
+    abs_p = os.path.abspath(os.path.join(base_abs, *[
+        seg for seg in unified.split('/') if seg not in ('', '.')]))
+    try:
+        common = os.path.commonpath([base_abs, abs_p])
+    except ValueError:
+        # 跨盘符（Windows）：commonpath 抛 ValueError，等同越界
+        return None
+    if common != base_abs or abs_p == base_abs:
+        return None
+    return abs_p
+
+
 def read_block_roots_index(base: str) -> List[str]:
     """读 `极快_包/.块根.json`，返回块根**绝对路径**列表（ADR-32 §2.3）。
 
@@ -220,7 +255,8 @@ def read_block_roots_index(base: str) -> List[str]:
 
     `base` 是 `极快_包/` 目录。文件不存在返回空；版本不匹配拒读（返回空并
     不报错——门禁不该因为一个可选索引文件挡住 `导入`，与 `包.锁` 版本拒读
-    的强硬程度区别对待）；只保留实际存在的目录。
+    的强硬程度区别对待）；越出 `base` 的条目跳过（W86，见 `安全块根路径`）；
+    只保留实际存在的目录。
     """
     index_path = os.path.join(base, BLOCK_ROOTS_INDEX)
     if not os.path.isfile(index_path):
@@ -238,10 +274,9 @@ def read_block_roots_index(base: str) -> List[str]:
     for 条 in data.get('块根') or []:
         if not isinstance(条, dict):
             continue
-        rel = 条.get('路径')
-        if not isinstance(rel, str) or not rel:
+        abs_p = 安全块根路径(base, 条.get('路径'))
+        if abs_p is None:
             continue
-        abs_p = os.path.normpath(os.path.join(base, rel))
         if abs_p in 见过:
             continue
         见过.add(abs_p)

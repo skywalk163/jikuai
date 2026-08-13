@@ -54,6 +54,13 @@ INSECURE_ENV = 'JIKUAI_REGISTRY_INSECURE'
 CREDENTIALS_NAME = '凭证.json'
 #: 默认请求超时（秒）。
 DEFAULT_TIMEOUT = 30.0
+#: 单次 HTTP 响应体大小上限（v0.21.0 W86 安全审计）。防止恶意注册表推送超大
+#: 响应让客户端 OOM。与 sources._MAX_TOTAL_BYTES 对齐（归档解压后上限 256 MiB，
+#: 压缩前一般远小于此），这里卡 512 MiB 给足余量——若归档本身大于此上限，
+#: 说明里面的内容解压后必然超出 sources 的体量限制，不值得继续下载。
+#: 索引/公钥/分类 JSON 文件远小于此，不需要单独设一条更小的限。
+_MAX_RESPONSE_BYTES = 512 * 1024 * 1024
+_RESPONSE_BYTES_ENV = 'JIKUAI_REGISTRY_MAX_RESPONSE'
 
 
 class BackendError(Exception):
@@ -236,7 +243,7 @@ class HttpBackend(RegistryBackend):
     不需要专门的服务端进程（ADR-34 §2.1）。
     """
 
-    __slots__ = ('_base', '_token', '_timeout')
+    __slots__ = ('_base', '_token', '_timeout', '_max_response')
     remote = True
 
     def __init__(self, locator: str, token: Optional[str] = None,
@@ -257,6 +264,7 @@ class HttpBackend(RegistryBackend):
         self._base = self.locator
         self._token = token if token is not None else resolve_token(self.locator)
         self._timeout = timeout if timeout is not None else _resolve_timeout()
+        self._max_response = _resolve_max_response()
 
     def url_of(self, rel: str) -> str:
         """相对路径 → 完整 URL。每段做 percent 编码（中文路径必须）。"""
@@ -280,7 +288,21 @@ class HttpBackend(RegistryBackend):
             req.add_header('Authorization', f'Bearer {self._token}')
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                return resp.read()
+                # W86：分块读取 + 上限检查，防止恶意服务端用超大响应耗尽内存。
+                # 不信任 Content-Length（可伪造），按实际读入字节累计。
+                chunks = []
+                total = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self._max_response:
+                        raise BackendError(
+                            f'注册表响应体超过上限 {self._max_response} 字节，'
+                            f'已中断下载：{url}（确需放宽设 {_RESPONSE_BYTES_ENV}）')
+                    chunks.append(chunk)
+                return b''.join(chunks)
         except urllib.error.HTTPError as e:
             # 404 → 「不存在」而非错误：上层 `read_text` 返回 None 的语义与
             # 本地 `os.path.isfile` 为假一致，索引缺失等分支不必分叉。
@@ -353,6 +375,18 @@ def _resolve_timeout() -> float:
     if value <= 0:
         raise BackendError(f'{TIMEOUT_ENV} 必须为正数：{raw!r}')
     return value
+
+
+def _resolve_max_response() -> int:
+    """响应体上限（字节）。非正/非数字回落默认——安全网配错应退回更安全的默认。"""
+    raw = os.environ.get(_RESPONSE_BYTES_ENV)
+    if not raw:
+        return _MAX_RESPONSE_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _MAX_RESPONSE_BYTES
+    return value if value > 0 else _MAX_RESPONSE_BYTES
 
 
 def _credentials_path() -> str:

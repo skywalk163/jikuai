@@ -165,6 +165,11 @@ class ModuleLoader:
         直接读文件、不 import pkg——与 `PACKAGES_DIR` 字面量同理，核心加载
         路径不该拉起包管理子包（含 git 的 sources）。文件缺失 / 版本不符
         返回空。
+
+        **W86 安全审计（v0.21.0）**：`路径` 字段必须是相对路径、无 `..`
+        段、归一后仍落在 `pkg_dir` 之内。同 `pkg.installer.安全块根路径`
+        的规则（不 import 避免依赖倒置）。索引里越界的条目静默跳过——不
+        因为一个可选索引挡住 `导入`，与既有版本不符处理同强度。
         """
         import json
         index_path = os.path.join(pkg_dir, self._BLOCK_ROOTS_INDEX)
@@ -178,6 +183,7 @@ class ModuleLoader:
         if (not isinstance(data, dict)
                 or data.get('索引版本') != self._BLOCK_ROOTS_INDEX_VERSION):
             return []
+        base_abs = os.path.abspath(pkg_dir)
         parents = []
         seen = set()
         for 条 in data.get('块根') or []:
@@ -186,7 +192,20 @@ class ModuleLoader:
             rel = 条.get('路径')
             if not isinstance(rel, str) or not rel:
                 continue
-            块根 = os.path.normpath(os.path.join(pkg_dir, rel))
+            unified = rel.replace('\\', '/')
+            if (unified.startswith('/')
+                    or os.path.isabs(rel) or os.path.isabs(unified)):
+                continue
+            if any(seg == '..' for seg in unified.split('/')):
+                continue
+            块根 = os.path.abspath(os.path.join(base_abs, *[
+                seg for seg in unified.split('/') if seg not in ('', '.')]))
+            try:
+                common = os.path.commonpath([base_abs, 块根])
+            except ValueError:
+                continue
+            if common != base_abs or 块根 == base_abs:
+                continue
             parent = os.path.dirname(块根)
             if parent in seen:
                 continue

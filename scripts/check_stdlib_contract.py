@@ -266,6 +266,16 @@ def main(argv):
     if check_pkg_doc.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
+    # G19：安全审计不变量（W87 · v0.21.0）。W86 的三条 defense-in-depth 修复必须
+    # 在代码里长在原处——单靠反例测试证明「当前对」，但删掉常量或换回裸
+    # `resp.read()` 会让反例造不出来（尺寸阈值一改成天文数字反例就跳过）。这里
+    # 静态断言：常量存在、类型对、值合理、被指定的调用点确实调用。
+    #
+    # 同 G16/G17：**不**学 G13+ 的 `except → 跳过`。新门禁解析不了就是它坏了。
+    import check_security_invariants
+    if check_security_invariants.main(["--quiet"]) != 0:
+        exit_code = exit_code or 1
+
     return exit_code
 
 

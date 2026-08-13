@@ -152,6 +152,36 @@ def _fetch_git(dep: Dependency, _base_dir: str) -> FetchedSource:
                          ephemeral=True)
 
 
+#: 解压上限（v0.21.0 W86 安全审计）。远程注册表是**外部可控输入**，
+#: 而 `_safe_extract_targz` 此前只校验成员路径安全、不限体量——一个几 KB 的
+#: tar.gz 可以解压出几十 GB（经典 tar bomb），撑爆客户端磁盘；成员数无上限时
+#: `getmembers()` 自身就能吃满内存。三条上限按「正常极快包的量级」定：
+#: 一个包是若干 .jk/.py/.json 源文件，几百个成员、单文件几 MB 已经很宽松。
+#: 环境变量覆盖是给「确实有大资源包」的用户的逃生门，不是默认路径。
+_MAX_MEMBERS = 4096
+_MAX_MEMBER_BYTES = 64 * 1024 * 1024        # 单成员 64 MiB
+_MAX_TOTAL_BYTES = 256 * 1024 * 1024        # 解压后合计 256 MiB
+_MEMBERS_ENV = 'JIKUAI_PKG_MAX_MEMBERS'
+_MEMBER_BYTES_ENV = 'JIKUAI_PKG_MAX_MEMBER_BYTES'
+_TOTAL_BYTES_ENV = 'JIKUAI_PKG_MAX_TOTAL_BYTES'
+
+
+def _limit(env_name: str, default: int) -> int:
+    """读一条上限的环境变量覆盖。非正整数/非数字一律回落默认值。
+
+    刻意不报错：上限是安全网，配错了应当退回**更安全**的默认值，
+    而不是让 `导入` 因为一个环境变量拼写错误而挂掉。
+    """
+    raw = os.environ.get(env_name)
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
 def _safe_extract_targz(data: bytes, dest_dir: str) -> None:
     """把 tar.gz 字节流安全解压到 `dest_dir`（ADR-34 §2.4）。
 
@@ -159,16 +189,39 @@ def _safe_extract_targz(data: bytes, dest_dir: str) -> None:
     设备节点。Python 3.12+ 有内置 `data_filter`，3.10/3.11 手写等价校验
     （项目 `requires-python >= 3.10`）。历史上 Windows 的 tar 路径处理踩过
     坑，这里宁可拒绝可疑归档也不冒解压到目录外的风险。
+
+    **v0.21.0 W86 追加体量上限**（成员数 / 单成员大小 / 合计解压大小）。
+    路径安全挡的是「写到哪」，体量上限挡的是「写多少」——tar bomb 的每个
+    成员路径都合法，只靠路径校验拦不住。上限在**解压前**按 tar 头部声明的
+    `size` 累加判定，不需要真的写盘才发现超标。
     """
     dest_abs = os.path.abspath(dest_dir)
+    max_members = _limit(_MEMBERS_ENV, _MAX_MEMBERS)
+    max_member_bytes = _limit(_MEMBER_BYTES_ENV, _MAX_MEMBER_BYTES)
+    max_total_bytes = _limit(_TOTAL_BYTES_ENV, _MAX_TOTAL_BYTES)
     import io
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tf:
         members = tf.getmembers()
+        if len(members) > max_members:
+            raise SourceError(
+                f'快照归档成员数 {len(members)} 超过上限 {max_members}，'
+                f'拒绝解压（疑似解压炸弹；确需放宽设 {_MEMBERS_ENV}）')
+        total = 0
         for m in members:
             if m.islnk() or m.issym():
                 raise SourceError(f'快照归档含链接成员，拒绝解压：{m.name}')
             if m.isdev():
                 raise SourceError(f'快照归档含设备节点，拒绝解压：{m.name}')
+            if m.size > max_member_bytes:
+                raise SourceError(
+                    f'快照归档成员 {m.name} 声明大小 {m.size} 字节，'
+                    f'超过单成员上限 {max_member_bytes}，拒绝解压'
+                    f'（确需放宽设 {_MEMBER_BYTES_ENV}）')
+            total += m.size
+            if total > max_total_bytes:
+                raise SourceError(
+                    f'快照归档解压后合计超过上限 {max_total_bytes} 字节，'
+                    f'拒绝解压（疑似解压炸弹；确需放宽设 {_TOTAL_BYTES_ENV}）')
             name = m.name.replace('\\', '/')
             if name.startswith('/') or os.path.isabs(name):
                 raise SourceError(f'快照归档含绝对路径成员：{m.name}')

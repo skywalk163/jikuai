@@ -42,6 +42,10 @@ _ENV_TOKEN = re.compile(r'JIKUAI_[A-Z_]+')
 #: `JIKUAI_PKG_ROOTS`（blocks 第三方块根）也在这篇文档里承诺过，纳进来
 #: 门禁才闭合——否则「文档写了但代码没引用」这一侧会被这两个常驻误报淹掉，
 #: 久了就会有人加 `--quiet` 把门禁哑掉。
+#:
+#: v0.21.0 W93 追加：`tools/registry-server/server.py` 的 `JIKUAI_REGISTRY_SERVER_*`
+#: 也算「面向用户的运维界面」，包管理文档承诺过就要同步——门禁的边界不看
+#: 目录属主（src/ vs tools/），看的是文档承诺过没有。
 _CODE_PATHS = [
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'keys.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'trust.py'),
@@ -51,6 +55,7 @@ _CODE_PATHS = [
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'backend.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'pkg', 'blocks.py'),
     os.path.join(_REPO_ROOT, 'src', 'jikuai', 'module_loader.py'),
+    os.path.join(_REPO_ROOT, 'tools', 'registry-server', 'server.py'),
 ]
 
 

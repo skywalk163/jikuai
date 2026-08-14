@@ -56,6 +56,7 @@ import logging
 import os
 import re
 import shutil
+import socketserver
 import sys
 import tarfile
 import tempfile
@@ -537,6 +538,34 @@ def _猜类型(rel):
 # 服务构造 & CLI
 # ---------------------------------------------------------------------------
 
+class _不反查HTTPServer(ThreadingHTTPServer):
+    """`ThreadingHTTPServer`，但绑定时不做反向 DNS。
+
+    `http.server.HTTPServer.server_bind` 在 `bind()` 之后会执行
+    `self.server_name = socket.getfqdn(host)`。`getfqdn` 是一次**反向 DNS 查询**，
+    而 `TCPServer.__init__` 的顺序是 `server_bind()` → `server_activate()`
+    （`listen()`）—— 也就是说 FQDN 反查没返回之前，端口是「已 bind 但未 listen」，
+    对外表现为连接被拒。
+
+    在 GitHub macOS runner 上 `socket.getfqdn()` 实测会阻塞一分钟以上
+    （actions/runner-images#12162），于是「构造服务实例」这一步就要耗一分钟，
+    起服务端的测试在就绪超时内根本等不到端口。Linux/Windows 上该反查是毫秒级，
+    所以这个坑只在 macOS 亮红——v0.22.0 的 macOS job 首次真跑时逮到。
+
+    `server_name` 本服务从头到尾不使用（没有 CGI，也不据此拼 URL），直接取
+    `host` 字面量即可。这不是测试专用绕行：任何主机上让「服务启动」依赖一次
+    反向 DNS 都是错的。
+    """
+
+    def server_bind(self):
+        # 跳过 HTTPServer.server_bind（它含 getfqdn），直接走 TCPServer 的
+        # bind 逻辑，再把 server_name/server_port 按字面量补齐。
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 def build_server(注册表, 授权, host=DEFAULT_HOST, port=DEFAULT_PORT,
                  审计路径=None, max_body=None, 要求TLS=False):
     """建一个未启动的服务实例。测试与 CLI 都走这个入口。
@@ -570,7 +599,7 @@ def build_server(注册表, 授权, host=DEFAULT_HOST, port=DEFAULT_PORT,
 
     写锁 = threading.Lock()
     处理器 = _make_handler(根, 授权源, 审计路径, 写锁, max_body, 要求TLS)
-    srv = ThreadingHTTPServer((host, port), 处理器)
+    srv = _不反查HTTPServer((host, port), 处理器)
     # 挂到实例上，供 CLI 打横幅与测试断言重载次数用。
     srv.授权源 = 授权源
     srv.要求TLS = bool(要求TLS)

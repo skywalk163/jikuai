@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import socket
 import sys
 import threading
 import urllib.error
@@ -289,6 +290,36 @@ def test_build_server不抢锁(tmp_path):
                          host='127.0.0.1', port=0)
     try:
         assert not os.path.exists(S.锁路径(str(根)))
+    finally:
+        srv.server_close()
+
+
+def test_绑定不做反向DNS(tmp_path, monkeypatch):
+    """构造服务实例时不许做反向 DNS 查询。
+
+    `http.server.HTTPServer.server_bind` 在 `bind()` 之后、`listen()` 之前执行
+    `self.server_name = socket.getfqdn(host)`。那是一次反向 DNS：没返回之前端口
+    「已 bind 未 listen」，对外就是连接被拒。GitHub macOS runner 上 `getfqdn`
+    实测阻塞一分钟以上（actions/runner-images#12162），于是 v0.22.0 的 macOS
+    job 首次真跑时，`test_pkg_remote_publish_e2e.py` 那 14 条全部挂在
+    「服务端未在预期时间内就绪」——起服务端的就绪超时只有 20 秒。
+
+    这条守卫**在所有平台都有效**：把 getfqdn 换成会抛的假货，只要有人把
+    `build_server` 改回裸的 `ThreadingHTTPServer`，Windows/Linux 上也立刻红，
+    不用等 macOS 那边偶尔跑一次才发现。
+    """
+    def 假getfqdn(*_a, **_k):
+        raise AssertionError('server_bind 不该做反向 DNS（getfqdn）')
+
+    monkeypatch.setattr(socket, 'getfqdn', 假getfqdn)
+    srv = S.build_server(注册表=str(tmp_path / '注册表'),
+                         授权=_授权配置(tmp_path),
+                         host='127.0.0.1', port=0)
+    try:
+        # server_name / server_port 仍要按 HTTPServer 的契约填上，只是取字面量。
+        assert srv.server_name == '127.0.0.1'
+        assert srv.server_port == srv.server_address[1]
+        assert srv.server_port > 0
     finally:
         srv.server_close()
 

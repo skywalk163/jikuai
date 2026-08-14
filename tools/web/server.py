@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import re
+import socketserver
 import sys
 import tempfile
 import threading
@@ -1043,6 +1044,25 @@ class JiKuaiHandler(BaseHTTPRequestHandler):
         _LOG.warning('%s - %s', self.address_string(), fmt % args)
 
 
+class _不反查HTTPServer(ThreadingHTTPServer):
+    """`ThreadingHTTPServer`，但绑定时不做反向 DNS。
+
+    与 `tools/registry-server/server.py` 里的同名类同因同治：
+    `HTTPServer.server_bind` 会在 `bind()` 之后、`listen()` 之前执行
+    `socket.getfqdn(host)`，那是一次反向 DNS。在 GitHub macOS runner 上它实测
+    阻塞一分钟以上（actions/runner-images#12162），于是「构造服务实例」就要耗
+    一分钟，期间端口已 bind 但未 listen，对外表现为连接被拒。
+
+    `server_name` 本服务不使用，直接取 host 字面量。
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 def build_server(host: str = DEFAULT_HOST,
                  port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     """建一个未启动的服务实例。
@@ -1050,7 +1070,7 @@ def build_server(host: str = DEFAULT_HOST,
     `port=0` 让内核分配空闲端口（测试用；写死 5000 会因为端口被占而 flaky）。
     实际端口在 `server.server_address[1]`。
     """
-    return ThreadingHTTPServer((host, port), JiKuaiHandler)
+    return _不反查HTTPServer((host, port), JiKuaiHandler)
 
 
 def main(argv=None) -> int:

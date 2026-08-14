@@ -263,8 +263,12 @@ jk              # 进入 REPL
 ```bash
 jk examples/hello.jk           # pip install -e . 后可用
 python -m jikuai examples/hello.jk   # 无需安装，只要 PYTHONPATH 含 src/
-python -m jikuai.main examples/hello.jk
+python -m jikuai.main examples/hello.jk   # 不推荐：会打印 runpy RuntimeWarning
 ```
+
+第三种写法功能等价，但 `jikuai/__init__.py` 会提前导入 `jikuai.main`，
+runpy 因此报 `RuntimeWarning: 'jikuai.main' found in sys.modules ...`。
+外部调用方（如 yanpub）请用 `python -m jikuai`。
 
 无参数时均进入交互式 REPL；`-h` 显示帮助；`-v` 显示版本。
 

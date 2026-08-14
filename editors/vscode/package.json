@@ -2,7 +2,7 @@
   "name": "jikuai-vscode",
   "displayName": "极快 JiKuai",
   "description": "极快 JiKuai 中文编程语言的 VS Code 支持：语法高亮 + LSP（实时校验 / 补全 / hover）+ 断点调试（DAP）。",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "publisher": "jikuai",
   "license": "MIT",
   "repository": {

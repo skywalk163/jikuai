@@ -115,17 +115,30 @@ jobs:
 
       # 守卫：AOT 端到端二进制用例在有 gcc 的环境必须真正运行、零 skip。
       # 若这里出现 skip，说明编译器探测或环境有问题，直接让 CI 失败。
+      #
+      # W106（v0.22.0）两处修正：
+      # 1) **用 glob 取代硬编码文件清单**。原来只列了 test_v0_7_0_aot.py 与
+      #    test_v0_8_0_aot_controlflow.py 两个文件，而 for/functions/containers
+      #    三个文件共 64 条 e2e 从来没进过这个守卫——守卫是绿的，但守了个空。
+      #    靠人记得往清单里加新文件不可靠，glob 让新增 AOT 测试文件自动入网。
+      # 2) **不再用 `pytest | tee`**。管道退出码取自 tee，pytest 真的 FAIL 这一步
+      #    也不会红，守卫等于只剩「查 skip」半个功能。改成先落盘再分别判退出码与 skip。
+      #    `|| status=$?` 是为了不被 `bash -e` 提前掐断。
       - name: Guard - AOT e2e tests must run (not skip)
         run: |
-          python -m pytest -v -rs \
-            tests/test_v0_7_0_aot.py \
-            tests/test_v0_8_0_aot_controlflow.py \
-            | tee aot_run.log
+          status=0
+          python -m pytest -v -rs tests/test_*aot*.py > aot_run.log 2>&1 || status=$?
+          cat aot_run.log
+          if [ "$status" -ne 0 ]; then
+            echo "::error::AOT 用例本身失败（pytest 退出码 $status）。"
+            exit "$status"
+          fi
           if grep -q "skipped" aot_run.log; then
             echo "::error::AOT 端到端用例出现 skip——gcc 环境下不应跳过。"
             exit 1
           fi
           echo "AOT 端到端用例全部运行，无跳过。"
+
 
   # W35：Windows 平台守卫。主开发环境是 Windows，平台差异（路径分隔符、
   # 可执行位、GBK 编码、PowerShell）过去全靠人肉发现——v0.11 的 AOT 产物缺
@@ -225,14 +238,64 @@ jobs:
         run: python scripts/check_stdlib_contract.py
 
       # macOS 上 AOT e2e 也必须真跑（clang 在位）。
+      # 文件清单与退出码处理同 Linux job，理由见那边的注释（W106）。
       - name: Guard - AOT e2e tests must run (not skip)
         run: |
-          python -m pytest -v -rs \
-            tests/test_v0_7_0_aot.py \
-            tests/test_v0_8_0_aot_controlflow.py \
-            | tee aot_run.log
+          status=0
+          python -m pytest -v -rs tests/test_*aot*.py > aot_run.log 2>&1 || status=$?
+          cat aot_run.log
+          if [ "$status" -ne 0 ]; then
+            echo "::error::AOT 用例本身失败（pytest 退出码 $status）。"
+            exit "$status"
+          fi
           if grep -q "skipped" aot_run.log; then
             echo "::error::AOT 端到端用例出现 skip——macOS clang 环境下不应跳过。"
             exit 1
           fi
           echo "AOT 端到端用例全部运行，无跳过。"
+
+  # W94 残留（v0.21.0 M24 立、v0.22.0 补齐）：覆盖率阈值进流水线。
+  #
+  # 在这之前，`fail_under = 80`（面阈值）和「点阈值优先于面阈值」这条纪律
+  # **都没有任何 CI 步骤会执行** —— 阈值只在有人本地手动跑 `coverage report`
+  # 时才生效，等于没有。这个 job 是这两条阈值唯一的执行处。
+  #
+  # 单独开 job 而不是塞进 test-linux：覆盖率测量要装 `.pth` 子进程钩子并全量
+  # 重跑一遍测试（本机约 4~5 分钟），塞进矩阵会让三个 Python 版本各付一次。
+  # 只跑 3.12 单版本 —— 覆盖率是代码结构的度量，跨版本差异不是这里的关注点。
+  #
+  # 必须装 gcc：全仓多处测试以子进程编译/运行 AOT 产物，没有编译器它们会
+  # skip，被跳过的代码路径会被记成未覆盖，测出来的数字比真实值低。
+  coverage:
+    name: Coverage thresholds (Python 3.12, ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure C compiler (gcc) is present
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc
+          gcc --version
+
+      - name: Install package (editable) with dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      # `scripts/coverage_baseline.py` 是唯一正确的测量入口：直接
+      # `coverage run -m pytest` 只记发起进程，会把 LSP/注册表/CLI 那些走子进程
+      # 的路径全记成未覆盖（v0.21.0 W94 就是这么把基线测歪的）。
+      #
+      # `--检查下限` 逐文件卡 docs/覆盖率下限.json 的点阈值；脚本末尾的
+      # `coverage report` 同时受 pyproject 里 `fail_under = 80` 的面阈值约束。
+      # 两者任一不达标该步骤非 0 退出。
+      - name: Coverage baseline + per-file floors
+        run: python scripts/coverage_baseline.py --检查下限 --按覆盖率升序
+

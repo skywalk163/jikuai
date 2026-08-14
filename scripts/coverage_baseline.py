@@ -6,6 +6,8 @@
     python scripts/coverage_baseline.py                 # 测量 + 打印报告
     python scripts/coverage_baseline.py --json 报告.json # 另存 JSON
     python scripts/coverage_baseline.py --保留数据       # 不删 .coverage* 中间件
+    python scripts/coverage_baseline.py --检查下限       # 门禁模式：卡阈值
+
 
 ## 为什么需要这个脚本，而不是直接 `coverage run -m pytest`
 
@@ -29,12 +31,18 @@
 
 ## 退出码
 
-0 = 测量完成（**不代表覆盖率达标** —— 本脚本不做阈值判定，
-阈值是 `[tool.coverage.report] fail_under` 的事）。
-非 0 = pytest 失败或 coverage 步骤失败，此时报告不可信。
+默认（无 `--检查下限`）：0 = 测量完成，**不代表覆盖率达标** —— 平时看基线不该
+被阈值挡住，所以此时连 `fail_under` 都不生效。非 0 = pytest 失败或 coverage
+步骤失败，此时报告不可信。
+
+门禁模式（`--检查下限`，CI 用的就是这个）：把两级阈值都变成硬失败 ——
+逐文件点阈值（`docs/覆盖率下限.json`）与全局面阈值（`fail_under`）。
+优先级：pytest 失败 > 点阈值 > 面阈值。
 """
 
+
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -43,6 +51,9 @@ import sysconfig
 _HERE = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(_HERE, '..'))
 配置路径 = os.path.join(REPO_ROOT, 'pyproject.toml')
+
+#: 逐文件覆盖率下限（点阈值）的数据文件。W94 纪律「点阈值优先于面阈值」的落地物。
+下限文件 = os.path.join(REPO_ROOT, 'docs', '覆盖率下限.json')
 
 #: `.pth` 文件名。前缀 `zzz_` 是刻意的：site-packages 里的 `.pth` 按文件名
 #: 排序执行，排在后面能确保 coverage 包本身已可导入。
@@ -107,6 +118,44 @@ def _跑(参数, 环境=None, 静默=False):
     return subprocess.call(参数, cwd=REPO_ROOT, env=环境)
 
 
+def _读下限():
+    """读逐文件下限表。返回 {相对posix路径: 下限百分比}。文件不存在则空表。"""
+    if not os.path.exists(下限文件):
+        return {}
+    with open(下限文件, 'r', encoding='utf-8') as f:
+        return json.load(f).get('下限', {})
+
+
+def _检查逐文件下限(json路径):
+    """按 docs/覆盖率下限.json 逐文件核对覆盖率。
+
+    这是 W94「点阈值优先于面阈值」纪律的**执行体**：全局 fail_under 是面阈值，
+    掩盖单点回归；这里对点名文件卡各自的地板。返回 (是否全部达标, 违规列表)。
+
+    coverage 的 JSON（`coverage json`）里每个文件的百分比在
+    `files[路径].summary.percent_covered`，路径分隔符随平台，统一成 posix 再比。
+    """
+    下限 = _读下限()
+    if not 下限:
+        return True, []
+    with open(json路径, 'r', encoding='utf-8') as f:
+        数据 = json.load(f)
+    文件表 = 数据.get('files', {})
+    规范化 = {}
+    for 路径, 信息 in 文件表.items():
+        键 = os.path.relpath(路径, REPO_ROOT) if os.path.isabs(路径) else 路径
+        规范化[键.replace(os.sep, '/')] = 信息.get('summary', {}).get(
+            'percent_covered', 0.0)
+    违规 = []
+    for 目标, 地板 in 下限.items():
+        实测 = 规范化.get(目标)
+        if 实测 is None:
+            违规.append((目标, None, 地板))  # 该文件没被测到，等同触底
+        elif 实测 + 1e-9 < 地板:
+            违规.append((目标, 实测, 地板))
+    return (not 违规), 违规
+
+
 def main(argv=None):
     """入参约定与 G16/G17/G19 一致：`argv` 是**不含程序名**的参数列表。"""
     解析器 = argparse.ArgumentParser(
@@ -118,6 +167,9 @@ def main(argv=None):
                         help='测完不删 .coverage* 中间文件（便于自己再出报告）')
     解析器.add_argument('--按覆盖率升序', dest='升序', action='store_true',
                         help='报告按覆盖率从低到高排（找低覆盖区用）')
+    解析器.add_argument('--检查下限', dest='检查下限', action='store_true',
+                        help='按 docs/覆盖率下限.json 逐文件卡点阈值，'
+                             '任一文件跌破其下限即以非 0 退出（W94 点阈值纪律）')
     args = 解析器.parse_args(list(sys.argv[1:] if argv is None else argv))
 
     try:
@@ -161,17 +213,59 @@ def main(argv=None):
         报告参数 = [sys.executable, '-m', 'coverage', 'report']
         if args.升序:
             报告参数.append('--sort=cover')
-        _跑(报告参数, 环境)
+        # `coverage report` 在总覆盖率低于 pyproject 的 `fail_under` 时以 2 退出。
+        # 这个退出码以前被丢掉了 —— 面阈值等于没设。只在门禁模式（--检查下限）
+        # 下让它生效：平时看基线不该被阈值挡住。
+        报告码 = _跑(报告参数, 环境)
+        if not args.检查下限:
+            报告码 = 0
 
-        if args.json路径:
+
+        # 逐文件下限要靠 JSON 里的 percent_covered，所以 `--检查下限` 时即便
+        # 用户没给 `--json` 也得出一份；这种情况下用临时路径，检查完就删。
+        json路径 = args.json路径
+        临时json = None
+        if args.检查下限 and not json路径:
+            临时json = os.path.join(REPO_ROOT, '.coverage_下限检查.json')
+            json路径 = 临时json
+        if json路径:
             _跑([sys.executable, '-m', 'coverage', 'json',
-                 '-o', args.json路径], 环境)
+                 '-o', json路径], 环境)
+
+        下限码 = 0
+        if args.检查下限:
+            try:
+                达标, 违规 = _检查逐文件下限(json路径)
+            finally:
+                if 临时json and os.path.exists(临时json):
+                    os.remove(临时json)
+            if 达标:
+                print('\n逐文件下限：全部达标（%d 个受保护文件）。'
+                      % len(_读下限()))
+            else:
+                下限码 = 1
+                print('\n逐文件下限未达标（W94 点阈值纪律）：', file=sys.stderr)
+                for 目标, 实测, 地板 in 违规:
+                    if 实测 is None:
+                        print('  %s：报告里没有这个文件（改名/删除？），'
+                              '下限 %.1f%%' % (目标, 地板), file=sys.stderr)
+                    else:
+                        print('  %s：%.1f%% < 下限 %.1f%%'
+                              % (目标, 实测, 地板), file=sys.stderr)
+                print('全局 fail_under 是面阈值，掩盖单点回归；'
+                      '要么补测试，要么带理由改 docs/覆盖率下限.json。',
+                      file=sys.stderr)
 
         if 测试码 != 0:
             print('\n注意：pytest 退出码 %d —— 有用例失败，'
                   '上面的覆盖率数字只反映实际跑到的部分。' % 测试码,
                   file=sys.stderr)
-        return 测试码
+        if 报告码 != 0:
+            print('\n总覆盖率低于 pyproject 的 fail_under（面阈值）。',
+                  file=sys.stderr)
+        # 测试失败优先报 —— 用例没跑全时覆盖率数字本身不可信，先修测试。
+        return 测试码 or 下限码 or 报告码
+
     finally:
         _卸钩子(钩子路径)
         if not args.保留数据:

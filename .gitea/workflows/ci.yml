@@ -38,7 +38,7 @@ jobs:
           . "$VENV_BIN/activate"
           python -m pytest -v
 
-      - name: 契约门禁 G10~G14
+      - name: 契约门禁 G10-G19
         run: |
           . "$VENV_BIN/activate"
           python scripts/check_stdlib_contract.py
@@ -46,10 +46,19 @@ jobs:
       - name: 守卫 - AOT e2e 必须运行（非 skip）
         run: |
           . "$VENV_BIN/activate"
-          python -m pytest -v -rs tests/test_v0_7_0_aot.py tests/test_v0_8_0_aot_controlflow.py | tee aot_run.log
+          # 用 glob 覆盖全部 AOT 测试文件（含 for/functions/containers），并分离
+          # pytest 退出码与 skip 判定——理由见 .github/workflows/ci.yml 同名步骤注释（W106）。
+          status=0
+          python -m pytest -v -rs tests/test_*aot*.py > aot_run.log 2>&1 || status=$?
+          cat aot_run.log
+          if [ "$status" -ne 0 ]; then
+            echo "::error::AOT 用例本身失败（pytest 退出码 $status）"
+            exit "$status"
+          fi
           if grep -q "skipped" aot_run.log; then
             echo "::error::AOT 端到端用例出现 skip —— gcc 环境下不应跳过"
             exit 1
           fi
           echo "AOT 端到端用例全部运行，无跳过"
+
 # trigger: re-push to fire Actions (content-API 偶发丢事件)

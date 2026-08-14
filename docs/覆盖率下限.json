@@ -5,7 +5,7 @@
   "_口径": "键是相对仓库根的 POSIX 路径；值是该文件覆盖率百分比的下限（含）。只列点名保护的文件，未列文件仍受全局 fail_under=80 约束。测量口径见 scripts/coverage_baseline.py（含子进程，直接 coverage run 的数字不作数）。",
   "_实测": "2026-08-14 本机（Windows, Python 3.14, 无 C 编译器故 88 条 AOT e2e skip——不影响这里点名的文件）：cli.py 94.0%、lockfile.py 100.0%、sources.py 93.4%、main.py 90.9%、text_document_store.py 86.1%、completion.py 78.2%；总覆盖率 86.8%。",
   "_为什么是这几个文件": "前三个是 M25（W98/W99）专门补过的；后三个来自 docs/路线图-v0.22.md §五 成功度量第 1 条点名的四个模块（completion.py / pkg/cli.py / main.py / text_document_store.py 各 ≥70%）——那条度量此前只是文档承诺，没有任何检查执行它，列进来才算落地。",
-  "_已知风险": "main.py 曾是余量最薄的一块（v0.22.0 发布时实测 71.7% 只高出旧下限 70.0 一个 1.7 点，等于没护栏）。已补 tests/test_main_cli.py（22 条：版本/帮助/repl 分派、包·块子命令透传退出码、文件不存在/非 utf8/运行时错误/语法错误各自退出 1 且不泄漏 Python 细节），实测升到 90.9%，下限随之提到 85.0（实测 −5.9），恢复正常护栏余量。仍未消的真风险：coverage job 因 github push 长期失败从没在 ubuntu+3.12 上真跑过，跨平台数字仅由 gitea 的 FreeBSD 标定探针（非门禁）旁证；main.py 本身平台中立，落差应很小，但在 ubuntu gate 真正绿一次之前，这仍是纸面承诺。",
+  "_已知风险": "main.py 曾是余量最薄的一块（v0.22.0 发布时实测 71.7% 只高出旧下限 70.0 一个 1.7 点，等于没护栏）。已补 tests/test_main_cli.py（22 条：版本/帮助/repl 分派、包·块子命令透传退出码、文件不存在/非 utf8/运行时错误/语法错误各自退出 1 且不泄漏 Python 细节），实测升到 90.9%，下限随之提到 85.0（实测 −5.9），恢复正常护栏余量。2026-08-14：commit 48014bd 推到 github 后，`Coverage thresholds (Python 3.12, ubuntu)` job **首次真跑并通过** —— 这里所有点阈值 + 面阈值第一次在 CI 平台被真正执行过，「四模块各 ≥70%」不再是纸面承诺。尚未采集：那次 run 的 ubuntu/3.12 逐文件数字（本文件 _实测 仍只有 Windows 一列，跨平台落差仍是推断而非实测）。",
   "下限": {
 
     "src/jikuai/pkg/cli.py": 88.0,

@@ -34,6 +34,16 @@
   可能是本地磁盘 IO 报错，往上抛前必须转成一句中文原因或干脆 500。
 - **协议版本不认** → 400 明说服务端版本与客户端版本（§2.7），别猜字段。
 - **`名称@版本` 已存在** → 409。**没有** `--允许覆盖` 开关（§2.4）。
+
+## 生产化约束（ADR-36 / v0.22.0 W102）
+
+- **TLS 自身永不做**。`--要求TLS转发` 让 `POST /publish` 必须带
+  `X-Forwarded-Proto: https`（缺则 403）；非回环绑定且未开该开关时启动横幅
+  醒目告警但**不拒绝启动**（内网可信段直连是合理场景）。
+- **单写者**。启动期抢 `<注册表根>/.发布锁`（`O_CREAT|O_EXCL`），已被占用即
+  拒绝启动（退出码 3）；陈旧锁靠 `--强制解锁` 手工清。裁决理由与「为什么不做
+  跨进程文件锁」见 ADR-36 §2.2 与 `抢发布锁` 的 docstring。
+- **授权配置热重载**。`授权.json` 改动无需重启，见 `auth.AuthProvider`。
 """
 
 import argparse
@@ -80,7 +90,8 @@ from jikuai.pkg.manifest import (                               # noqa: E402
 
 __all__ = [
     'PROTOCOL_VERSION', 'MAX_BODY_ENV', 'DEFAULT_MAX_BODY',
-    'DEFAULT_HOST', 'DEFAULT_PORT',
+    'DEFAULT_HOST', 'DEFAULT_PORT', 'PUBLISH_PATH',
+    'LOCK_NAME', '锁冲突', '锁路径', '抢发布锁', '释放发布锁', '危险绑定横幅',
     'build_server', 'main',
 ]
 
@@ -124,13 +135,18 @@ class _响应(Exception):
 # 请求处理器工厂
 # ---------------------------------------------------------------------------
 
-def _make_handler(注册表根, 授权源, 审计路径, 写锁, max_body):
+def _make_handler(注册表根, 授权源, 审计路径, 写锁, max_body, 要求TLS=False):
     """闭包出一个绑定运行时状态的 `BaseHTTPRequestHandler` 子类。
 
     不用类属性/全局：便于测试起多个实例互不干扰。
 
     `授权源` 是 `AuthProvider`（不是 `AuthConfig`）——每次处理写请求时向它
     要一份当前配置，从而支持 `授权.json` 的热重载（ADR-36 §2.3）。
+
+    `要求TLS` 为真时，`POST /publish` 必须携带 `X-Forwarded-Proto: https`
+    （ADR-36 §2.1），否则 403。这条断言的是「我确认自己只被反代访问」——
+    在默认回环绑定下该头由反代设置、不可被外部伪造；它**不是**对真实 TLS
+    的密码学鉴别，文档必须这么写，不给错误的安全感。
     """
     注册表根_abs = os.path.abspath(注册表根)
 
@@ -208,6 +224,17 @@ def _make_handler(注册表根, 授权源, 审计路径, 写锁, max_body):
         # -- 发布主流水（8 步 + 落盘 + 审计）-----------------------------
 
         def _发布(self):
+            # 0. TLS 转发闸门（ADR-36 §2.1）。放在读 body **之前**：误配置的
+            #    部署不该先把一个 32 MiB 的报文明文灌进来再拒。
+            if 要求TLS:
+                proto = (self.headers.get('X-Forwarded-Proto') or '').strip()
+                if proto.lower() != 'https':
+                    raise _响应(
+                        403,
+                        '本服务端以 --要求TLS转发 启动，POST 必须带 '
+                        '`X-Forwarded-Proto: https`。请检查反向代理是否设置了'
+                        '该头，或确认你并非在绕过反代直连')
+
             # 1. 读 body，卡上限。`Content-Length` 缺失直接拒（不接 chunked）。
             长度头 = self.headers.get('Content-Length')
             if 长度头 is None:
@@ -501,13 +528,20 @@ def _猜类型(rel):
 # ---------------------------------------------------------------------------
 
 def build_server(注册表, 授权, host=DEFAULT_HOST, port=DEFAULT_PORT,
-                 审计路径=None, max_body=None):
+                 审计路径=None, max_body=None, 要求TLS=False):
     """建一个未启动的服务实例。测试与 CLI 都走这个入口。
 
     - `注册表`：本地注册表根目录（远程 URL 不支持—— ADR-34 §2.1 明文本地）。
-    - `授权`：`AuthConfig` 实例或 `授权.json` 路径。
+    - `授权`：`AuthConfig` / `AuthProvider` 实例或 `授权.json` 路径。
     - `审计路径`：可选。省略即不写审计日志。
     - `max_body`：请求体上限，`None` 时读环境变量或用默认 32 MiB。
+    - `要求TLS`：真则 `POST /publish` 必须带 `X-Forwarded-Proto: https`
+      （ADR-36 §2.1）。
+
+    **本函数不抢 `.发布锁`**：锁是「一个进程独占一个注册表根」的约束，属于
+    进程生命周期，由 `main` 负责（见 `抢发布锁`）。测试要在同一个进程里起好
+    几个 server 实例，若在这里抢锁就得每个测试都造独立注册表根——那是把
+    部署约束泄漏到了构造函数里。
     """
     根 = os.path.abspath(注册表)
     if not os.path.isdir(根):
@@ -525,11 +559,135 @@ def build_server(注册表, 授权, host=DEFAULT_HOST, port=DEFAULT_PORT,
         max_body = _读上限(MAX_BODY_ENV, DEFAULT_MAX_BODY)
 
     写锁 = threading.Lock()
-    处理器 = _make_handler(根, 授权源, 审计路径, 写锁, max_body)
+    处理器 = _make_handler(根, 授权源, 审计路径, 写锁, max_body, 要求TLS)
     srv = ThreadingHTTPServer((host, port), 处理器)
     # 挂到实例上，供 CLI 打横幅与测试断言重载次数用。
     srv.授权源 = 授权源
+    srv.要求TLS = bool(要求TLS)
     return srv
+
+
+# ---------------------------------------------------------------------------
+# 单写者锁文件（ADR-36 §2.2）
+# ---------------------------------------------------------------------------
+
+#: 锁文件名。放在注册表根下而不是系统临时目录：约束的对象是「这个注册表根」，
+#: 锁就该和它同生共死。跨机器共享同一个网络盘时也能挡住（尽最大努力——
+#: NFS 上 O_EXCL 的原子性不保证，ADR-36 §4 已记为局限）。
+LOCK_NAME = '.发布锁'
+
+
+class 锁冲突(Exception):
+    """`.发布锁` 已被占用。`原因` 是可直接打给运维的中文说明。"""
+
+
+def 锁路径(注册表根):
+    return os.path.join(os.path.abspath(注册表根), LOCK_NAME)
+
+
+def 抢发布锁(注册表根, 强制解锁=False):
+    """原子抢占 `<注册表根>/.发布锁`，返回锁文件路径。
+
+    ADR-36 §2.2：服务端是**单写者**。索引是全局单点，写路径本就必须串行，
+    多 worker 只能提升读吞吐——而读端是静态文件，本该由反代/CDN 直接吐。
+    与其做一套跨平台文件锁（POSIX `flock` / Windows `msvcrt.locking` 两份
+    实现 + 陈旧锁回收 + 锁升级），不如把「只能起一个」变成启动期的硬失败。
+
+    `强制解锁=True` 时先删掉既有锁再抢。**刻意不做自动判活**：
+    `os.kill(pid, 0)` 在 Windows 上不可用，pid 又会被系统复用，跨平台的
+    自动判活必然要么误杀活进程要么误放陈旧锁。让人看一眼锁里记的 pid、
+    自己敲一个 `--强制解锁`，比一个有时猜错的启发式可靠。
+    """
+    根 = os.path.abspath(注册表根)
+    os.makedirs(根, exist_ok=True)
+    path = 锁路径(根)
+    if 强制解锁:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise 锁冲突('删除既有锁文件失败：%s' % e) from None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise 锁冲突(_陈旧锁说明(path)) from None
+    except OSError as e:
+        raise 锁冲突('创建锁文件失败：%s' % e) from None
+    try:
+        内容 = json.dumps({
+            'pid': os.getpid(),
+            '启动时刻': datetime.now(timezone.utc).strftime(
+                '%Y-%m-%dT%H:%M:%SZ'),
+            '注册表根': 根,
+        }, ensure_ascii=False, indent=2) + '\n'
+        os.write(fd, 内容.encode('utf-8'))
+    finally:
+        os.close(fd)
+    return path
+
+
+def 释放发布锁(path):
+    """删除锁文件。已经不在了也算成功（幂等，便于放进 `finally`）。"""
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _LOG.exception('删除锁文件失败，下次启动需要 --强制解锁')
+        return False
+
+
+def _陈旧锁说明(path):
+    """读锁文件里的 pid/时刻拼一句可操作的中文说明。读不出也要能说话。"""
+    信息 = ''
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            记 = json.load(f)
+        信息 = '（持锁 pid=%s，启动于 %s）' % (
+            记.get('pid', '?'), 记.get('启动时刻', '?'))
+    except (OSError, ValueError, json.JSONDecodeError):
+        信息 = '（锁文件内容读不出，可能是上次崩在写锁的半路）'
+    return (
+        '该注册表根已有一个服务端持锁 %s。本服务端是单写者（ADR-36 §2.2），'
+        '不支持多进程同时写同一个注册表根。\n'
+        '  · 若确实还有进程在跑：先停掉它。\n'
+        '  · 若那是崩溃留下的陈旧锁：确认该 pid 已不存在后，'
+        '加 --强制解锁 重启。\n'
+        '  （刻意不自动判活：pid 会复用，自动判断必然有猜错的时候。）'
+        % 信息)
+
+
+def _是回环(host):
+    """判断监听地址是否只对本机可见。空串/`0.0.0.0`/`::` 都是**全网**。"""
+    h = (host or '').strip().strip('[]').lower()
+    if h in ('127.0.0.1', '::1', 'localhost'):
+        return True
+    # 127.0.0.0/8 整段都是回环
+    return h.startswith('127.')
+
+
+def 危险绑定横幅(host, 要求TLS):
+    """非回环绑定且未要求 TLS 转发时，返回多行告警文本；否则返回 ''。
+
+    **只告警不拒绝启动**（ADR-36 §2.1）：内网可信段直连是合理场景，硬拒会
+    逼用户改代码，那比告警更糟。
+    """
+    if _是回环(host) or 要求TLS:
+        return ''
+    return (
+        '\n'
+        '!!! ====================================================== !!!\n'
+        '!!!  警告：监听地址 %s 不是回环地址，且未开 --要求TLS转发    \n'
+        '!!!  · token 会以明文经网络传输，任何能路由到本机的人都能\n'
+        '!!!    试探 POST %s\n'
+        '!!!  · 正确形态：反代终结 TLS → 转发到 127.0.0.1:<端口>，\n'
+        '!!!    反代设置 X-Forwarded-Proto，服务端加 --要求TLS转发\n'
+        '!!!  · 部署样例见 docs/远程注册表部署.md\n'
+        '!!!  （若这是内网可信段直连，可无视本告警——不拒绝启动。）\n'
+        '!!! ====================================================== !!!\n'
+        % (host, PUBLISH_PATH))
 
 
 
@@ -545,46 +703,76 @@ def _读上限(名, 默认):
 
 
 def main(argv=None):
-    """CLI 入口。返回退出码（0 正常 / 非 0 异常）。"""
+    """CLI 入口。返回退出码（0 正常 / 2 授权配置错 / 3 锁冲突）。"""
     p = argparse.ArgumentParser(
-        description='极快远程注册表服务端（ADR-35）')
+        description='极快远程注册表服务端（ADR-35 / ADR-36）')
     p.add_argument('--注册表', dest='registry', required=True,
                    help='本地注册表根目录（写入目标）')
     p.add_argument('--授权', dest='auth', required=True,
-                   help='授权配置文件路径（授权.json）')
+                   help='授权配置文件路径（授权.json）；改动无需重启即生效')
     p.add_argument('--监听', '--host', dest='host', default=DEFAULT_HOST,
                    help='监听地址，默认 %s' % DEFAULT_HOST)
     p.add_argument('--端口', '--port', dest='port', type=int,
                    default=DEFAULT_PORT, help='监听端口，默认 %d' % DEFAULT_PORT)
     p.add_argument('--审计', dest='audit', default=None,
                    help='审计日志路径；省略即不写审计')
+    p.add_argument('--要求TLS转发', dest='require_tls', action='store_true',
+                   help='POST %s 必须带 `X-Forwarded-Proto: https`，否则 403。'
+                        '语义是「我确认自己只被反代访问」，不是鉴别真实 TLS'
+                        % PUBLISH_PATH)
+    p.add_argument('--强制解锁', dest='force_unlock', action='store_true',
+                   help='启动前删掉既有 `%s`（崩溃留下陈旧锁时用）。'
+                        '刻意不自动判活：pid 会复用' % LOCK_NAME)
     args = p.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO, stream=sys.stderr,
         format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
+    # 抢锁在建服务**之前**：锁冲突就不该占端口，也不该读授权配置。
     try:
-        srv = build_server(
-            注册表=args.registry, 授权=args.auth,
-            host=args.host, port=args.port, 审计路径=args.audit)
-    except _auth_mod.AuthError as e:
-        print('授权配置错误：%s' % e, file=sys.stderr)
-        return 2
-
-    实际地址, 实际端口 = srv.server_address[0], srv.server_address[1]
-    print('极快远程注册表服务端已启动：http://%s:%d/' % (实际地址, 实际端口),
-          file=sys.stderr)
-    print('提示：写端点是 POST %s，读端点走静态托管；无 TLS，请前置 nginx/Caddy。'
-          % PUBLISH_PATH, file=sys.stderr)
+        锁 = 抢发布锁(args.registry, 强制解锁=args.force_unlock)
+    except 锁冲突 as e:
+        print('无法启动：%s' % e, file=sys.stderr)
+        return 3
 
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print('\n已停止。', file=sys.stderr)
+        try:
+            srv = build_server(
+                注册表=args.registry, 授权=args.auth,
+                host=args.host, port=args.port, 审计路径=args.audit,
+                要求TLS=args.require_tls)
+        except _auth_mod.AuthError as e:
+            print('授权配置错误：%s' % e, file=sys.stderr)
+            return 2
+
+        实际地址, 实际端口 = srv.server_address[0], srv.server_address[1]
+        print('极快远程注册表服务端已启动：http://%s:%d/' % (实际地址, 实际端口),
+              file=sys.stderr)
+        print('提示：写端点是 POST %s，读端点走静态托管；'
+              '本进程不做 TLS，请前置 nginx/Caddy。' % PUBLISH_PATH,
+              file=sys.stderr)
+        print('单写者锁：%s（正常退出会自动删除）' % LOCK_NAME, file=sys.stderr)
+        if args.require_tls:
+            print('已开 --要求TLS转发：缺 `X-Forwarded-Proto: https` 的 POST 一律 403。',
+                  file=sys.stderr)
+        横幅 = 危险绑定横幅(args.host, args.require_tls)
+        if 横幅:
+            print(横幅, file=sys.stderr)
+            _LOG.warning('非回环绑定且未要求 TLS 转发：%s', args.host)
+
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            print('\n已停止。', file=sys.stderr)
+        finally:
+            srv.server_close()
     finally:
-        srv.server_close()
+        # 无论怎么退（含 KeyboardInterrupt / SIGTERM 触发的 SystemExit）都要
+        # 把锁删掉，否则下次启动得靠人敲 --强制解锁。
+        释放发布锁(锁)
     return 0
+
 
 
 if __name__ == '__main__':                              # pragma: no cover

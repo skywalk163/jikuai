@@ -164,7 +164,7 @@ class TestGateRejectsContextual:
         for node in ('FuncDef', 'FuncCall', 'Return'):
             assert node not in unsupported, f'{node} 应已移出不支持清单'
         # 仍不支持的
-        for node in ('Lambda', 'ClassDef', 'ListLit'):
+        for node in ('Lambda', 'ClassDef', 'MemberAccess'):
             assert node in unsupported
         # 上下文相关特性存在
         ctx = d.get('unsupported_contextual_features', {})

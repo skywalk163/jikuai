@@ -255,8 +255,12 @@ class TestDescribeSubset:
         d = describe_subset()
         assert 'For' not in set(d['unsupported_node_types']), \
             '`For` 已改为上下文相关判定，不该再挂在节点类型清单上'
+        # W104（ADR-37 第一切片）：容器字面量与下标已进子集，不该再挂在清单上
+        for node in ('ListLit', 'DictLit', 'Index'):
+            assert node not in set(d['unsupported_node_types']), \
+                f'{node} 已进子集（ADR-37 §2.1），应已移出不支持清单'
         # 仍不支持的
-        for node in ('Lambda', 'ClassDef', 'ListLit', 'Pipeline'):
+        for node in ('Lambda', 'ClassDef', 'MemberAccess', 'Pipeline'):
             assert node in set(d['unsupported_node_types'])
 
     def test_context_features_include_for(self):

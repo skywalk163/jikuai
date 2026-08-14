@@ -74,6 +74,47 @@ class ContinueSignal(Exception):
     pass
 
 
+#: Python 类名 → 极快类型的中文叫法。名字对齐 `pybridge.py` 顶部的跨语言编组表
+#: 与 `keywords.BUILTIN_TYPES`，不另立一套叫法——同一个类型在诊断里和在文档里
+#: 必须是同一个词。
+#:
+#: `RMB` 这条是**兜底**：它是本文件内定义的 `evaluator.RMB`，不显式映射就会退回
+#: Python 类名 `RMB`，而 AOT 那侧 `jk_typename` 对 `JK_RMB` 出「人民币」，两路文案
+#: 就会一中一英——这正是 ADR-37 §2.5 要求逐字对齐的地方。
+_中文类型名 = {
+    'bool': '布尔', 'int': '整数', 'float': '小数', 'str': '字符串',
+    'list': '列表', 'tuple': '列表', 'dict': '字典', 'NoneType': '空',
+    'RMB': '人民币',
+}
+
+
+def _类型名(值):
+    """诊断文案里用的中文类型名。
+
+    表外类型退回 Python 类名：那些是 Python 桥对象之类本来就不在极快值模型里的东西，
+    给出真名比给一个含糊的「对象」更能帮用户定位。
+    """
+    return _中文类型名.get(type(值).__name__, type(值).__name__)
+
+
+def _值文本(值):
+    """诊断里回显一个值。
+
+    字符串用中文引号包起来而不是 `repr`：`repr` 的单引号看起来像 Python 实现细节，
+    而 ADR-09 明令诊断不得泄漏实现细节。
+    """
+    if isinstance(值, str):
+        return f'「{值}」'
+    if 值 is None:
+        return '空'
+    if 值 is True:
+        return '真'
+    if 值 is False:
+        return '假'
+    return str(值)
+
+
+
 class BoundMethod:
     """ADR-07：绑定方法对象。仅承载 (实例, 方法定义, 闭包环境)，
     按元数分流产生（≥1 参方法访问返回它），只能被 `_eval_FuncCall` 立即调用。
@@ -1350,10 +1391,50 @@ class Evaluator:
     def _eval_Index(self, node, env):
         obj = self._eval_node(node.obj, env)
         idx = self._eval_node(node.index, env)
-        # 字典按键取值（键不强转 int），序列按整数下标取值
+        line = getattr(node, 'line', 0)
+        col = getattr(node, 'col', 0)
+
+        def _诊断(类别, 文案):
+            return JiKuaiError(文案, info=ErrorInfo(
+                category=类别, message=文案, line=line, col=col,
+                source_line=self._source_line(line),
+            ))
+
+        # 字典按键取值（键不强转 int）。
         if isinstance(obj, dict):
+            try:
+                命中 = idx in obj
+            except TypeError:
+                # 列表/字典这类不可哈希的东西当键。与 `_eval_DictLit` 的 ADR-23b
+                # 检查同口径：那边管构造，这边管取值，两处都不能漏成 Python 原文。
+                raise _诊断(ErrorCategory.TYPE,
+                            f"{_类型名(idx)}不能作为字典的键"
+                            f"（键必须是字符串/数字/布尔/空）")
+            if not 命中:
+                raise _诊断(ErrorCategory.RUNTIME,
+                            f"键不存在：字典里没有键 {_值文本(idx)}")
             return obj[idx]
-        return obj[int(idx)]
+
+
+        # 序列（列表/字符串/元组）按整数下标取值。
+        if isinstance(obj, (list, str, tuple)):
+            # 下标必须是数字。bool 是 int 子类，天然通过。字符串等非数字要报中文诊断，
+            # 而不是让 `int("甲")` 抛出 Python 的 `invalid literal` 原文。
+            if not isinstance(idx, (int, float)):
+                raise _诊断(ErrorCategory.TYPE,
+                            f"下标必须是整数，收到{_类型名(idx)} {_值文本(idx)}")
+            i = int(idx)  # 小数按 ADR-37 §2.5 现状截断，不报错
+            长度 = len(obj)
+            if i < -长度 or i >= 长度:
+                raise _诊断(ErrorCategory.RUNTIME,
+                            f"下标越界：{_类型名(obj)}长度为 {长度}，"
+                            f"下标 {i} 超出有效范围（{-长度} 到 {长度 - 1}）")
+            return obj[i]
+
+        # 其余类型（整数/小数/布尔/空 等）不支持下标。
+        raise _诊断(ErrorCategory.TYPE,
+                    f"{_类型名(obj)}不支持下标取值")
+
 
     def _eval_ListLit(self, node, env):
         return [self._eval_node(item, env) for item in node.items]

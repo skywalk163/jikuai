@@ -122,8 +122,9 @@ class TestGateAcceptsControlFlow:
         unsupported = set(d['unsupported_node_types'])
         for node in ('If', 'While', 'Repeat', 'Break', 'Continue', 'For'):
             assert node not in unsupported, f'{node} 应已移出不支持清单'
-        # 仍不支持的（T2a 起 FuncDef 已进子集，闭包 Lambda 顶上来）
-        for node in ('Lambda', 'ClassDef', 'ListLit'):
+        # 仍不支持的（T2a 起 FuncDef 已进子集，W104 起容器也进了，
+        # 顶上来的是闭包 Lambda / 类 / 成员访问）
+        for node in ('Lambda', 'ClassDef', 'MemberAccess'):
             assert node in unsupported
 
 

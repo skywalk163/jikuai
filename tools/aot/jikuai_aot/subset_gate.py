@@ -27,8 +27,8 @@ from __future__ import annotations
 from typing import Iterable, List, Optional, Tuple
 
 from jikuai.ast_nodes import (
-    AdverbCall, Assign, Call, For, FuncCall, FuncDef, Import, ListLit, Node,
-    Program, Return,
+    AdverbCall, Assign, Call, DictLit, For, FuncCall, FuncDef, Import, ListLit,
+    Node, Program, Repeat, Return, While,
 )
 from jikuai.diagnostics.codes import CODE_TABLE, JK_E7001
 from jikuai.diagnostics.model import Diagnostic, Position, Span
@@ -74,9 +74,17 @@ SUPPORTED_VERBS: frozenset = frozenset({
 #: 但遍历任意可迭代对象（变量、函数返回值等）仍命中 JK-E7001，判定见
 #: `_collect` 里的上下文规则，不再靠这个集合。
 #:
+#: **W104（ADR-37 第一切片）**把 `ListLit` / `DictLit` / `Index` 移出本集合：
+#: 容器现在有真的堆运行时（`JKList` / `JKDict`，见 codegen 的 `_C_RUNTIME`）。
+#: 但只放行到 ADR-37 划的那条线上，四类顺延项靠**别的机制**继续拒：
+#:   - `MemberAccess`（`.成员`）—— 仍在本集合里，顺延，见 ADR-37 §2.1；
+#:   - 下标**写**（`列表[i] = 值`）—— 靠 `_collect` 里 `Assign` 的
+#:     「赋值目标不是 Ident」判定，顺延，见 ADR-37 §2.3；
+#:   - 容器作字典键 —— 靠上下文规则 `容器作字典键`，见 ADR-37 §2.4；
+#:   - 循环体内构造容器 —— 靠上下文规则 `循环体内构造容器`，见 ADR-37 §2.2。
+#:
 #: 仍然不支持的都有明确的运行时依赖：`Lambda` 要环境捕获、
-#: `ListLit`/`Index` 要堆容器（`For` 里的字面量列表是就地展开的特例，不落堆）、
-#: 类与异常要对象模型与栈展开。
+#: `MemberAccess` 要对象模型、类与异常要对象模型与栈展开。
 UNSUPPORTED_NODE_TYPES: frozenset = frozenset({
     # 类与继承
     "ClassDef", "NewInstance", "MemberAccess",
@@ -88,11 +96,14 @@ UNSUPPORTED_NODE_TYPES: frozenset = frozenset({
     "Import", "Export",
     # 闭包（需要环境捕获，代价比无捕获函数高一个量级）
     "Lambda",
-    # 复合数据（第一版子集不含；`For` 里的字面量列表遍历是就地展开的特例）
-    "ListLit", "DictLit", "Index",
 })
 
-#: 节点类型名 → 对外中文特性名。诊断消息必须含这个名字，便于用户定位。
+#: 节点类型名 → 对外中文特性名。
+#:
+#: 这是一张**纯粹的「节点类型 → 中文叫法」查表**，不等于「不支持清单」：
+#: `Index` 已进子集（读），但 `Assign` 分支报「赋值目标 索引访问」时还要用它
+#: 取中文名。`describe_subset()` 会按 `UNSUPPORTED_NODE_TYPES` 过滤后才对外，
+#: 免得文档把已支持的特性列成不支持。
 _NODE_FEATURE_NAMES = {
     "ClassDef": "类定义",
     "NewInstance": "类实例化",
@@ -104,8 +115,6 @@ _NODE_FEATURE_NAMES = {
     "Import": "模块导入",
     "Export": "模块导出",
     "Lambda": "匿名函数",
-    "ListLit": "列表字面量",
-    "DictLit": "字典字面量",
     "Index": "索引访问",
 }
 
@@ -113,7 +122,10 @@ _NODE_FEATURE_NAMES = {
 _NODE_FEATURE_NOTES = {
     "ClassDef": "类与继承需要运行时对象模型，AOT 后端没有堆对象与方法派发。",
     "NewInstance": "类与继承需要运行时对象模型，AOT 后端没有堆对象与方法派发。",
-    "MemberAccess": "成员访问依赖对象模型，AOT 后端未实现。",
+    "MemberAccess": "成员访问依赖对象模型（类实例的字段/方法、继承链、模块导出名），"
+                    "不只是「字典取键」那一条；把它纳入切片等于顺手实现一个最小对象"
+                    "模型。**顺延项，见 ADR-37 §2.1**（等 v0.23.0 对象模型 ADR）。"
+                    "字典取值请写 `字典[键]`（Index），那个已在子集内。",
     "Try": "异常需要栈展开机制，AOT 后端未实现。",
     "Throw": "异常需要栈展开机制，AOT 后端未实现。",
     "Pipeline": "管道是极快的核心范式，但需要值传递与惰性求值支撑，暂不在 AOT 子集内。",
@@ -122,10 +134,8 @@ _NODE_FEATURE_NOTES = {
     "Export": "模块导出只在模块语境有意义，AOT 只编译单文件顶层程序。",
     "Lambda": "闭包需要环境捕获（逃逸分析或显式 env 结构体），AOT 后端未实现；"
               "请改用顶层 `函数` 定义。",
-    "ListLit": "列表需要堆分配与泛型容器运行时，AOT 后端未实现。",
-    "DictLit": "字典需要哈希表运行时，AOT 后端未实现。",
-    "Index": "索引访问依赖列表/字典运行时，AOT 后端未实现。",
 }
+
 
 # ---------------------------------------------------------------------------
 # T2b：`遍历`（For）的受支持形态
@@ -147,9 +157,17 @@ FOR_ITERABLE_FEATURE: str = (
 #: `范围` 参数个数不合法。
 FOR_RANGE_ARITY_FEATURE: str = "范围(...) 的参数个数（AOT 支持 1~3 个参数）"
 
-#: **上下文相关**的不支持特性（T2a / T2b）。这些特性靠节点类型判不出来，必须
-#: 结合所处位置或形态：同一个 `FuncDef` 写在顶层合法、写在函数体里就是闭包；
-#: 同一个 `For` 遍历 `范围(...)` 合法、遍历变量就要可迭代对象运行时。
+#: **W104 / ADR-37 §2.4**：容器作字典键。键的相等与哈希只对标量定义。
+DICT_KEY_FEATURE: str = "容器作字典键"
+
+#: **W104 / ADR-37 §2.2**：在循环体内构造容器。第一切片的内存策略是
+#: 「malloc 不 free」，循环里反复建容器会让内存只涨不落。
+LOOP_CONTAINER_FEATURE: str = "循环体内构造容器"
+
+#: **上下文相关**的不支持特性（T2a / T2b / W104）。这些特性靠节点类型判不出来，
+#: 必须结合所处位置或形态：同一个 `FuncDef` 写在顶层合法、写在函数体里就是闭包；
+#: 同一个 `For` 遍历 `范围(...)` 合法、遍历变量就要可迭代对象运行时；
+#: 同一个 `【1，2】` 写在顶层合法、写在循环体里就会让 arena 无界增长。
 #:
 #: 键即诊断消息里出现的对外特性名，值为写进 notes 的说明。
 _CONTEXT_FEATURE_NOTES = {
@@ -169,7 +187,18 @@ _CONTEXT_FEATURE_NOTES = {
         "`范围` 与 Python 的 range 同构：1 个参数是 `范围(止)`，2 个是 "
         "`范围(起, 止)`，3 个是 `范围(起, 止, 步)`。0 个或超过 3 个参数"
         "在解释器里也是错误。",
+    DICT_KEY_FEATURE:
+        "字典键第一切片限标量（字符串/数字/布尔/空/人民币）：相等与哈希只对标量"
+        "定义好了，容器作键要先定义「容器相等」语义。**顺延，见 ADR-37 §2.4**"
+        "（「字典键限标量」），不是 bug。",
+    LOOP_CONTAINER_FEATURE:
+        "第一切片的容器是 malloc 后**全程不回收**的 arena（ADR-37 §2.2：不做"
+        "引用计数也不做 GC）。不回收的 arena 语义下循环内建容器会让内存只涨不落，"
+        "所以循环体内构造容器**顺延，见 ADR-37 §2.2** 升级触发线 (a)：命中它即"
+        "启动内存管理 ADR。注意 `遍历 变量 于 【字面量列表】` 的遍历源不受此限 —— "
+        "那个列表是就地展开成栈上数组的，不落堆。",
 }
+
 
 
 
@@ -304,15 +333,25 @@ def describe_subset() -> dict:
     """导出子集描述，供 docs/AOT.md 与测试做「文档 ↔ 代码」一致性核对。
 
     `unsupported_contextual_features`（T2a 新增）列出**靠节点类型判不出来**的
-    子集外特性：同一个 `FuncDef` 写在顶层是支持的，写在函数体里就是闭包。
+    子集外特性：同一个 `FuncDef` 写在顶层是支持的，写在函数体里就是闭包；
+    W104 起还有「容器作字典键」「循环体内构造容器」两条，见 ADR-37 §2.4/§2.2。
+
+    `unsupported_feature_names` 按 `UNSUPPORTED_NODE_TYPES` **过滤**后才导出 ——
+    `_NODE_FEATURE_NAMES` 里还留着已进子集的 `Index`（`Assign` 分支报
+    「赋值目标 索引访问」时要用它取中文名），不过滤会把它误报成不支持特性。
     """
     return {
         "supported_verbs": sorted(SUPPORTED_VERBS),
         "unsupported_node_types": sorted(UNSUPPORTED_NODE_TYPES),
-        "unsupported_feature_names": dict(sorted(_NODE_FEATURE_NAMES.items())),
+        "unsupported_feature_names": {
+            name: label
+            for name, label in sorted(_NODE_FEATURE_NAMES.items())
+            if name in UNSUPPORTED_NODE_TYPES
+        },
         "unsupported_contextual_features": dict(
             sorted(_CONTEXT_FEATURE_NOTES.items())),
     }
+
 
 
 # ---------------------------------------------------------------------------
@@ -320,19 +359,28 @@ def describe_subset() -> dict:
 # ---------------------------------------------------------------------------
 
 def _collect(node: Node, in_function: bool = False,
-             program_top: bool = False):
+             program_top: bool = False, in_loop: bool = False):
     """前序深度优先产出 (特性名, 主体名, 说明, 节点) 四元组。
 
     命中不支持节点后**不再下钻**其子树：一个类定义只报一条，而不是把类体里
     每个语句都报一遍。未命中的节点继续递归。
 
-    上下文参数（T2a）
-    ----------------
+    上下文参数（T2a / T2b / W104）
+    -----------------------------
     `in_function`   当前是否位于某个 `FuncDef` 体内 —— 决定 `返回` 合法性，
                     以及再遇到 `FuncDef` 时按「嵌套函数（闭包）」拒绝。
     `program_top`   当前节点是否为 `Program.body` 的**直接**成员 —— 只有这一
                     层的 `FuncDef` 在子集内。写在 `如果`/`当`/`重复` 块里的
                     函数定义是条件定义，静态编译期定不下绑定，一律拒绝。
+    `in_loop`       当前是否位于 `遍历`/`当`/`重复` 的**循环体**内 —— 决定
+                    `ListLit`/`DictLit` 是否命中 `循环体内构造容器`
+                    （ADR-37 §2.2：容器 malloc 后不回收，循环里建就只涨不落）。
+                    只有**体**算循环内；`重复 N 次` 的 N、`遍历 ... 于` 的遍历源
+                    都在进入循环前求值一次，不算。
+
+    `in_loop` 的**已知盲区**（记在这里而不是假装没有）：函数体一律按
+    `in_loop=False` 检查，所以「顶层函数里造容器 + 循环里反复调它」这条路径
+    绕过本规则。堵它要做调用图分析，超出第一切片；已写进 docs/AOT.md 局限。
     """
     type_name = type(node).__name__
 
@@ -352,9 +400,11 @@ def _collect(node: Node, in_function: bool = False,
         if feature is not None:
             yield (feature, node.name, _CONTEXT_FEATURE_NOTES[feature], node)
             return
-        # 函数体：进入函数语境，且不再是「顶层」
+        # 函数体：进入函数语境，且不再是「顶层」。
+        # in_loop 归零 —— 函数体自己不是循环体（盲区见上面 docstring）。
         for stmt in node.body:
-            for item in _collect(stmt, in_function=True, program_top=False):
+            for item in _collect(stmt, in_function=True, program_top=False,
+                                 in_loop=False):
                 yield item
         return
 
@@ -363,11 +413,41 @@ def _collect(node: Node, in_function: bool = False,
         yield (feature, "返回", _CONTEXT_FEATURE_NOTES[feature], node)
         return
 
+    if isinstance(node, (ListLit, DictLit)):
+        # W104（ADR-37 第一切片）：容器字面量已进子集，但有两条上下文红线。
+        #
+        # 红线一（§2.2）：循环体内构造容器。第一切片 malloc 不 free，循环里
+        # 每轮新建一个容器 = 内存只涨不落。注意这里**收不到** `遍历 变量 于
+        # 【字面量列表】` 的那个遍历源 —— For 分支只把它的 items 递下来，
+        # ListLit 节点本身不进 `_collect`，因为它会被就地展开成栈上数组。
+        if in_loop:
+            yield (LOOP_CONTAINER_FEATURE, type_name,
+                   _CONTEXT_FEATURE_NOTES[LOOP_CONTAINER_FEATURE], node)
+            return
+        # 红线二（§2.4）：容器作字典键。键的相等/哈希只对标量定义。
+        # 只查字面量形态；「变量里装着容器」要到运行期才知道，由 C 运行时的
+        # `jk_dict_set` 兜（文案与解释器 `_eval_DictLit` 的 ADR-23b 检查一致）。
+        if isinstance(node, DictLit):
+            for pair in node.items:
+                key_node = pair[0]
+                if isinstance(key_node, (ListLit, DictLit)):
+                    yield (DICT_KEY_FEATURE, type(key_node).__name__,
+                           _CONTEXT_FEATURE_NOTES[DICT_KEY_FEATURE], key_node)
+                    return
+        # 元素 / 键 / 值本身仍要逐个过门禁：它们可以是变量、算术、嵌套容器，
+        # 但不能是子集外特性。
+        for child in _iter_child_nodes(node):
+            for item in _collect(child, in_function=in_function,
+                                 program_top=False, in_loop=in_loop):
+                yield item
+        return
+
     if isinstance(node, For):
         # T2b：只接受两种**静态可展开**的遍历源，其余一律拒绝。
         # 必须在这里自己递归 —— 交给下面的通用下钻会误判：`范围` 不在动词白名单
-        # 里、`ListLit` 还在 UNSUPPORTED_NODE_TYPES 里，而它们作为遍历源是合法
-        # 特例（codegen 会就地展开成计数 for / 栈上数组），不能按普通表达式判。
+        # 里，而它作为遍历源是合法特例（codegen 会就地展开成计数 for）；字面量
+        # 列表遍历源同理会展开成栈上数组，所以**不能**让它去撞上面那条
+        # 「循环体内构造容器」规则（它压根不落堆）。
         iterable = node.iterable
         children: List[Node] = []
         if isinstance(iterable, Call) and getattr(iterable, "verb", "") == RANGE_VERB:
@@ -383,10 +463,34 @@ def _collect(node: Node, in_function: bool = False,
                    _CONTEXT_FEATURE_NOTES[FOR_ITERABLE_FEATURE], node)
             return
         # 起/止/步 与列表元素本身仍要逐个过门禁：它们可以是变量、算术表达式、
-        # 函数调用，但不能是子集外特性。循环体同理。
-        for child in children + list(node.body):
+        # 函数调用，但不能是子集外特性。这些都在进入循环**前**求值一次，
+        # 所以沿用外层的 in_loop，而循环体才是 in_loop=True。
+        for child in children:
             for item in _collect(child, in_function=in_function,
-                                 program_top=False):
+                                 program_top=False, in_loop=in_loop):
+                yield item
+        for stmt in node.body:
+            for item in _collect(stmt, in_function=in_function,
+                                 program_top=False, in_loop=True):
+                yield item
+        return
+
+    if isinstance(node, While):
+        # 条件每轮都重新求值，语义上就在循环内，所以也按 in_loop=True 查。
+        for child in [node.cond] + list(node.body):
+            for item in _collect(child, in_function=in_function,
+                                 program_top=False, in_loop=True):
+                yield item
+        return
+
+    if isinstance(node, Repeat):
+        # 次数只在进入前求值一次（对齐 codegen 的 `_emit_repeat`），不算循环内。
+        for item in _collect(node.count, in_function=in_function,
+                             program_top=False, in_loop=in_loop):
+            yield item
+        for stmt in node.body:
+            for item in _collect(stmt, in_function=in_function,
+                                 program_top=False, in_loop=True):
                 yield item
         return
 
@@ -401,9 +505,10 @@ def _collect(node: Node, in_function: bool = False,
             return
         for arg in node.args:
             for item in _collect(arg, in_function=in_function,
-                                 program_top=False):
+                                 program_top=False, in_loop=in_loop):
                 yield item
         return
+
 
     if isinstance(node, Call):
         verb = getattr(node, "verb", "")
@@ -418,15 +523,25 @@ def _collect(node: Node, in_function: bool = False,
             return
 
     if isinstance(node, Assign):
-        # 赋值目标必须是简单标识符。MemberAccess / Index 目标本身也在
-        # UNSUPPORTED_NODE_TYPES 里，会在下钻时命中；这里给出更贴切的消息。
+        # 赋值目标必须是简单标识符。
+        #   - `对象.成员 = 值`：MemberAccess 目标仍在 UNSUPPORTED_NODE_TYPES 里；
+        #   - `列表[i] = 值`：Index 已进子集（**读**），但**写**顺延，靠这条挡。
+        # 两者都在这里报「赋值目标 X」，比等下钻时报节点名更贴近用户写的那行。
         target = getattr(node, "target", None)
         if target is not None and type(target).__name__ != "Ident":
             tgt_type = type(target).__name__
+            if tgt_type == "Index":
+                note = ("AOT 只支持赋值给简单变量名（Ident）。下标**写**"
+                        "（`列表[i] = 值` / `字典[键] = 值`）是**顺延项，见 "
+                        "ADR-37 §2.3**：写是就地可变，一进循环就踩 §2.2 的内存"
+                        "升级触发线 (b)，所以留到内存管理 ADR 里与「可变 + 回收」"
+                        "一起做，不是 bug。下标**读**（`列表[i]` 取值）已在子集内。")
+            else:
+                note = "AOT 只支持赋值给简单变量名（Ident）。"
             yield (
                 "赋值目标 {}".format(_NODE_FEATURE_NAMES.get(tgt_type, tgt_type)),
                 tgt_type,
-                "AOT 只支持赋值给简单变量名（Ident）。",
+                note,
                 node,
             )
             return
@@ -434,5 +549,6 @@ def _collect(node: Node, in_function: bool = False,
     child_top = isinstance(node, Program)
     for child in _iter_child_nodes(node):
         for item in _collect(child, in_function=in_function,
-                             program_top=child_top):
+                             program_top=child_top, in_loop=in_loop):
             yield item
+

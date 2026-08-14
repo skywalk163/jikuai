@@ -299,3 +299,80 @@ jobs:
       - name: Coverage baseline + per-file floors
         run: python scripts/coverage_baseline.py --检查下限 --按覆盖率升序
 
+  # FreeBSD 平台守卫。
+  #
+  # 为什么在 github 这边也要有：FreeBSD 其实**早就在跑**——`.gitea/workflows/ci.yml`
+  # 的 `runs-on: freebsd` 就是一台真 FreeBSD host runner，全量测试 + G10-G19 +
+  # AOT 零 skip 守卫都在那儿卡着。但那条流水线只对内网可见，且依赖一台自维护的
+  # 机器；公开镜像上看不到 FreeBSD 的结果，别人也没法复现。这个 job 补的是
+  # **可公开验证的那一份**，不替代 gitea 那条。
+  #
+  # GitHub 没有原生 FreeBSD runner，所以用 vmactions/freebsd-vm 在 ubuntu runner
+  # 里跑 QEMU FreeBSD VM。代价是慢（VM 启动 + pkg 安装 + 全量测试），收益是四平台
+  # 矩阵在公开 CI 上齐了。`cache-after-prepare` 把装完包的镜像缓存下来，后续 run
+  # 直接跳过 prepare。
+  #
+  # 编译器：FreeBSD base system 自带 clang（`cc` 指向它），**不需要装 gcc**。
+  # `tools/aot/jikuai_aot/driver.py` 的 `_CC_CANDIDATES` 是
+  # `("gcc", "clang", "cc", "zig", "cl")`，gcc 缺席时会命中 clang，AOT e2e 照跑。
+  #
+  # 装依赖走 venv 而不是往系统 python 里塞：与 gitea runner 同策略，且绕开
+  # PEP 668「externally-managed-environment」的不确定性。
+  test-freebsd:
+    name: Test (FreeBSD VM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          # FreeBSD 14 之前默认 shell 是 csh；下面的脚本按 sh 写。
+          usesh: true
+          # 不把 VM 里的构建产物（venv、AOT 二进制、日志）拷回宿主。
+          copyback: false
+          cache-after-prepare: true
+          prepare: |
+            pkg install -y python311
+          run: |
+            set -e
+            cd "$GITHUB_WORKSPACE"
+
+            echo '--- 环境 ---'
+            freebsd-version
+            uname -a
+
+            echo '--- venv + 安装 ---'
+            python3.11 -m venv /tmp/jkvenv
+            . /tmp/jkvenv/bin/activate
+            python -m pip install --upgrade pip
+            python -m pip install -e '.[dev]'
+
+            echo '--- 确认 C 编译器在位（AOT e2e 需要）---'
+            cc --version
+            python -c "import shutil, sys; cc = shutil.which('clang') or shutil.which('cc'); print('cc ->', cc); sys.exit(0 if cc else 1)"
+
+            echo '--- 全量测试 ---'
+            python -m pytest -v
+
+            echo '--- 契约门禁 G10-G19 ---'
+            python scripts/check_stdlib_contract.py
+
+            # 与 linux/macos job 同款守卫：用 glob 覆盖全部 AOT 测试文件，并把
+            # pytest 退出码与 skip 判定分开（理由见 test-linux 里同名步骤，W106）。
+            echo '--- 守卫：AOT e2e 必须真跑，不许 skip ---'
+            status=0
+            python -m pytest -v -rs tests/test_*aot*.py > aot_run.log 2>&1 || status=$?
+            cat aot_run.log
+            if [ "$status" -ne 0 ]; then
+              echo "::error::AOT 用例本身失败（pytest 退出码 $status）。"
+              exit "$status"
+            fi
+            if grep -q "skipped" aot_run.log; then
+              echo "::error::AOT 端到端用例出现 skip —— FreeBSD 自带 clang，不应跳过。"
+              exit 1
+            fi
+            echo 'AOT 端到端用例全部运行，无跳过。'
+
+

@@ -45,8 +45,15 @@ EXIT_USAGE = 2         # 文件读不到 / 编码不对
 EXIT_TOOLCHAIN = 3     # 缺 C 编译器，且没加 --emit-c
 EXIT_BUILD = 4         # C 编译器返回非 0
 
-#: 探测顺序。`cl` 放最后：MSVC 需要 vcvars 环境，命中率最低。
-_CC_CANDIDATES = ("gcc", "clang", "cc", "cl")
+#: 探测顺序。
+#:
+#: `zig` 排在 `cl` 前面：`zig cc` 自带 libc 与交叉工具链，装一个 pip 包就能用
+#: （`pip install ziglang` 会在包目录里放 `zig.exe`，把那个目录加进 PATH 即可），
+#: 对没有系统编译器的开发机是成本最低的一条路 —— 它只是**被探测到的外部工具**，
+#: 不是极快的依赖，`src/jikuai/` 与 `tools/` 的零第三方依赖约束不受影响。
+#: `cl` 放最后：MSVC 需要 vcvars 环境，命中率最低。
+_CC_CANDIDATES = ("gcc", "clang", "cc", "zig", "cl")
+
 
 
 @dataclass
@@ -106,14 +113,27 @@ def _is_msvc(cc: str) -> bool:
     return base.startswith("cl") and not base.startswith("clang")
 
 
+def _is_zig(cc: str) -> bool:
+    """`zig` 不是编译器本体，是多工具入口：编 C 要走 `zig cc ...`。
+
+    识别后在 argv 里插入 `cc` 子命令。`zig cc` 接受 gcc/clang 风格的 flag，
+    所以除了这个前缀，其余按 gcc 分支处理即可。
+    """
+    base = os.path.basename(cc).lower()
+    return base == "zig" or base == "zig.exe"
+
+
 def compile_c(c_path: str, out_path: str, cc: str) -> Tuple[int, str]:
     """调用 C 编译器。返回 (返回码, 合并后的编译器输出)。
 
-    gcc/clang 用 `-std=c11 -O2 ... -lm`；MSVC 用 `/nologo /utf-8`。
+    gcc/clang 用 `-std=c11 -O2 ... -lm`；MSVC 用 `/nologo /utf-8`；
+    `zig` 走 `zig cc <同 gcc flag>`。
     """
     if _is_msvc(cc):
         cmd: Sequence[str] = [cc, "/nologo", "/utf-8", c_path,
                               "/Fe:" + out_path]
+    elif _is_zig(cc):
+        cmd = [cc, "cc", "-std=c11", "-O2", c_path, "-o", out_path, "-lm"]
     else:
         cmd = [cc, "-std=c11", "-O2", c_path, "-o", out_path, "-lm"]
 

@@ -61,8 +61,10 @@ def _interpret(src):
 
 
 def _have_c_compiler():
-    import shutil
-    return any(shutil.which(c) for c in ('gcc', 'clang', 'cc', 'cl'))
+    # 直接问驱动，别在测试里另抄候选清单——抄一份就会与 detect_c_compiler 漂移
+    # （W104 给它加了 zig / CC 环境变量支持）。
+    from jikuai_aot.driver import detect_c_compiler
+    return detect_c_compiler() is not None
 
 
 requires_cc = pytest.mark.skipif(

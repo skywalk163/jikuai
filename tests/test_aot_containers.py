@@ -69,7 +69,7 @@ from jikuai_aot.subset_gate import (
     is_supported,
 )
 from jikuai_aot.codegen import CodegenError, generate_c
-from jikuai_aot.driver import BuildOptions, build
+from jikuai_aot.driver import BuildOptions, build, detect_c_compiler
 
 
 # ===========================================================================
@@ -131,8 +131,15 @@ def _interpreter_message(src):
 
 
 def _have_c_compiler():
-    import shutil
-    return any(shutil.which(c) for c in ('gcc', 'clang', 'cc', 'cl'))
+    """有没有可用的 C 编译器 —— **直接问驱动**，不在测试里另抄一份候选清单。
+
+    抄一份就会漂移：W104 给 `detect_c_compiler` 加了 `zig`（走 `zig cc`）之后，
+    这里原来那份硬编码的 `('gcc','clang','cc','cl')` 仍然找不到 zig，也不认
+    `CC` 环境变量，结果驱动明明能编、这批测试却全报「环境无 C 编译器」而 skip。
+    CI 的「AOT e2e 零 skip」守卫也就守了个空。
+    """
+    return detect_c_compiler() is not None
+
 
 
 requires_cc = pytest.mark.skipif(

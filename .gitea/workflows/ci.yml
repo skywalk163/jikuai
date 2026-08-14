@@ -22,10 +22,12 @@ jobs:
 
       - name: 准备持久 venv（第三方依赖复用）
         run: |
-          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest')"
+          # coverage[toml] 与 pytest 一起进持久 venv —— 覆盖率门禁那步要用。
+          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest coverage[toml]')"
           echo "VENV_BIN=$VENV_BIN" >> "$GITHUB_ENV"
           ln -sfn "$PWD" "/var/db/act_runner/venvs/jikuai.src"
           "$VENV_BIN/pip" install -e "/var/db/act_runner/venvs/jikuai.src" --no-build-isolation >/dev/null 2>&1 || "$VENV_BIN/pip" install -e . --no-build-isolation >/dev/null 2>&1 || true
+
 
       - name: 确认 gcc 在位（AOT 端到端用例需要）
         run: |
@@ -60,5 +62,29 @@ jobs:
             exit 1
           fi
           echo "AOT 端到端用例全部运行，无跳过"
+
+      # 覆盖率标定（**不是门禁**，故意 continue-on-error）。
+      #
+      # 背景：`docs/覆盖率下限.json` 的逐文件点阈值是在 Windows + Python 3.14
+      # 上实测标定的，而**硬门禁在 .github 的 ubuntu 3.12 job 里**。问题是那条
+      # 流水线一次都没真跑过（github remote 推不上去），阈值等于没被任何真实
+      # CI 验证过。
+      #
+      # 这一步的唯一职责是**产出第一份非 Windows 的实测数字**：让 `.pth` 子进程
+      # 钩子、combine、逐文件判定这条链路在真 CI 上跑一遍，并把每个文件的百分比
+      # 打出来。标定完（拿到 FreeBSD 数字、确认跨平台落差）再决定要不要把它也
+      # 变成硬门禁。
+      #
+      # 为什么不直接卡：在没标定过的第三个平台上开硬阈值，红了大概率是平台差异
+      # 而不是真回归——那种红会训练人忽略门禁，比没有门禁更糟。
+      #
+      # 成本：要在覆盖率模式下把全量测试再跑一遍，这个 job 的耗时大致翻倍。
+      - name: 覆盖率标定（非门禁，只取数）
+        continue-on-error: true
+        run: |
+          . "$VENV_BIN/activate"
+          python scripts/coverage_baseline.py --检查下限 --按覆盖率升序
+          echo "上面的数字是 FreeBSD 实测值；与 docs/覆盖率下限.json 的 _实测 字段（Windows）比对，差值就是跨平台落差。"
+
 
 # trigger: re-push to fire Actions (content-API 偶发丢事件)

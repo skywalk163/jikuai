@@ -379,7 +379,7 @@ def compute_checksum(directory: str) -> Tuple[str, int]:
 
 
 def _iter_source_files(directory: str):
-    """按相对路径升序遍历源文件，跳过隐藏目录与临时产物。"""
+    """按相对路径升序遍历源文件，跳过隐藏目录与缓存/产物目录。"""
     root = os.path.abspath(directory)
     collected = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -391,8 +391,6 @@ def _iter_source_files(directory: str):
         )
         for fn in sorted(filenames):
             if not fn.endswith(('.jk', '.py', '.json')):
-                continue
-            if fn.endswith('.tmp'):
                 continue
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, root).replace(os.sep, '/')

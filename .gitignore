@@ -92,6 +92,10 @@ temp/
 # 包.json 与 包.锁 应提交进版本库。
 极快_包/
 
+# ===== 编辑器插件构建产物 =====
+# `vsce package` 的输出。可由源码重新打包，不入库；发行走 Release 附件。
+*.vsix
+
 # ===== 误建目录兜底 =====
 # `python scripts/generate_block_index.py --check` 一旦被当成位置参数解析，
 # 就会在仓库根建出 `--check/` 这种目录（v0.15.0 真实踩过）。

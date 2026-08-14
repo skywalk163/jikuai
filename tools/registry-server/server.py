@@ -48,6 +48,7 @@
 
 import argparse
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -60,6 +61,7 @@ import tarfile
 import tempfile
 import threading
 import urllib.parse
+import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -348,6 +350,14 @@ def _make_handler(注册表根, 授权源, 审计路径, 写锁, max_body, 要�
                     # 安全解压失败：路径穿越、tar bomb、链接成员等。
                     # 原因是「归档不安全」，透出简短中文原因，**不带路径**。
                     raise _响应(400, f'归档不安全：{e}')
+                except (tarfile.TarError, gzip.BadGzipFile, zlib.error,
+                        EOFError) as e:
+                    # 根本不是合法 tar.gz（垃圾字节、截断的 gzip 流、坏 tar 头）。
+                    # 这是**客户端**输入的问题，必须是 4xx：报 500 会让运维在
+                    # 告警里追一个不存在的服务端故障，还会淹掉真实的 500。
+                    # 只报异常类名不报原文：上游文本可能带上临时目录路径。
+                    raise _响应(
+                        400, f'归档不安全：不是合法的 tar.gz（{type(e).__name__}）')
 
                 # 归档以 `<版本>/...` 为根（见 registry._archive_snapshot）。
                 子目录 = [e for e in os.listdir(临时根)

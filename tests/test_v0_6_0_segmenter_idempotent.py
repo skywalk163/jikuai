@@ -21,13 +21,12 @@ import importlib.util
 
 import pytest
 
+from jikuai import resources
 from jikuai.main import run_source
-
-STDLIB = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'stdlib'))
 
 
 def _load(stem, alias):
-    path = os.path.join(STDLIB, stem + '.py')
+    path = resources.stdlib_path(stem + '.py')
     spec = importlib.util.spec_from_file_location(alias, path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
@@ -146,7 +145,7 @@ def test_AC_M5_07_02_源码无global与可变模块级容器():
 
     这是 G12 的结构性防回归——只要有人日后加了 `global`，本条立刻红。
     """
-    path = os.path.join(STDLIB, '分词.py')
+    path = resources.stdlib_path('分词.py')
     with open(path, 'r', encoding='utf-8') as f:
         source = f.read()
     import re as _re

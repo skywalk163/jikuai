@@ -9,6 +9,7 @@ import importlib.util
 
 import pytest
 
+from jikuai import resources
 from jikuai.main import run_source
 
 # ---------------------------------------------------------------------------
@@ -16,8 +17,7 @@ from jikuai.main import run_source
 # ---------------------------------------------------------------------------
 
 def _load_jianfan():
-    stdlib = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'stdlib'))
-    path = os.path.join(stdlib, '简繁.py')
+    path = resources.stdlib_path('简繁.py')
     spec = importlib.util.spec_from_file_location('jf', path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)

@@ -7,12 +7,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import importlib.util
 import pytest
 
+from jikuai import resources
 from jikuai.main import run_source
 
 
 def _load_seg():
-    stdlib = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'stdlib'))
-    path = os.path.join(stdlib, '分词.py')
+    path = resources.stdlib_path('分词.py')
     spec = importlib.util.spec_from_file_location('py_seg', path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
@@ -95,7 +95,7 @@ def test_词典文件sha256与元信息一致():
     import hashlib, json
     with open(SEG.dictionary_path(), 'rb') as f:
         actual = hashlib.sha256(f.read()).hexdigest()
-    with open(_repo('stdlib', '分词词典.元信息.json'), encoding='utf-8') as f:
+    with open(resources.stdlib_path('分词词典.元信息.json'), encoding='utf-8') as f:
         meta = json.load(f)
     assert actual == meta['sha256'], (
         '词典文件与元信息不一致。手改过词典就跑 '
@@ -107,8 +107,7 @@ def test_词典文件sha256与元信息一致():
 def test_词典文件缺失时抛异常而不是静默降级():
     """ADR-38 §8：静默降级会把「词典没打包进去」变成线上悄悄劣化。"""
     import importlib.util
-    stdlib = _repo('stdlib')
-    path = os.path.join(stdlib, '分词.py')
+    path = resources.stdlib_path('分词.py')
     src = open(path, encoding='utf-8').read()
     # 在隔离命名空间里执行，把 DICT_FILE 指向不存在的路径
     src = src.replace('"分词词典.txt")', '"不存在的词典.txt")')

@@ -7,12 +7,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import importlib.util
 import pytest
 
+from jikuai import resources
 from jikuai.main import run_source
 
 
 def _load_idioms():
-    stdlib = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'stdlib'))
-    path = os.path.join(stdlib, '成语.py')
+    path = resources.stdlib_path('成语.py')
     spec = importlib.util.spec_from_file_location('py_idioms', path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)

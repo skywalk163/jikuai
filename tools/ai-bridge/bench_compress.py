@@ -39,6 +39,11 @@ import sys
 _HERE = os.path.abspath(os.path.dirname(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, os.pardir, os.pardir))
 
+# stdlib 已收进包内（ADR-39 / v0.24.0）。块根一律经 resources 单一入口定位，
+# 不再拼旧的仓库根 `stdlib/blocks`——那条路径搬走后不存在，会让依赖闭包全落空。
+sys.path.insert(0, os.path.join(_ROOT, 'src'))
+from jikuai import resources  # noqa: E402
+
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding='utf-8')
@@ -46,7 +51,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 demo目录 = os.path.join(_ROOT, 'examples', 'blocks', 'demo')
-块根 = os.path.join(_ROOT, 'stdlib', 'blocks')
+块根 = resources.blocks_dir()
 
 门槛 = 8.0
 

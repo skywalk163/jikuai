@@ -276,6 +276,19 @@ def main(argv):
     if check_security_invariants.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
+    # G20：wheel 内容门禁（W116 · v0.24.0 · ADR-39 §5）。守 BACKLOG §10 那次
+    # 已经发生过的事故——PyPI 0.4.1 的 wheel 里零个 stdlib 文件，装完 `导入 数学`
+    # 直接失败，而本机 editable 一切正常。**刻意不在这里跑**：G10–G19 全是秒级
+    # 静态检查，而 G20 要 `python -m build`（量级差两个数量级，还多一个 build
+    # 依赖）。塞进主流程会拖垮常规 CI 的门禁步骤。这里只打一行提示，免得它被
+    # 静默忘掉——真检查由下面这个脚本单独跑（发布前必跑，见路线图 v0.24）。
+    #
+    # `--json` 下不打：那个模式的 stdout 必须是**纯** JSON，多一行人读文本就让
+    # `json.loads` 报 Extra data（test_契约脚本_json_输出可解析 当场抓到过）。
+    if not as_json:
+        print("G20（wheel 内容）不在本静态门禁内，"
+              "发布前请单独跑：python scripts/check_wheel_contents.py")
+
     return exit_code
 
 

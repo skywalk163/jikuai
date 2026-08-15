@@ -40,13 +40,23 @@ def _iter_测试文件():
 
 
 @pytest.mark.parametrize('test_path', list(_iter_测试文件()))
-def test_块测试跑通(test_path, capsys):
+def test_块测试跑通(test_path, capsys, tmp_path, monkeypatch):
     """每个块目录下的 `测试.jk` 必须能跑完不抛异常。
 
     `run_source` 底层会 tokenize + parse + evaluate 完整流程，所以既覆盖了
     块自身的 .jk 语法正确性，也覆盖了从 `blocks.<领域>.<块名>` 导入的路径解析、
     白名单反哺、依赖块加载。
+
+    **W114（v0.24.0）：先 chdir 到 `tmp_path`。** `数据.存文` / `数据.载入` /
+    `数据.序出` 三个块的自测要真写文件，此前它们用写死的
+    `stdlib/blocks/数据/存文/临时_测试*.txt`（相对 cwd），于是每跑一次就往
+    源码树里拉一堆产物——9 个这样的产物当年被提交进了库，还跟着进了 wheel。
+    chdir 到临时目录一次性根治：产物随 pytest 自动回收，且这条保护对**所有**
+    块自测生效，不只这三个。
+    模块解析不受影响——`run_source(..., file=test_path)` 让 `module_loader`
+    从 `test_path` 所在目录与包内 stdlib 找块，不依赖 cwd。
     """
+    monkeypatch.chdir(tmp_path)
     with open(test_path, 'r', encoding='utf-8') as f:
         源码 = f.read()
     try:

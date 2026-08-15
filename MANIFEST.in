@@ -1,6 +1,20 @@
-# W114（v0.24.0 · ADR-39）：sdist 也必须带 stdlib。
-# package-data 管 wheel；sdist 的收录规则不同，显式再声明一次。
+# W114（v0.24.0 · ADR-39）：**「stdlib 里哪些文件随包发行」的唯一真源。**
+#
+# pyproject 配置下 setuptools 的 `include_package_data` 默认为 true，所以本文件
+# 同时决定 wheel 与 sdist 的内容——不是只管 sdist。起草时以为 wheel 由
+# `[tool.setuptools.package-data]` 白名单决定，实测证伪（见 pyproject.toml 里
+# 那段 W114 注释），白名单已删除。改这里就是改「用户装到什么」，慎改。
+#
+# 用宽 recursive-include 而非窄白名单，是刻意的：白名单漏一个扩展名会静默
+# 不打包、到运行期才炸（W114 差点漏掉 14 个块背衬 .py）；宽 include 收进垃圾
+# 则会被 G20（`scripts/check_wheel_contents.py`）抓住。
 recursive-include src/jikuai/stdlib *.jk *.py *.txt *.json *.md *.bin
 recursive-include src/jikuai/stdlib .gitkeep
+
+# 块自测产物（`数据.存文`/`载入`/`序出` 的 `测试.jk` 会真写文件）。
+# runner 已 chdir 到 tmp_path，正常不会出现在源码树里；这条是兜底，防它们
+# 再一次随包发给用户——v0.24.0 之前真发生过（9 个进了 wheel）。
+global-exclude 临时_测试*.txt
+
 global-exclude *.pyc
 global-exclude __pycache__/*

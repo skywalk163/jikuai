@@ -24,24 +24,24 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# W114（v0.24.0 · ADR-39）：stdlib 是包内资源，必须显式列进 package-data。
-# 这里不用 `include-package-data = true` + MANIFEST.in 的组合，是因为那条
-# 路径把「wheel 里有什么」的真源分散到两个文件；显式白名单更好审。
-# 扩展名白名单而非 `**/*`：明确排除 .pyc（stdlib 下有 .py，会生成 __pycache__）。
-[tool.setuptools.package-data]
-"jikuai" = [
-    "stdlib/*.jk",
-    "stdlib/*.py",
-    "stdlib/*.txt",
-    "stdlib/*.json",
-    "stdlib/*.md",
-    "stdlib/blocks/*.json",
-    "stdlib/blocks/*.bin",
-    "stdlib/blocks/.gitkeep",
-    "stdlib/blocks/**/*.jk",
-    "stdlib/blocks/**/*.json",
-    "stdlib/blocks/**/*.py",
-]
+# W114（v0.24.0 · ADR-39）：**stdlib 进包的真源是 `MANIFEST.in`，不在这里。**
+#
+# 起草时这里放过一份显式 `[tool.setuptools.package-data]` 白名单，注释还写着
+# 「不用 include-package-data + MANIFEST.in 的组合，显式白名单更好审」。
+# 执行期实测把这个前提证伪了：pyproject 配置下 setuptools 的
+# `include_package_data` **默认为 true**，MANIFEST.in 因此同时管着 wheel。
+# 铁证是 9 个 `临时_测试*.txt`（块自测遗留产物）进了 wheel，而白名单里没有
+# 任何模式能匹配它们——那份白名单从来不是过滤器，只是一份让人误判的副本。
+#
+# 于是删掉白名单，认 MANIFEST.in 为唯一真源。这个取舍是刻意的，因为两种机制
+# 的失败模式不对称：
+#   - 白名单（allow-list）漏一个扩展名 → **静默不打包 → 运行期炸**。
+#     W114 差点就这么翻车：`blocks/**/*.py` 那 14 个混合模块背衬没列进去，
+#     而 `圆分`（`财务/保留分/保留分.py`）被 13 个财务块引用，含 `个税`/`增值税`。
+#   - 宽 recursive-include 收进垃圾 → **被 G20 门禁抓住**。
+# 静默功能损坏比被抓住的垃圾危险得多，所以选后者 + 让门禁兜。
+# G20（`scripts/check_wheel_contents.py`）既查该有的在不在，也查不该有的
+# 有没有混进来。
 
 # W25（v0.16.0）：版本号单一真源，避免 pyproject / __init__ / main 三处漂移。
 [tool.setuptools.dynamic]

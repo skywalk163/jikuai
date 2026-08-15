@@ -230,12 +230,15 @@ def main(argv):
     except Exception as e:
         print("G13+ 跳过（%s）" % e)
 
-    # G15：版本号单一真源（W25 · v0.16.0；W60 · v0.18.0 补入扩展 CHANGELOG 第五处）。
-    # `_version.__version__` 是唯一真源；pyproject（dynamic 引用它，解析后应相等）、
-    # 根 CHANGELOG 最新条目、VS Code 扩展 package.json、**VS Code 扩展 CHANGELOG**
-    # 四处投影必须与之一致。历史上 pyproject/__init__/main/扩展四处停在 0.6.0 与
-    # 实际发布 v0.15.0 脱节达九个版本；扩展 CHANGELOG 又在 v0.17/v0.18 连续两轮
-    # 漏更——本门禁防止再次漂移。
+    # G15：版本号单一真源（W25 · v0.16.0；W60 · v0.18.0 补入扩展 CHANGELOG；
+    # W118 · v0.24.0 补入 lsp / dap 两个独立发行包）。
+    # `_version.__version__` 是唯一真源；六处投影必须与之一致：pyproject（dynamic
+    # 引用它，解析后应相等）、根 CHANGELOG 最新条目、VS Code 扩展 package.json、
+    # VS Code 扩展 CHANGELOG、**`lsp/jikuai_lsp/_version.py`**、
+    # **`dap/jikuai_dap/_version.py`**。历史上 pyproject/__init__/main/扩展四处停在
+    # 0.6.0 与实际发布 v0.15.0 脱节达九个版本；扩展 CHANGELOG 又在 v0.17/v0.18
+    # 连续两轮漏更；lsp 的版本号一路停在 0.15.0、dap 停在 0.7.0 直到 v0.24.0 才发现。
+    # 本门禁防止再次漂移。
     problems = _check_version_consistency()
     if problems:
         print("G15 版本号不一致（%d 处）：" % len(problems))
@@ -359,11 +362,30 @@ def _read_vscode_version():
         return json.load(f).get("version")
 
 
-def _check_version_consistency():
-    """比对五处版本号，返回不一致描述列表（空 = 一致）。
+def _read_attr_version(rel_path):
+    """静态读一个 `_version.py` 里的 `__version__ = "x.y.z"` 字面量。
 
-    真源是 `jikuai._version.__version__`；其余五处都只是它的投影。
-    第五处（扩展 CHANGELOG）在 W60 补入，理由见 `_read_vscode_changelog_version`。
+    W118（v0.24.0）：lsp / dap 两个独立发行包各有自己的 `_version.py` 单一真源，
+    与主包同号发布。这里刻意**不** import 它们——构建期不该跨包 import，
+    且 import lsp/dap 会连带跑各自 `__init__.py` 的 `from .server/adapter import main`，
+    把可选依赖（pygls 等）也拽进来。纯 AST/正则静态读，只认字面量。
+    """
+    path = os.path.join(REPO_ROOT, *rel_path)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r'(?m)^__version__\s*=\s*["\']([^"\']+)["\']', text)
+    return m.group(1) if m else None
+
+
+def _check_version_consistency():
+    """比对六处版本号，返回不一致描述列表（空 = 一致）。
+
+    真源是 `jikuai._version.__version__`；下面六处都只是它的投影。
+    第四处（扩展 CHANGELOG）在 W60 补入；第五、六处（lsp / dap 的 `_version.py`）
+    在 W118 补入——三包同仓同步发 PyPI，版本各走各的会让用户没法判断
+    「哪个 lsp/dap 配哪个 jikuai」（lsp 此前停在 0.15.0、dap 停在 0.7.0）。
     """
     problems = []
     try:
@@ -376,6 +398,8 @@ def _check_version_consistency():
         ("CHANGELOG.md 最新条目", _read_changelog_version()),
         ("editors/vscode/package.json", _read_vscode_version()),
         ("editors/vscode/CHANGELOG.md 最新条目", _read_vscode_changelog_version()),
+        ("lsp/jikuai_lsp/_version.py", _read_attr_version(("lsp", "jikuai_lsp", "_version.py"))),
+        ("dap/jikuai_dap/_version.py", _read_attr_version(("dap", "jikuai_dap", "_version.py"))),
     ]
     for 名, 值 in checks:
         if 值 is None:

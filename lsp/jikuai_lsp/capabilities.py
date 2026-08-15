@@ -27,10 +27,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from ._version import __version__
+
 #: 服务端标识。`serverInfo` 与包 `__version__` 共用这一份，避免三处版本各自漂移
 #: （v0.15.0 W13 之前 pyproject=0.5.0 / __init__=0.5.0 / serverInfo=0.6.0 三不一致）。
+#:
+#: W118（v0.24.0）：上面那句「共用这一份」此前**是假的**——它是抄了一遍的字面量，
+#: 一路停在 `'0.15.0'`。W118 把 lsp 的版本真源收到 `._version` 后，这里改成引用它，
+#: 声明才算兑现。别再写回字面量：`serverInfo.version` 是客户端唯一能看到的
+#: 服务端版本，写死了排障时会指向错误的代码版本。
 SERVER_NAME = 'jikuai-lsp'
-SERVER_VERSION = '0.15.0'
+SERVER_VERSION = __version__
 
 # LSP TextDocumentSyncKind：0=None / 1=Full / 2=Incremental
 TEXT_DOCUMENT_SYNC_FULL = 1

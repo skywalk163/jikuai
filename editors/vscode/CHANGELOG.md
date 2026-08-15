@@ -2,6 +2,22 @@
 
 本扩展遵循 [语义化版本](https://semver.org/lang/zh-CN/)，版本号与主包 `jikuai` 对齐。
 
+## [0.24.0] - 2026-08-15
+
+版本号随主包 v0.24.0 对齐。**扩展侧无代码改动** —— 本轮主题是「把 `pip install jikuai`
+从坏的修成能用的」，改动落在打包布局与发布链路，扩展不涉及。
+
+### 与写代码体感相关的变化
+
+- **`pip install jikuai` 现在真的能用了**。此前 PyPI 上的 0.4.1 是坏包（wheel 里零个
+  stdlib 文件，装完 `导入 数学` 直接失败）。装扩展的人不再必须先 clone 仓库 +
+  `pip install -e .`，`pip install jikuai jikuai-lsp` 就够。
+- **`jikuai-lsp` 版本号从 0.15.0 跳到 0.24.0**，与主包同号发布。此前它写死在
+  `lsp/pyproject.toml` 里落后主包八个版本，没法判断「哪个 lsp 配哪个 jikuai」。
+  扩展的 `python.defaultInterpreterPath` 之类配置不受影响。
+- **`stdlib/` 物理位置变了**：从仓库根搬到 `src/jikuai/stdlib/`。从源码开发的人若在
+  设置里硬写过 stdlib 路径要改；也可以用新的 `JIKUAI_STDLIB` 环境变量指过去。
+
 ## [0.23.0] - 2026-08-15
 
 版本号随主包 v0.23.0 对齐。**扩展侧无代码改动** —— 本轮主题是「中文分词从玩具做成

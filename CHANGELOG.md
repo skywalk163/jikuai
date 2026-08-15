@@ -1,5 +1,32 @@
 # 极快 JiKuai · 变更日志
 
+## v0.24.0（2026-08-15）· 把 `pip install jikuai` 从坏的修成能用的
+
+> WBS 见 `docs/路线图-v0.24.md`（§六有实施结果）；方案见 `docs/ADR-39-stdlib包内资源.md`。
+
+> **单主轴版本。** 这一版只做一件事：让 `pip install jikuai` 在干净 venv、非 editable 下**真的能用**。此前 PyPI 上的 0.4.1 是坏包——wheel 里零个 stdlib 文件，装完 `导入 数学` 直接退出码 1，而本机 editable 一切正常，谁都没发现。根因见 BACKLOG §10。
+
+### Breaking Change（先看这段）
+
+1. **`stdlib/` 从仓库根搬进 `src/jikuai/stdlib/`，成为包内资源**（W114 · ADR-39）。它现在随 wheel/sdist 发行。定位入口收敛到唯一的 `jikuai.resources`——`stdlib_dir()` / `blocks_dir()` / `stdlib_path()`。此前散落在 6 处各写各的 `__file__` 相对回溯全部改道到这里。任何新增的 `__file__` 回溯定位 stdlib 视为违约。
+2. **新增环境变量 `JIKUAI_STDLIB`**：指向一个已存在的目录即可覆盖 stdlib 根（从源码开发、或指向自定义 stdlib 时用）；值无效则静默回落包内默认值。
+3. **推翻 ADR-16 §3.4 的 data-files 裁决**（ADR-39 §2）。原方案把 stdlib 装到 `sys.prefix`，与从 `site-packages/jikuai/` 上溯定位对不上，从来没成立过。
+
+### M30 · stdlib 进包 + 单一定位入口（W113-W115 · ADR-39）
+
+- **W113**：新增 `src/jikuai/resources.py`（唯一定位口 + `JIKUAI_STDLIB` 覆盖口，只依赖标准库、无全局可变状态）。
+- **W114**：`git mv` 搬 stdlib 进包，`MANIFEST.in` 成为「什么随包发」的单一真源（`include_package_data` 默认 true，package-data 白名单反而不是实际过滤器——实测 9 个 `临时_测试*.txt` 曾随包发出）。清掉 9 个随包的测试产物。
+- **W115**：6 处定位点收敛到 `resources`；块自测 chdir 到 tmp 根治源码树污染，顺带修 4 处硬编码旧布局的自测。
+
+### M31 · 门禁 + 真机验收（W116-W117）
+
+- **W116 · G20 wheel 内容门禁**（`scripts/check_wheel_contents.py`）：真构建 wheel 再解包断言——具名资源在、无 `.pyc`/`__pycache__` 泄漏、无 `临时_测试*` 随包、块 json 数在 [112,500]、**块背衬 `.py` 精确 14 个**（漏了 `圆分` 等旗舰财务块运行期炸，原验收线会全绿——这是本门禁的核心理由）。刻意不进静态门禁主流程（要跑 build，慢两个数量级），由 `check_stdlib_contract.py` 末尾提示单独跑。
+- **W117 · 干净 venv 真机验收**（`scripts/verify_wheel_e2e.ps1`）：全新 venv、`--no-deps` 装本地 wheel，跑通 hello / 分词（`个人所得税` 整词切出，证明词典真随包）/ 选块 / 包管理，并断言 stdlib 落在 site-packages 而非回落源码树、`JIKUAI_STDLIB` 覆盖生效。这是唯一能抓住「editable 假绿」的一步。
+
+### M32 · 三包对齐 + 发布（W118-W120）
+
+- **W118 · 三包版号对齐 0.24.0**：`jikuai-lsp` 此前写死 0.15.0（落后八个版本）、`jikuai-dap` 写死 0.7.0，各走各的。两者改用 `_version.py` 单一真源 + `pyproject` dynamic version，并钉依赖下界 `jikuai>=0.24.0`（PyPI 上 0.4.1 及更早是坏包，无下界时解析器可能拽回来，与 yank 构成双保险）。**G15 版本投影从 4 处扩到 6 处**。
+
 ## v0.23.0（2026-08-15）· 中文分词从玩具做成能用的
 
 > WBS 见 `docs/路线图-v0.23.md`（§六有实施结果）；方案见 `docs/ADR-38-中文分词词典.md`。

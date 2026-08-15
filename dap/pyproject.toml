@@ -1,6 +1,6 @@
 [project]
 name = "jikuai-dap"
-version = "0.7.0"
+dynamic = ["version"]
 description = "极快语言 DAP 适配器 - Debug Adapter Protocol MVP（M6-P3 · ADR-20）"
 readme = "README.md"
 license = "MIT"
@@ -9,8 +9,11 @@ authors = [
     {name = "skywalk163"}
 ]
 keywords = ["jikuai", "dap", "debug-adapter", "中文编程"]
+# W118（v0.24.0）：**必须钉下界**。PyPI 上 0.4.1 及更早的 jikuai 是坏包
+# （wheel 里零个 stdlib，装完 `导入 数学` 即失败，见 BACKLOG §10）。
+# 无下界时解析器可能把它拽回来，与 yank 构成双保险。
 dependencies = [
-    "jikuai",
+    "jikuai>=0.24.0",
 ]
 
 [project.optional-dependencies]
@@ -25,3 +28,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["jikuai_dap*"]
+
+# W118：版本接本包单一真源 `_version.py`，不再手写字面量（此前写死 0.7.0，
+# 落后主包十六个版本）。attr 靠静态 AST 分析读，不 import 本包。
+[tool.setuptools.dynamic]
+version = {attr = "jikuai_dap._version.__version__"}

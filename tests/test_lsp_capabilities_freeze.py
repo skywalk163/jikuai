@@ -128,3 +128,24 @@ def test_execute_command_declares_select_block():
     cmds = SERVER_CAPABILITIES['executeCommandProvider']['commands']
     assert COMMAND_SELECT_BLOCK in cmds
     assert COMMAND_SELECT_BLOCK == '极快.选块'
+
+
+def test_serverinfo版本不是写死的字面量():
+    """W118（v0.24.0）：`serverInfo.version` 必须等于包版本。
+
+    `capabilities.py` 的注释从 v0.15.0 起就声称「`serverInfo` 与包
+    `__version__` 共用这一份」，但它其实是**抄了一遍的字面量**，一路停在
+    `'0.15.0'` ——注释说的事根本没发生。W118 把它改成引用 `._version`，
+    这条测试是那个声明的执行体：`serverInfo.version` 是客户端唯一能看到的
+    服务端版本，写死了排障时会指向错误的代码版本。
+    """
+    import jikuai_lsp
+    from jikuai_lsp.capabilities import SERVER_VERSION
+    assert SERVER_VERSION == jikuai_lsp.__version__
+
+
+def test_lsp包版本与主包同号():
+    """三包同仓同步发（W118）。lsp 此前停在 0.15.0，落后主包八个版本。"""
+    import jikuai
+    import jikuai_lsp
+    assert jikuai_lsp.__version__ == jikuai.__version__

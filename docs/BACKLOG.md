@@ -206,7 +206,74 @@
 
 ---
 
+## 10. 分发：`stdlib/` 整个目录不进 wheel/sdist（既有缺口，有到期日）
+
+来源：v0.23.0 M29 挂账段（`docs/路线图-v0.23.md` §六）+ 2026-08-15 查证。
+
+| 条目 | 来源 | 优先级 | 目标版本 |
+|------|------|--------|----------|
+| `stdlib/` 全目录（约 1.07 MB / 381 文件，含 `分词词典.txt` 534 KB、`向量索引.bin` 169 KB、224 个块 `.jk`、112 个块元数据 `.json`）**不在 wheel 也不在 sdist**。`pyproject.toml` 只有 `packages.find where=["src"]`，无 `package-data` / `include-package-data` / `data-files`，仓库无 `MANIFEST.in`；`egg-info/SOURCES.txt` 实证零个 `stdlib/` 文件。运行时全靠 7 处 `__file__` 相对回溯，**只在 `pip install -e .` 下成立** | `docs/路线图-v0.23.md` §六、`docs/ADR-16-标准库契约.md` §3.4 | 中（**触发式**） | 待定 —— **首次发 PyPI / 首次分发非 editable wheel 之前必须做** |
+
+### 为什么现在没炸
+
+分发渠道实际是 git clone + `pip install -e .`（`README.md` §安装与使用），源码树在原地，
+回溯自然命中。`.vsix` 也不含 stdlib（解包 `jikuai-vscode-0.20.0.vsix` 只有 8 个条目：
+语法高亮 + LSP/DAP 客户端胶水），但那是**设计如此**——扩展不带 Python 运行时，
+靠用户侧 `pip install -e` 补齐，`editors/vscode/build.ps1` 明确这么写。
+
+**到期日信号**：`.env.example` 里已有 `TWINE_USERNAME` / `TWINE_PASSWORD`（PyPI token）。
+一旦真发 PyPI，这条立刻从「无影响」变成「装完就不能用」。
+
+### ADR-16 的原计划不能照做（重要）
+
+`docs/ADR-16-标准库契约.md` §3.4 写的是「`stdlib/` 固定仓库根不可移动 + 以 data-files
+声明，安装时复制到 site-packages 对应位置」（原始裁决见 `summaries/软件开发团队/
+20260808-055145.md` 追加条款③）。**这个方案本身不成立**，也是它三个版本没落地的真实原因：
+setuptools 的 `data_files` 在 wheel 里装到 `sys.prefix` 相对位置，而代码是从
+`site-packages/jikuai/` 往上回溯 2–3 级——两者在任何平台上都对不上。
+所以这不是「忘了加一行声明」，是**方案要重做**。
+
+### 修的时候要动什么（7 处运行时定位点 / 5 个文件）
+
+上溯 2 级（文件在 `src/jikuai/`）：
+- `src/jikuai/module_loader.py:147`（`_search_paths` 的 `.jk` 兜底搜索路径）
+- `src/jikuai/stdlib_contract.py:21`（`default_stdlib_dir`）
+- `src/jikuai/evaluator.py:1644`（stdlib `.py` 实现加载）
+
+上溯 3 级（文件在 `src/jikuai/pkg/` 或 `src/jikuai/ai/`）：
+- `src/jikuai/pkg/blocks.py:307`（`blocks_root`）
+- `src/jikuai/pkg/blocks_cli.py:186`（`_repo_root`）
+- `src/jikuai/ai/retrieval.py:133`（`vector_index_path` → `向量索引.bin`）
+- `src/jikuai/ai/retrieval.py:675`（`_load_builtin_blocks` → `索引.json`）
+
+连带面：
+- `src/jikuai/ai/embed_client.py:57` 回溯 `tools/ai-bridge/embed_query.py`。**这一处已按缺口设计**
+  ——注释自述「pip 安装场景 `tools/` 不随包发布，此文件不存在，那正是降级到启发式该覆盖的情况」，
+  即 `tools/` 明确不入包，不要顺手一起搬。
+- `scripts/` 下 7 处 `__file__` 回溯只用于把 `src/` 塞进 `sys.path` 或定位 `docs/`，
+  只在源码仓库跑，**不随 wheel 走，不用改**。
+
+**当前没有任何环境变量能覆盖 stdlib 根**（全仓无 `JIKUAI_STDLIB` 之类）。
+`JIKUAI_PATH`（`module_loader.py:150`）与 `JIKUAI_PKG_ROOTS`（`pkg/blocks.py:155`）都是
+**追加**额外搜索路径，改不了内置根。
+
+### 建议的修法与验收（真做时再细化，别现在动）
+
+1. `stdlib/` 收进包内（`src/jikuai/stdlib/`）+ `[tool.setuptools.package-data]`，
+   定位统一收敛到 `importlib.resources` 的**单一入口**，替掉 7 处各写各的回溯
+2. 补一个 `JIKUAI_STDLIB` 环境变量覆盖口（开发/装包两种场景都好接管）
+3. **这会推翻 ADR-16 §3.4 的「不可移动」裁决与 D-05，必须另立 ADR 说明**
+4. 验收必须是**干净 venv 装构建出的 wheel（非 editable），跑 `jk` + `分词`**
+   ——ADR-16 与 v0.23.0 W112 一直缺的就是这一步真机验证
+5. 顺手加一条构建后门禁：断言 wheel 内含 `分词词典.txt` 与 `向量索引.bin`
+
+`stdlib/分词.py` 的「词典文件缺失即抛 `RuntimeError`，不静默降级」就是为这类发布事故
+留的兜底——它会让事故在启动时爆掉，而不是线上悄悄劣化。
+
+---
+
 ## 相关文档
+
 
 - v0.14→v0.15 复盘：[`v0.14-v0.15-复盘.md`](v0.14-v0.15-复盘.md)
 - L3 聚合块规范：[`ADR-28-L3聚合块规范.md`](ADR-28-L3聚合块规范.md)

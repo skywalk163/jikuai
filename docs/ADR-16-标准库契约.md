@@ -88,6 +88,14 @@
 
 分发方案：`pyproject.toml` 以 data files 方式声明 `stdlib/` 目录，安装时复制到 site-packages 对应位置，**不移动源码仓库中的目录结构**。
 
+> **2026-08-15 更正：本段分发方案从未落地，且方案本身不成立。** `pyproject.toml` 里
+> 没有任何 data-files / package-data 声明，`stdlib/` 整个目录一直不进 wheel/sdist，
+> 项目靠 `pip install -e .` 工作。更关键的是 setuptools 的 `data_files` 装到
+> `sys.prefix` 相对位置，与本节「从 `src/jikuai/` 上溯两级」的回溯定位**对不上**——
+> 所以这不是「忘了加声明」，是方案要重做。真修时须另立 ADR 推翻本节「不可移动」裁决
+> 与 D-05（大概率把 `stdlib/` 收进 `src/jikuai/` 包内 + `importlib.resources` 定位）。
+> 完整口径见 `docs/BACKLOG.md` §10。
+
 ### 3.5 静态契约校验
 
 新增脚本 `scripts/check_stdlib_contract.py`：

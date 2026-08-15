@@ -144,9 +144,9 @@ class ModuleLoader:
             # 可被内置块遮蔽，与发现侧「内置优先」一致。
             for parent in self._block_root_parents(pkg_dir):
                 paths.append(parent)
-        here = os.path.dirname(os.path.abspath(__file__))
-        stdlib_dir = os.path.normpath(os.path.join(here, '..', '..', 'stdlib'))
-        paths.append(stdlib_dir)
+        # W115（v0.24.0 · ADR-39）：stdlib 是包内资源，定位收敛到 resources。
+        from . import resources
+        paths.append(resources.stdlib_dir())
         env_path = os.environ.get('JIKUAI_PATH', '')
         if env_path:
             for p in env_path.split(os.pathsep):

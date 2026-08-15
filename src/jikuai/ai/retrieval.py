@@ -129,10 +129,12 @@ class VectorIndex:
 
 
 def vector_index_path() -> str:
-    """返回 `stdlib/blocks/向量索引.bin` 的绝对路径。"""
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.normpath(os.path.join(here, '..', '..', '..'))
-    return os.path.join(repo_root, 'stdlib', 'blocks', '向量索引.bin')
+    """返回 `stdlib/blocks/向量索引.bin` 的绝对路径。
+
+    W115（v0.24.0 · ADR-39）：定位收敛到 `resources`，不再回溯到仓库根。
+    """
+    from .. import resources
+    return resources.stdlib_path('blocks', '向量索引.bin')
 
 
 def load_vector_index(path: Optional[str] = None) -> Optional[VectorIndex]:
@@ -672,13 +674,12 @@ _cached_retriever: Optional[Retriever] = None
 
 def _load_builtin_blocks() -> List[dict]:
     """加载 `stdlib/blocks/索引.json` 的内置块列表。"""
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.normpath(os.path.join(here, '..', '..', '..'))
-    idx_path = os.path.join(repo_root, 'stdlib', 'blocks', '索引.json')
+    from .. import resources
+    idx_path = resources.stdlib_path('blocks', '索引.json')
     if not os.path.isfile(idx_path):
         _log.warning(
             '块索引未找到：%s——内置块检索将为空。'
-            '若包被搬到非仓库布局，请设 JIKUAI_PATH 或显式传入 blocks 列表。',
+            '若 stdlib 不在包内默认位置，请设 JIKUAI_STDLIB 或显式传入 blocks 列表。',
             idx_path)
         return []
     with open(idx_path, 'r', encoding='utf-8') as f:

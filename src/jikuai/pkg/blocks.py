@@ -301,12 +301,11 @@ class BlockMetadata:
 def blocks_root() -> str:
     """返回内置 `stdlib/blocks/` 的绝对路径。
 
-    定位方式与 `module_loader._search_paths()` 找 stdlib 的方式保持一致：
-    从本文件位置上溯到仓库根（`src/jikuai/pkg` → 上三级）。
+    W115（v0.24.0 · ADR-39）：定位收敛到 `resources.blocks_dir()`。原实现是
+    从 `src/jikuai/pkg` 上溯三级到仓库根，只在 `pip install -e .` 下成立。
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.normpath(os.path.join(here, '..', '..', '..'))
-    return os.path.join(repo_root, 'stdlib', 'blocks')
+    from .. import resources
+    return resources.blocks_dir()
 
 
 def extra_roots() -> List[str]:

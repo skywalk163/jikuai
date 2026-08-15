@@ -1640,10 +1640,9 @@ def _load_stdlib_module(name):
     if name in _STDLIB_CACHE:
         return _STDLIB_CACHE[name]
     import importlib.util
-    # stdlib 目录：src/jikuai/../../stdlib
-    here = os.path.dirname(os.path.abspath(__file__))
-    stdlib_dir = os.path.join(here, '..', '..', 'stdlib')
-    path = os.path.normpath(os.path.join(stdlib_dir, f'{name}.py'))
+    # W115（v0.24.0 · ADR-39）：stdlib 是包内资源，定位收敛到 resources。
+    from . import resources
+    path = resources.stdlib_path(f'{name}.py')
     spec = importlib.util.spec_from_file_location(f'jikuai_stdlib_{name}', path)
     if spec is None or spec.loader is None:
         raise JiKuaiError(f"无法加载标准库模块：{name}")

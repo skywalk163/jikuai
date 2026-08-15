@@ -14,12 +14,14 @@ from typing import Optional
 
 
 def default_stdlib_dir() -> str:
-    """返回仓库根 stdlib/ 绝对路径。
+    """返回包内 stdlib/ 绝对路径。
 
-    与 module_loader._search_paths 同一算法：从 src/jikuai/ 上溯两级。
+    W115（v0.24.0 · ADR-39）：改由 `resources.stdlib_dir()` 统一定位，不再
+    自己回溯 `__file__`。原实现是「从 src/jikuai/ 上溯两级到仓库根」，只在
+    `pip install -e .` 下成立。
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(here, '..', '..', 'stdlib'))
+    from . import resources
+    return resources.stdlib_dir()
 
 
 def parse_exports(jk_source: str) -> set:

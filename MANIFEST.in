@@ -1,0 +1,6 @@
+# W114（v0.24.0 · ADR-39）：sdist 也必须带 stdlib。
+# package-data 管 wheel；sdist 的收录规则不同，显式再声明一次。
+recursive-include src/jikuai/stdlib *.jk *.py *.txt *.json *.md *.bin
+recursive-include src/jikuai/stdlib .gitkeep
+global-exclude *.pyc
+global-exclude __pycache__/*

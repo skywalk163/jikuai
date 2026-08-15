@@ -24,6 +24,25 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# W114（v0.24.0 · ADR-39）：stdlib 是包内资源，必须显式列进 package-data。
+# 这里不用 `include-package-data = true` + MANIFEST.in 的组合，是因为那条
+# 路径把「wheel 里有什么」的真源分散到两个文件；显式白名单更好审。
+# 扩展名白名单而非 `**/*`：明确排除 .pyc（stdlib 下有 .py，会生成 __pycache__）。
+[tool.setuptools.package-data]
+"jikuai" = [
+    "stdlib/*.jk",
+    "stdlib/*.py",
+    "stdlib/*.txt",
+    "stdlib/*.json",
+    "stdlib/*.md",
+    "stdlib/blocks/*.json",
+    "stdlib/blocks/*.bin",
+    "stdlib/blocks/.gitkeep",
+    "stdlib/blocks/**/*.jk",
+    "stdlib/blocks/**/*.json",
+    "stdlib/blocks/**/*.py",
+]
+
 # W25（v0.16.0）：版本号单一真源，避免 pyproject / __init__ / main 三处漂移。
 [tool.setuptools.dynamic]
 version = {attr = "jikuai._version.__version__"}

@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import struct
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -161,6 +162,15 @@ def load_vector_index(path: Optional[str] = None) -> Optional[VectorIndex]:
                 raw = f.read(dim * 2)
                 vec = array.array('h')
                 vec.frombytes(raw)
+                # W119 · v0.24.0：向量载荷此前用 `array.frombytes` 直接吃字节，也就是
+                # **原生字节序**，而文件头一直是显式小端（'<HH' / '<I' / '<ff' / '<H'）——
+                # 格式自己跟自己不一致。仓库里提交的 `向量索引.bin` 是在 x86（小端）上
+                # 生成的，而 jikuai 发的是 `py3-none-any` wheel，装到大端平台（s390x 等）
+                # 上时 int16 会被逐个字节翻转：**不抛任何异常，只是余弦相似度全部算错，
+                # 静默返回错误的检索结果**。格式口径现定为「全小端」（头部已是小端，载荷
+                # 跟上），所以在大端机器上读完要翻回来。
+                if sys.byteorder == 'big':
+                    vec.byteswap()
                 names.append(name)
                 vectors.append(vec)
 

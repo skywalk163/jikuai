@@ -78,6 +78,16 @@
 
 ### 3.4 `stdlib/` 物理位置
 
+> **本节已于 v0.24.0 被 [ADR-39](ADR-39-stdlib包内资源.md) 推翻。**
+>
+> 「不可移动」这条约束与 data-files 分发方案**都不成立**，且后者从未落地过。
+> 现行裁决：`stdlib/` 是**包内资源**，位于 `src/jikuai/stdlib/`，随 wheel/sdist 发行；
+> 定位收敛到唯一入口 `jikuai.resources`（`stdlib_dir()` / `blocks_dir()` /
+> `stdlib_path()`），覆盖口是 `JIKUAI_STDLIB`。
+>
+> **原文保留不删** —— 决策史要留痕，且它解释了为什么这条缺口挂了三个版本没人碰。
+> 下面的内容描述的是 v0.23.0 及以前的状态，**不要照它建立前提**。
+
 **`stdlib/` 固定在仓库根目录，不可移动。**
 
 理由：
@@ -95,6 +105,13 @@
 > 所以这不是「忘了加声明」，是方案要重做。真修时须另立 ADR 推翻本节「不可移动」裁决
 > 与 D-05（大概率把 `stdlib/` 收进 `src/jikuai/` 包内 + `importlib.resources` 定位）。
 > 完整口径见 `docs/BACKLOG.md` §10。
+>
+> **2026-08-15 追记（v0.24.0 落地后）**：上面这段预判对了「收进包内」，但
+> **`importlib.resources` 这一半被证伪** —— 所有消费方要的是真实文件系统目录路径
+> （搜索路径追加 / `spec_from_file_location` / `os.walk` / `open`），
+> 而 `importlib.resources` 只保证「可读的字节流」，拿真实路径要走 `as_file()`
+> 上下文管理器且出了上下文即删。本项目本来就不可能 zip-safe，
+> 用 `os.path.dirname(__file__)` 直接算目录更诚实。理由见 ADR-39 §3。
 
 ### 3.5 静态契约校验
 

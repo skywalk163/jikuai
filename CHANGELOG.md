@@ -3,6 +3,8 @@
 ## v0.24.0（2026-08-15）· 把 `pip install jikuai` 从坏的修成能用的
 
 > WBS 见 `docs/路线图-v0.24.md`（§六有实施结果）；方案见 `docs/ADR-39-stdlib包内资源.md`。
+> 全量回归 **2595 passed / 88 skipped**（88 条 skip 是需 C 编译器的 AOT 编译-运行比对，本机无编译器）。契约门禁 **G10-G19 全绿**（`scripts/check_stdlib_contract.py` exit 0）；**G20 wheel 内容门禁**单独跑，430 条条目全绿。
+
 
 > **单主轴版本。** 这一版只做一件事：让 `pip install jikuai` 在干净 venv、非 editable 下**真的能用**。此前 PyPI 上的 0.4.1 是坏包——wheel 里零个 stdlib 文件，装完 `导入 数学` 直接退出码 1，而本机 editable 一切正常，谁都没发现。根因见 BACKLOG §10。
 
@@ -26,6 +28,9 @@
 ### M32 · 三包对齐 + 发布（W118-W120）
 
 - **W118 · 三包版号对齐 0.24.0**：`jikuai-lsp` 此前写死 0.15.0（落后八个版本）、`jikuai-dap` 写死 0.7.0，各走各的。两者改用 `_version.py` 单一真源 + `pyproject` dynamic version，并钉依赖下界 `jikuai>=0.24.0`（PyPI 上 0.4.1 及更早是坏包，无下界时解析器可能拽回来，与 yank 构成双保险）。**G15 版本投影从 4 处扩到 6 处**。
+- **W119 · 文档结账**：立 `docs/ADR-39-stdlib包内资源.md`（推翻 ADR-16 §3.4 的 data-files 裁决）、BACKLOG §10 结账、README 安装段与项目结构树改到包内布局、新增 `docs/路线图-v0.24.md`。
+- **W119 · 修 `向量索引.bin` 字节序不自洽**（查证时撞见的仓库级缺陷，不是本版引入）：文件头一直是显式小端（`struct('<...')`），而向量载荷写侧用 numpy `.tobytes()`、读侧用 `array.array('h').frombytes()`——都是**原生字节序**。仓库里那份 bin 生成于 x86，而发的是 `py3-none-any` wheel：装到大端平台（s390x 等）时 int16 会被逐字节翻转，**不抛异常，只是余弦打分全错、静默返回错误的检索结果**。格式口径现定为「全小端」：读侧 `sys.byteorder == 'big'` 时补 `array.byteswap()`；写侧改 `astype('<i2').tobytes()`——在小端机器上是纯 no-op，产出字节与改前逐字节一致，**不触碰 G12 哈希门禁、不需重跑 embeddings**。补三条测试：小端解析、monkeypatch 强制大端分支证明 `byteswap` 真被调用、真实 bin 仍可加载。真机大端验证挂在 W120。
+
 
 ## v0.23.0（2026-08-15）· 中文分词从玩具做成能用的
 

@@ -134,7 +134,14 @@ def _write_index(path: str, names: List[str], quantized: 'numpy.ndarray',
             name_bytes = name.encode('utf-8')
             f.write(struct.pack('<H', len(name_bytes)))
             f.write(name_bytes)
-            f.write(quantized[i].tobytes())
+            # W119 · v0.24.0：此前 `quantized[i].tobytes()` 用 numpy 的**原生字节序**
+            # 写出 int16 载荷，而文件头一直用显式小端（'<HH' / '<I' / '<ff' / '<H'）——
+            # 格式自己跟自己不一致。发布走 `py3-none-any` wheel，装到大端平台（s390x 等）
+            # 上读取时 int16 会被逐字节翻转，**不抛异常，只是余弦相似度全部算错**。
+            # 格式口径现定为「全小端」，写侧显式转成小端。`astype('<i2')` 在小端机器上是
+            # 纯 no-op（字节序已经是小端），产出的字节与改动前逐字节完全一致，因此不会
+            # 触碰 G12 向量索引哈希门禁、也不需要重跑 embeddings。
+            f.write(quantized[i].astype('<i2').tobytes())
     size_kb = os.path.getsize(path) / 1024
     print(f'写入 {path} ({size_kb:.1f} KB, {count} 块, {dim} 维)')
 

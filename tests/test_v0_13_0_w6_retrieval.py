@@ -117,7 +117,12 @@ def test_结果按分数降序(样例块):
 # ---------------------------------------------------------------------------
 
 def _write_test_index(path, names, vectors, dim, qmin=-1.0, qmax=1.0):
-    """按 ADR-25 §4 格式写一个测试索引。vectors 是 int16 二维列表。"""
+    """按 ADR-25 §4 格式写一个测试索引。vectors 是 int16 二维列表。
+
+    W119 · v0.24.0：载荷用 `struct.pack('<%dh')` 显式小端写出（原先是
+    `array.array('h').tobytes()`，即原生字节序）。格式口径是「全小端」，
+    测试夹具必须跟着，否则这些用例在大端平台上会假红。
+    """
     with open(path, 'wb') as f:
         f.write(MAGIC)
         f.write(struct.pack('<HH', 1, dim))
@@ -127,7 +132,8 @@ def _write_test_index(path, names, vectors, dim, qmin=-1.0, qmax=1.0):
             nb = name.encode('utf-8')
             f.write(struct.pack('<H', len(nb)))
             f.write(nb)
-            f.write(array.array('h', vec).tobytes())
+            f.write(struct.pack('<%dh' % len(vec), *vec))
+
 
 
 def test_向量索引_读写往返(tmp_path):
@@ -161,6 +167,76 @@ def test_向量索引_版本不兼容返回None(tmp_path):
     with open(p, 'wb') as f:
         f.write(MAGIC + struct.pack('<HH', 99, 4))
     assert load_vector_index(p) is None
+
+
+# ---------------------------------------------------------------------------
+# 字节序（W119 · v0.24.0）
+#
+# 载荷此前用 `array.array('h').frombytes()` 读，即**原生字节序**，与一直是显式
+# 小端的文件头不自洽。仓库里的 `向量索引.bin` 生成于 x86（小端），而发的是
+# `py3-none-any` wheel，装到大端平台（s390x 等）上读会把 int16 逐字节翻转：
+# 不抛异常，只是余弦打分全错。格式口径现定为「全小端」，读侧在大端机器上补
+# `array.byteswap()`。
+# ---------------------------------------------------------------------------
+
+#: 挑这几个值是为了让「翻转」肉眼可辨：0x0001↔0x0100 = 1↔256，0x0002↔0x0200 = 2↔512。
+_小端原值 = [1, 2, 256, 258]
+_逐字节翻转后 = [256, 512, 1, 513]
+
+
+def test_向量索引_载荷按小端解析(tmp_path):
+    """小端字节流的载荷必须被解析成原值——在任何字节序的平台上都成立。
+
+    夹具用 `struct.pack('<4h')` 保证写出的是小端字节，不依赖本机字节序。
+    """
+    p = str(tmp_path / '小端.bin')
+    _write_test_index(p, ['求和'], [_小端原值], dim=4)
+
+    vi = load_vector_index(p)
+    assert vi is not None
+    assert list(vi.vectors[0]) == _小端原值
+
+
+def test_向量索引_大端平台上翻转字节(tmp_path, monkeypatch):
+    """强制走大端分支，证明 `byteswap()` 真的被调用了。
+
+    本机是小端，`sys.byteorder == 'big'` 分支自然跑不到，所以直接 monkeypatch
+    `sys.byteorder`——`retrieval` 里是 `import sys` 后动态取属性，patch 模块属性
+    就能改变分支走向。小端机器上强行按大端解释一段小端字节流，读出的必然是逐字节
+    翻转后的值；若哪天有人把 byteswap 删掉，这条会当场红。
+    """
+    p = str(tmp_path / '小端.bin')
+    _write_test_index(p, ['求和'], [_小端原值], dim=4)
+
+    真实字节序 = sys.byteorder
+    monkeypatch.setattr(sys, 'byteorder', 'big')
+    vi = load_vector_index(p)
+    assert vi is not None
+    if 真实字节序 == 'little':
+        # patch 让小端机器走了大端分支：正确值被 byteswap 翻坏，正好证明分支生效。
+        assert list(vi.vectors[0]) == _逐字节翻转后
+        assert list(vi.vectors[0]) != _小端原值
+    else:
+        # 本机就是大端，这个分支本来就该走；结果应该是正确值。
+        assert list(vi.vectors[0]) == _小端原值
+
+
+def test_向量索引_真实bin仍可加载():
+    """回归保护：改了字节序处理之后，仓库里那份真实索引仍要能正常读出来。"""
+    p = retrieval.vector_index_path()
+    if not os.path.isfile(p):
+        pytest.skip('本环境没有 向量索引.bin（运行时允许降级启发式）')
+    vi = load_vector_index(p)
+    assert vi is not None
+    assert vi.version == retrieval.FORMAT_VERSION
+    assert vi.count == len(vi.names) == len(vi.vectors)
+    assert vi.count > 0
+    assert vi.dim > 0
+    assert all(len(v) == vi.dim for v in vi.vectors)
+    assert vi.qmin < vi.qmax
+    # 量化值不能全是 0——真读出了内容，而不是一堆空 array。
+    assert any(x != 0 for x in vi.vectors[0])
+
 
 
 # ---------------------------------------------------------------------------

@@ -250,18 +250,30 @@ jk examples/scenarios/管道数据清洗.jk
 ## 安装与使用
 
 ```bash
-cd G:\jikuai
-pip install -e .
+pip install jikuai
 jk examples/hello.jk
 jk              # 进入 REPL
 ```
+
+`pip install jikuai jikuai-lsp jikuai-dap` 一并装上编辑器语言服务与调试适配器。
+
+### 从源码开发
+
+```bash
+cd G:\jikuai
+pip install -e .
+jk examples/hello.jk
+```
+
+从源码开发时 `stdlib/` 在 `src/jikuai/stdlib/`，随包发行；也可用环境变量
+`JIKUAI_STDLIB` 指向自定义 stdlib 根（值须是已存在目录，否则回落包内默认值）。
 
 ### 三种等价入口
 
 以下三种方式完全一致，均归一到 `jikuai.main:main`：
 
 ```bash
-jk examples/hello.jk           # pip install -e . 后可用
+jk examples/hello.jk           # pip install jikuai（或 -e .）后可用
 python -m jikuai examples/hello.jk   # 无需安装，只要 PYTHONPATH 含 src/
 python -m jikuai.main examples/hello.jk   # 不推荐：会打印 runpy RuntimeWarning
 ```
@@ -286,6 +298,8 @@ jk 块 跑 方案.json --json        # 执行，出 {源码, 执行结果:{stdou
 
 **LSP** —— 编辑器语言服务（stdio JSON-RPC，零第三方依赖）：
 ```powershell
+pip install jikuai-lsp                # 装包用法（与主包同号发布）
+# 或从源码：
 $env:PYTHONPATH = "src;lsp"       # 或先 pip install -e . 与 lsp/
 python -m jikuai_lsp               # completion/hover/definition/documentSymbol/
                                    # signatureHelp/references/rename/极快.选块
@@ -320,10 +334,11 @@ jikuai/
 │   ├── diagnostics/          # 诊断内核（ADR-14，唯一真源）
 │   ├── service/              # 三通道服务层（schema/session/position）
 │   ├── ai/                   # 语义选块检索（纯标准库，ADR-25）
-│   └── pkg/                  # 块生态 + 包管理（jk 块 / jk 包）
-├── stdlib/                   # 标准库
-│   ├── blocks/               # 块生态（108 块 · 索引.json + 向量索引.bin）
-│   └── *.jk / *.py           # 分词/排版/校验/成语/正则/简繁/历法/工具
+│   ├── pkg/                  # 块生态 + 包管理（jk 块 / jk 包）
+│   ├── resources.py          # 标准库定位唯一入口（ADR-39）
+│   └── stdlib/               # 标准库（包内资源，随 wheel 发行 · ADR-39）
+│       ├── blocks/           # 块生态（112 块 · 索引.json + 向量索引.bin）
+│       └── *.jk / *.py       # 分词/排版/校验/成语/正则/简繁/历法/工具
 ├── lsp/                      # Language Server（独立发行包，零依赖）
 │   └── jikuai_lsp/           # server/capabilities/transport
 ├── dap/                      # Debug Adapter（独立发行包）

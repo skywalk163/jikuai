@@ -1,0 +1,3 @@
+# 上游词典源缓存（不入仓）
+# 由 tools/dict/重生成词典.py 下载填充；raw.githubusercontent 偶发超时，脚本带 retry。
+*.txt

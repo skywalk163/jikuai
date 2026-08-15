@@ -1,0 +1,40 @@
+{
+  "说明": "由 tools/dict/重生成词典.py 生成，勿手改。见 docs/ADR-38-中文分词词典.md。",
+  "算法": "正向最大匹配（FMM）",
+  "词长范围": [
+    2,
+    8
+  ],
+  "词条数": 58713,
+  "sha256": "5205f8393c897df4620df764ffd99392bb3112b9292fe25c22ec19722328c904",
+  "组成": {
+    "种子": 565,
+    "jieba底座": 50000,
+    "THUOCL_caijing": 3771,
+    "THUOCL_law": 6226,
+    "topn": 50000
+  },
+  "上游源": [
+    {
+      "名称": "jieba",
+      "url": "https://raw.githubusercontent.com/fxsjy/jieba/master/jieba/dict.txt",
+      "license": "MIT",
+      "版权": "Copyright (c) 2013 Sun Junyi",
+      "取用规则": "按第二列词频降序取 top N（本次 N 见 组成.topn）"
+    },
+    {
+      "名称": "THUOCL_caijing",
+      "url": "https://raw.githubusercontent.com/thunlp/THUOCL/master/data/THUOCL_caijing.txt",
+      "license": "MIT",
+      "版权": "Copyright (c) 2018 THUNLP",
+      "取用规则": "全量过滤后取"
+    },
+    {
+      "名称": "THUOCL_law",
+      "url": "https://raw.githubusercontent.com/thunlp/THUOCL/master/data/THUOCL_law.txt",
+      "license": "MIT",
+      "版权": "Copyright (c) 2018 THUNLP",
+      "取用规则": "全量过滤后取"
+    }
+  ]
+}

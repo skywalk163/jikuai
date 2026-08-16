@@ -41,10 +41,17 @@ Google Cloud 等几个身份提供方），所以「不再存长效 token」那�
   而调低**。
 - **W123 · tag 触发发版流水线（半自动，刻意不上传）**：新增 `.gitea/workflows/release.yml`。
   链路：tag↔版本号断言 → 编译器检查 → 全量测试 → G10–G19 → 构建三包 → G20 → G21 → 干净
-  venv e2e → 留 artifact → 打印人该做的两步。**它不上传**：发正式 PyPI 不可逆，而 yank
+  venv e2e → 留存产物 → 打印人该做的两步。**它不上传**：发正式 PyPI 不可逆，而 yank
   连 API 都没有；真正值钱的不是那条 upload 命令，是它前面那串检查。
   新增一道原先没有的检查：**tag 名 ↔ `_version.py` 一致**——G15 只保证源码里六处投影互相
   一致，**它管不到 tag**，打错 tag 照样能过 G15 然后发出去一个版号与 tag 不符的包。
+- **W129 · `release.yml` 首跑修正**：它原本用 `actions/upload-artifact@v3` 留存产物，
+  而这台自建 gitea **只镜像了 `actions/checkout`**。致命之处在于 **gitea 在 job setup
+  阶段一次性解析所有 `uses:`**——缺一个 action 让**整个 job 在第一步之前就红，0 个 step
+  执行过**，那趟发版准入一项都没验。改成纯 shell 拷到 runner 持久目录，零外部 action
+  依赖。教训：自建 CI 上**每个 `uses:` 都是 job 级 fail-fast 的外部依赖**，能用 `run:`
+  就别用 `uses:`。
+
 - **W124 · 收尾**：BACKLOG 新增 §11 / §11.1；`.gitattributes` 钉 `*.sh` 为 LF；
   **`jikuai` 0.4.1 的 yank 拍定「不做」**（yank 无 API 只能人在网页点，而 0.4.1 已被 0.24.0
   取代、`pip install jikuai` 默认拿最新版，伤害面接近零。改判条件：有人报「装到 0.4.1」）。

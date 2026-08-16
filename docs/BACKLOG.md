@@ -334,11 +334,12 @@ v0.24.0 W119 顺带修了 `向量索引.bin` 的字节序缺陷（文件头显�
 | **FreeBSD 逐文件覆盖率数字未采集** —— `覆盖率下限.json` 的 `_实测` 至今只有 Windows 一列，ubuntu 与 FreeBSD 的数字都只在 CI 日志里飘过、没人抄回来。跨平台落差仍是推断而非实测。W122 把 gitea 那步转成硬门禁后，第一次红就该顺手把数字补进去 | `覆盖率下限.json` `_已知风险` | 低 | 待定 |
 | **`verify_wheel_e2e` 有两份实现** —— `.ps1`（PowerShell 5.1 专用）与 `.sh`（POSIX，W121 新增）。两份要保持行为等价，改一份必须改另一份。为什么不统一成一份 Python：它要建 venv、跨 shell 起子进程、断言输出编码，写成 Python 反而要处理更多平台分叉；且 `.ps1` 那些坑（BOM、GBK 管道编码）已经踩完并记在文件头注释里 | W121 | 设计边界 | 不做（除非两份真漂移） |
 | **`twine check` 在 FreeBSD runner 上装不上，已换成 G21** —— twine → readme_renderer → `nh3`（Rust 扩展，无 FreeBSD 轮子，回源码构建要 maturin + Rust）。readme_renderer 42/43/44/45 全都钉 nh3，没有降版本绕过的路。改用 `scripts/check_dist_metadata.py`（G21，纯标准库）。**代价说清**：G21 不验「long_description 能否在 PyPI 页面渲染」，那一项由发版时人做的 TestPyPI 预演兜住 | W127 | 设计边界 | 不做（除非给 runner 装 Rust） |
-| **发正式 PyPI 仍是人肉最后一步** —— `release.yml` 只到「产物 + 全套准入检查 + artifact」，`twine upload` 由人执行。理由三条见 `release.yml` 文件头（不可逆 / yank 无 API / 值钱的是前面那串检查而非 upload 本身）。**这是有意的取舍，不是没做完** | W123 | 设计边界 | 不做（除非另立 ADR） |
+| **发正式 PyPI 仍是人肉最后一步** —— `release.yml` 只到「产物 + 全套准入检查 + 产物留在 runner 持久目录」，`twine upload` 由人执行。理由三条见 `release.yml` 文件头（不可逆 / yank 无 API / 值钱的是前面那串检查而非 upload 本身）。**这是有意的取舍，不是没做完** | W123 | 设计边界 | 不做（除非另立 ADR） |
 
-### 11.1 门禁自身的三次假红（本轮实测代价，值得单独记）
+### 11.1 门禁自身的四次假红（本轮实测代价，值得单独记）
 
-W121–W123 写完推 gitea，**连红三跑**，三次根因都不在被守护的对象上，而在**门禁自己**：
+W121–W123 写完推 gitea，**连红三跑**；随后打 tag 验 `release.yml` 又红一跑。四次根因都不在
+被守护的对象上，而在**门禁自己或它的执行环境**：
 
 - **W125**：`确认 gcc 在位` 硬查 gcc，而这台 FreeBSD runner 只有 clang（`cc` 指向它）。
   AOT 探测本来就认 clang/cc，`.github` 的 freebsd job 也是查 cc/clang —— 同一件事
@@ -348,15 +349,29 @@ W121–W123 写完推 gitea，**连红三跑**，三次根因都不在被守护�
   （PowerShell 支持 Unicode 标识符），照着它写就会踩；**本机 `sh -n` 也验不出来**
   （git-bash 的 sh 是 bash，bash 允许）。
 - **W127**：`twine check` 装不上（见上一行）。
+- **W129**：`release.yml` 用了 `actions/upload-artifact@v3`，而这台自建 gitea **只镜像了
+  `actions/checkout`**，`http://192.168.1.5:3000/actions/upload-artifact` 这个仓库不存在。
+  致命之处在于 **gitea 在 job setup 阶段一次性解析所有 `uses:`**：缺一个 action 会让
+  **整个 job 在第一步之前就红**，0 个 step 执行过 —— 连 tag↔版本号断言都没跑到，
+  等于那趟发版准入**一项都没验**。`ci.yml` 从未踩到，因为它除 checkout 之外
+  **一个 `uses:` 都不用**。改法是把留存产物改成纯 shell 拷到 runner 持久目录
+  `/var/db/act_runner/artifacts/jikuai/<tag>/`，零外部 action 依赖。
 
-**共同教训**：门禁的**前提假设**（有 gcc / shell 认中文标识符 / 装得上 twine）比被守护
-对象的**真实要求**更严时，产出的红是假红 —— 比没有门禁更糟，因为它训练人忽略红灯。
-这是 v0.22「守卫绿≠守卫在守」的镜像面：**守卫红≠真的有问题**。
+**共同教训**：门禁的**前提假设**（有 gcc / shell 认中文标识符 / 装得上 twine / 有这个
+action）比被守护对象的**真实要求**更严时，产出的红是假红 —— 比没有门禁更糟，因为它训练人
+忽略红灯。这是 v0.22「守卫绿≠守卫在守」的镜像面：**守卫红≠真的有问题**。
+
+**W129 还多一条独有的**：在自建 CI 上，**每一个 `uses:` 都是一个外部依赖**，且是
+**job 级 fail-fast 的硬依赖**——它不像某一步失败那样只损失那一步，而是让整条链路
+一步都不执行。所以自建 gitea 上的流水线应当**尽量只用 `run:`**；非要用 `uses:` 时，
+先确认那个 action 在本地 gitea 的 `actions` 组织下真存在。
 
 **可操作的推论**：凡是「门禁行为依赖工具/平台版本长相」的地方一律放宽到与被守护对象
 同宽（W127 的下界正则就同时认 `jikuai>=0.24.0` 与老 setuptools 的 `jikuai (>=0.24.0)`）；
 新门禁上线后**必须亲眼看到它绿过一次**才算落地 —— 本轮之前那 34 次 run 只被确认「有耗时」，
-没被确认「是绿的」，W125 那个假红才藏得住。
+没被确认「是绿的」，W125 那个假红才藏得住。**`release.yml` 这条同理：它在 W129 修完之前
+从未真跑过一步**，写得再周全也只是纸面。
+
 
 ---
 

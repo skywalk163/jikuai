@@ -2,8 +2,8 @@
 #
 # 触发：推 `vX.Y.Z` 形式的 tag。
 #
-# **它不上传。** 这一版刻意做成半自动：跑完全套发布准入检查、把三包产物留成
-# artifact，最后那条 `twine upload` 仍由人执行。三条理由：
+# **它不上传。** 这一版刻意做成半自动：跑完全套发布准入检查、把三包产物留在 runner
+# 的持久目录，最后那条 `twine upload` 仍由人执行。三条理由：
 #
 #   1. **发正式 PyPI 不可逆**。版号发错无法覆盖，撤只能 yank，而 yank 连 API
 #      都没有（`pypi-` token 只授权 upload 端点，yank 走登录 session + CSRF
@@ -108,18 +108,30 @@ jobs:
           . "$VENV_BIN/activate"
           sh scripts/verify_wheel_e2e.sh "$WHEEL"
 
-      - name: 留存产物
-        uses: http://192.168.1.5:3000/actions/upload-artifact@v3
-        with:
-          name: 三包产物
-          path: |
-            dist/*
-            lsp/dist/*
-            dap/dist/*
+      # 刻意**不用** `actions/upload-artifact`：这台自建 gitea 只镜像了
+      # `actions/checkout`，`http://192.168.1.5:3000/actions/upload-artifact` 这个仓库
+      # **不存在**。而 gitea 会在 **job setup 阶段一次性解析所有 `uses:`**，所以缺一个
+      # action 会让**整个 job 在第一步之前就红** —— v0.25.0 首跑实测：`repository not
+      # found`，0 个 step 执行过，连 tag↔版本号断言都没跑到。`ci.yml` 一直没踩到这个坑，
+      # 是因为它一个 `uses:` 都不用（除 checkout）。
+      #
+      # 所以这一步用纯 shell 做，**零外部 action 依赖**。它要守的是「产物留得下来、
+      # 能被人取走」，不是「必须用 upload-artifact」。要换回 action 版，得先让管理员在
+      # gitea 的 `actions` 组织下把 upload-artifact 镜像过来。
+      - name: 留存产物到 runner 持久目录
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          out="/var/db/act_runner/artifacts/jikuai/$tag"
+          rm -rf "$out"
+          mkdir -p "$out"
+          cp dist/* lsp/dist/* dap/dist/* "$out/"
+          ls -l "$out"
+          echo "OUT_DIR=$out" >> "$GITHUB_ENV"
 
       - name: 下一步该人做什么
         run: |
-          echo '发布准入全绿。三包产物已存为 artifact「三包产物」。'
+          echo '发布准入全绿。三包产物（sdist + wheel × 3）留在 runner 上：'
+          echo "  $OUT_DIR"
           echo ''
           echo '剩下两步由人执行（本流水线刻意不做，理由见本文件顶部注释）：'
           echo '  1. TestPyPI 预演：'
@@ -127,5 +139,10 @@ jobs:
           echo '  2. 正式 PyPI（不可逆）：'
           echo '     python -m twine upload dist/* lsp/dist/* dap/dist/*'
           echo ''
+          echo '注意：上面两条在**你自己的机器上**跑，用你本机 python -m build 构出来的'
+          echo '产物即可 —— 本流水线的价值是「这套源码能构出合规产物」这个结论，'
+          echo '不是那六个具体文件。要用 runner 上这份，从上面的路径拷走。'
+          echo ''
           echo 'token 在仓库根 .env（TWINE_USERNAME / TWINE_PASSWORD，那是正式 PyPI 不是 TestPyPI）。'
           echo 'twine 要用 python -m 调。'
+

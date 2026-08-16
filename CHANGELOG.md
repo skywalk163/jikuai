@@ -50,7 +50,9 @@ Google Cloud 等几个身份提供方），所以「不再存长效 token」那�
   阶段一次性解析所有 `uses:`**——缺一个 action 让**整个 job 在第一步之前就红，0 个 step
   执行过**，那趟发版准入一项都没验。改成纯 shell 拷到 runner 持久目录，零外部 action
   依赖。教训：自建 CI 上**每个 `uses:` 都是 job 级 fail-fast 的外部依赖**，能用 `run:`
-  就别用 `uses:`。
+  就别用 `uses:`。修完 tag 挪到 `a306e85` 重推，**`release.yml` 九步全绿** —— 发版准入
+  链路至此第一次被完整执行过。
+
 
 - **W124 · 收尾**：BACKLOG 新增 §11 / §11.1；`.gitattributes` 钉 `*.sh` 为 LF；
   **`jikuai` 0.4.1 的 yank 拍定「不做」**（yank 无 API 只能人在网页点，而 0.4.1 已被 0.24.0

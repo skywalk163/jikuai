@@ -2,7 +2,14 @@
 
 ## v0.25.0（2026-08-16）· 把发布准入的门禁装到真在跑的那条流水线上
 
-> WBS 见 `docs/路线图-v0.25.md`（§三有 W121–W128 全过程，§五是成功度量）。
+> **三包已上正式 PyPI**（2026-08-16）：`jikuai` / `jikuai-lsp` / `jikuai-dap` 各 sdist + wheel
+> 共 6 个产物。发布前走完全套准入：全量 pytest **2680 passed / 3 skipped**（本机 Windows，
+> `CC` 指向 zig 让 AOT 编译-运行比对真跑）、G10-G19、三包从零重构、G20（430 条目）、
+> G21 `--要求成对`（6 个产物）、干净 venv wheel e2e 五步全绿，以及 TestPyPI 预演
+> （人眼确认 long_description 渲染 + 从索引真装真跑 —— 这项 G21 刻意不覆盖）。
+
+> WBS 见 `docs/路线图-v0.25.md`（§三有 W121–W129 全过程，§五是成功度量）。
+
 > 全量回归 **2682 passed / 1 skipped**（gitea `ci.yml #39`，FreeBSD 14.3 + Python 3.11，
 > AOT 编译-运行比对**真跑**，只剩 1 条 skip）。契约门禁 **G10–G19 全绿**，
 > **G20 / G21 / 干净 venv wheel e2e / 覆盖率硬门禁**四道全部在 CI 里真执行。

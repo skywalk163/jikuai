@@ -127,7 +127,34 @@ jobs:
 
 
 
+      # W128：先把 coverage 的 **C tracer** 弄到位，再跑门禁。
+      #
+      # 第一次真跑（W127 之后）这一步 20m43s 只走到 45%，日志开头写着：
+      #   CoverageWarning: Couldn't import C tracer: No module named
+      #   'coverage.tracer' (no-ctracer)
+      # 那不是卡住也不是超时，是**回退到纯 Python tracer**了 —— 逐行回调走 Python 层，
+      # 比 C tracer 慢一个数量级，照 45% / 20m 外推整跑要 ~45 分钟。而 PyPI 上
+      # coverage 没有 FreeBSD 轮子，pip 只能装 sdist；建 venv 那会儿扩展没编出来，
+      # coverage 就静默降级了（它设计如此，缺 C tracer 只 warn 不报错）。
+      #
+      # 现在能修是因为 W125 已经确认这台机器有 clang（`cc` 指向它）—— 强制
+      # `--no-binary` 重装一次，扩展就地编出来。持久 venv 会留着它，只有第一次花时间。
+      #
+      # **编不出来就明确失败，不静默走慢路**：慢到 45 分钟的门禁等于没有门禁，
+      # 它会先撞上 runner 的 job 超时，然后被人当噪音关掉。
+      - name: 确保 coverage 用 C tracer（纯 Python tracer 慢一个数量级）
+        run: |
+          . "$VENV_BIN/activate"
+          if python -c "import coverage.tracer" 2>/dev/null; then
+            echo "C tracer 已在位"
+          else
+            echo "C tracer 缺失，用 clang 就地重建 coverage"
+            python -m pip install --force-reinstall --no-deps --no-binary coverage 'coverage>=7.0'
+            python -c "import coverage.tracer; print('C tracer 重建成功:', coverage.tracer.__file__)"
+          fi
+
       # 覆盖率两级阈值 —— **W122（v0.25.0）起是硬门禁**。
+
       #
       # 此前这一步是 `continue-on-error: true`，只负责打数字。当时的理由写得没错：
       # `docs/覆盖率下限.json` 的点阈值是 Windows + Python 3.14 实测标定的，在没
@@ -149,7 +176,11 @@ jobs:
       # `_阈值怎么定的` 里）。
       #
       # 成本：要在覆盖率模式下把全量测试再跑一遍，本 job 耗时大致翻倍。
+      # `timeout-minutes` 是 W128 加的护栏：真跑过一次 20m43s 才走到 45%（纯 Python
+      # tracer），与其让它慢慢啃掉整台 runner 的时间片再撞 job 级超时，不如在这里
+      # 明确断掉 —— **超时本身就是要报的结论**（说明 C tracer 那步没生效）。
       - name: 覆盖率门禁（点阈值 + 面阈值）
+        timeout-minutes: 25
         run: |
           . "$VENV_BIN/activate"
           python scripts/coverage_baseline.py --检查下限 --按覆盖率升序

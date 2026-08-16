@@ -55,6 +55,14 @@ jobs:
             exit 1
           fi
 
+      - name: 确认 C 编译器在位（全量测试里的 AOT e2e 需要）
+        run: |
+          . "$VENV_BIN/activate"
+          # 查 cc/clang 而非 gcc：FreeBSD base 自带 clang，没有 gcc。理由同
+          # ci.yml 的 W125 修正。缺编译器会让 AOT e2e 静默 skip，发版前该拦住。
+          cc --version || clang --version
+          python -c "import shutil, sys; c = shutil.which('gcc') or shutil.which('clang') or shutil.which('cc'); print('cc ->', c); sys.exit(0 if c else 1)"
+
       - name: 全量测试
         run: |
           . "$VENV_BIN/activate"

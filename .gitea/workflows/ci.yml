@@ -3,7 +3,11 @@
 # 依赖安装改为「持久 venv 复用」：第三方依赖（pytest）装进
 # /var/db/act_runner/venvs/jikuai 跨 run 复用；项目自身 editable 指向
 # /var/db/act_runner/venvs/jikuai.src（每 run ln -sfn $PWD 更新）。
-# gcc 已在 runner 预装，AOT 端到端用例真正运行。
+#
+# 编译器：这台 runner 上**没有 gcc**，用的是 FreeBSD base system 自带的 clang
+# （`cc` 指向它）。AOT 端到端用例照样真跑——`tools/aot/.../driver.py` 的
+# `_CC_CANDIDATES` 是 ("gcc", "clang", "cc", "zig", "cl")，gcc 缺席时命中 clang。
+# 本文件曾写「gcc 已在 runner 预装」并据此硬查 gcc，那是错的，W125 已修。
 
 name: CI
 
@@ -30,11 +34,16 @@ jobs:
           "$VENV_BIN/pip" install -e "/var/db/act_runner/venvs/jikuai.src" --no-build-isolation >/dev/null 2>&1 || "$VENV_BIN/pip" install -e . --no-build-isolation >/dev/null 2>&1 || true
 
 
-      - name: 确认 gcc 在位（AOT 端到端用例需要）
+      - name: 确认 C 编译器在位（AOT 端到端用例需要）
         run: |
           . "$VENV_BIN/activate"
-          gcc --version
-          python -c "import shutil,sys; cc=shutil.which('gcc'); print('gcc ->', cc); sys.exit(0 if cc else 1)"
+          # W125 修假红：原步骤硬跑 `gcc --version` 且只认 gcc，但 FreeBSD base
+          # system 自带的是 clang（cc 指向它），runner 上根本没有 gcc——这一步
+          # 每次都红在编译器探测上，跟真正要跑的 AOT 用例无关。AOT 探测走
+          # shutil.which('gcc'|'clang'|'cc'|'cl')，cc/clang 命中就够；.github 的
+          # freebsd job 也是查 cc/clang（注释明写「不需要装 gcc」）。两处口径对齐。
+          cc --version || clang --version
+          python -c "import shutil, sys; c = shutil.which('gcc') or shutil.which('clang') or shutil.which('cc'); print('cc ->', c); sys.exit(0 if c else 1)"
 
       - name: 运行全部测试
         run: |
@@ -59,7 +68,7 @@ jobs:
             exit "$status"
           fi
           if grep -q "skipped" aot_run.log; then
-            echo "::error::AOT 端到端用例出现 skip —— gcc 环境下不应跳过"
+            echo "::error::AOT 端到端用例出现 skip —— FreeBSD 自带 clang，不应跳过"
             exit 1
           fi
           echo "AOT 端到端用例全部运行，无跳过"

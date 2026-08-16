@@ -284,13 +284,18 @@ def main(argv):
     # 直接失败，而本机 editable 一切正常。**刻意不在这里跑**：G10–G19 全是秒级
     # 静态检查，而 G20 要 `python -m build`（量级差两个数量级，还多一个 build
     # 依赖）。塞进主流程会拖垮常规 CI 的门禁步骤。这里只打一行提示，免得它被
-    # 静默忘掉——真检查由下面这个脚本单独跑（发布前必跑，见路线图 v0.24）。
+    # 静默忘掉——真检查由 check_wheel_contents.py 单独跑。
+    #
+    # **W121（v0.25.0）起它已进 CI**：`.gitea/workflows/ci.yml` 与
+    # `release.yml` 都会构建 wheel 再调它。在这之前它只靠人看见下面这行提示
+    # 并记得手动跑一次 —— 而 PyPI 0.4.1 那个坏包正是这么漏出去的。
     #
     # `--json` 下不打：那个模式的 stdout 必须是**纯** JSON，多一行人读文本就让
     # `json.loads` 报 Extra data（test_契约脚本_json_输出可解析 当场抓到过）。
     if not as_json:
-        print("G20（wheel 内容）不在本静态门禁内，"
-              "发布前请单独跑：python scripts/check_wheel_contents.py")
+        print("G20（wheel 内容）不在本静态门禁内，它要跑 python -m build。"
+              "CI 里由 .gitea/workflows/ 两条流水线承载；"
+              "本地手动跑：python scripts/check_wheel_contents.py")
 
     return exit_code
 

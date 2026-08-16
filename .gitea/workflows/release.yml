@@ -1,0 +1,117 @@
+# 极快 JiKuai · 发版流水线（Gitea Actions）· v0.25.0 W123
+#
+# 触发：推 `vX.Y.Z` 形式的 tag。
+#
+# **它不上传。** 这一版刻意做成半自动：跑完全套发布准入检查、把三包产物留成
+# artifact，最后那条 `twine upload` 仍由人执行。三条理由：
+#
+#   1. **发正式 PyPI 不可逆**。版号发错无法覆盖，撤只能 yank，而 yank 连 API
+#      都没有（`pypi-` token 只授权 upload 端点，yank 走登录 session + CSRF
+#      的网页表单）—— 见 v0.24 教训坑 1。自动化一个不可逆且撤不回的动作，
+#      收益远小于风险。
+#   2. **Gitea 用不了 PyPI Trusted Publishing**。OIDC 那套只认 GitHub /
+#      GitLab / Google Cloud 等几个身份提供方，自建 Gitea 不在名单里。所以
+#      「不再存长效 token」这条在 gitea 上做不到 —— 要自动上传就得把长效
+#      `pypi-` token 存进 Gitea secret。半自动方案则**一个 token 都不用存**。
+#   3. 真正值钱的部分不是那条 upload 命令，是它前面那串检查。人肉发版出事故
+#      从来不是因为敲不对 twine，而是因为漏跑 G20 / e2e —— PyPI 上那个坏了
+#      三个版本的 `jikuai 0.4.1` 就是这么出去的（BACKLOG §10）。
+#
+# 要改成全自动上传的话：加一个 `twine upload` 步骤 + `secrets.PYPI_TOKEN`，
+# 并把本文件顶部这段理由一起改掉，别偷偷加。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  发布准入:
+    runs-on: freebsd
+    steps:
+      - name: Checkout
+        uses: http://192.168.1.5:3000/actions/checkout@v4
+
+      - name: 准备持久 venv
+        run: |
+          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest coverage[toml] build twine')"
+          echo "VENV_BIN=$VENV_BIN" >> "$GITHUB_ENV"
+          ln -sfn "$PWD" "/var/db/act_runner/venvs/jikuai.src"
+          "$VENV_BIN/pip" install -e "/var/db/act_runner/venvs/jikuai.src" --no-build-isolation >/dev/null 2>&1 || "$VENV_BIN/pip" install -e . --no-build-isolation >/dev/null 2>&1 || true
+
+      # tag 名与代码里的版本号必须一致。G15 只保证「_version.py ↔ pyproject ↔
+      # CHANGELOG ↔ 扩展 package.json」四处互相一致，它管不到 tag —— 打错 tag
+      # 照样能过 G15，然后发出去一个版号与 tag 不符的包。
+      - name: 断言 tag 与 _version.py 一致
+        run: |
+          . "$VENV_BIN/activate"
+          TAG="${GITHUB_REF#refs/tags/v}"
+          VER="$(python -c 'import sys; sys.path.insert(0, "src"); from jikuai._version import __version__; print(__version__)')"
+          echo "tag=$TAG  _version=$VER"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::tag v$TAG 与 jikuai._version.__version__ ($VER) 不一致"
+            exit 1
+          fi
+
+      - name: 全量测试
+        run: |
+          . "$VENV_BIN/activate"
+          python -m pytest -q
+
+      - name: 契约门禁 G10-G19
+        run: |
+          . "$VENV_BIN/activate"
+          python scripts/check_stdlib_contract.py
+
+      - name: 构建三包（sdist + wheel）
+        run: |
+          . "$VENV_BIN/activate"
+          rm -rf dist lsp/dist dap/dist
+          python -m build
+          python -m build --outdir lsp/dist lsp
+          python -m build --outdir dap/dist dap
+          ls -l dist lsp/dist dap/dist
+          WHEEL="$(ls -1t dist/*.whl | head -n 1)"
+          echo "WHEEL=$WHEEL" >> "$GITHUB_ENV"
+
+      - name: G20 门禁 - wheel 内容
+        run: |
+          . "$VENV_BIN/activate"
+          python scripts/check_wheel_contents.py "$WHEEL"
+
+      - name: twine check（三包元数据）
+        run: |
+          . "$VENV_BIN/activate"
+          python -m twine check dist/* lsp/dist/* dap/dist/*
+
+      # 发布准入最后一道、也是最要紧的一道：干净 venv、非 editable、--no-deps。
+      # 它断言的是**内容**（分词能否整词切出「个人所得税」、stdlib 是否落在
+      # site-packages）而不只是退出码 —— 词典没随包发行时退出码照样 0。
+      - name: 干净 venv wheel e2e 验收
+        run: |
+          . "$VENV_BIN/activate"
+          sh scripts/verify_wheel_e2e.sh "$WHEEL"
+
+      - name: 留存产物
+        uses: http://192.168.1.5:3000/actions/upload-artifact@v3
+        with:
+          name: 三包产物
+          path: |
+            dist/*
+            lsp/dist/*
+            dap/dist/*
+
+      - name: 下一步该人做什么
+        run: |
+          echo '发布准入全绿。三包产物已存为 artifact「三包产物」。'
+          echo ''
+          echo '剩下两步由人执行（本流水线刻意不做，理由见本文件顶部注释）：'
+          echo '  1. TestPyPI 预演：'
+          echo '     python -m twine upload --repository testpypi dist/* lsp/dist/* dap/dist/*'
+          echo '  2. 正式 PyPI（不可逆）：'
+          echo '     python -m twine upload dist/* lsp/dist/* dap/dist/*'
+          echo ''
+          echo 'token 在仓库根 .env（TWINE_USERNAME / TWINE_PASSWORD，那是正式 PyPI 不是 TestPyPI）。'
+          echo 'twine 要用 python -m 调。'

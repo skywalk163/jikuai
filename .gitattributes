@@ -1,0 +1,11 @@
+# 只钉一条：`.sh` 必须 LF。
+#
+# gitea 那台 FreeBSD runner 用 `sh scripts/verify_wheel_e2e.sh` 跑脚本。POSIX sh
+# 读到 CRLF 会把 `\r` 当成命令和变量值的一部分（`set -u` 变 `set -u\r`、路径尾巴
+# 多一个 \r），症状是莫名其妙的「command not found」和路径对不上——而本机 Git
+# 默认 autocrlf 正会把它签出成 CRLF。所以这条不是洁癖，是防一类真会发生的 CI 假红。
+#
+# 刻意**不**顺手加 `* text=auto` 或给 .ps1/.jk 定规矩：那会让全仓已入库文件重新
+# 归一化，制造一次与本轮无关的大 diff。.ps1 的换行与 BOM 要求写在
+# scripts/verify_wheel_e2e.ps1 文件头，靠注释约束足够。
+*.sh text eol=lf

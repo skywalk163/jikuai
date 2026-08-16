@@ -23,7 +23,8 @@ jobs:
       - name: 准备持久 venv（第三方依赖复用）
         run: |
           # coverage[toml] 与 pytest 一起进持久 venv —— 覆盖率门禁那步要用。
-          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest coverage[toml]')"
+          # build 是 W121 加的：G20 wheel 内容门禁与 wheel e2e 都要 `python -m build`。
+          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest coverage[toml] build')"
           echo "VENV_BIN=$VENV_BIN" >> "$GITHUB_ENV"
           ln -sfn "$PWD" "/var/db/act_runner/venvs/jikuai.src"
           "$VENV_BIN/pip" install -e "/var/db/act_runner/venvs/jikuai.src" --no-build-isolation >/dev/null 2>&1 || "$VENV_BIN/pip" install -e . --no-build-isolation >/dev/null 2>&1 || true
@@ -63,28 +64,79 @@ jobs:
           fi
           echo "AOT 端到端用例全部运行，无跳过"
 
-      # 覆盖率标定（**不是门禁**，故意 continue-on-error）。
+      # ===== W121（v0.25.0）：把发布准入的两道检查搬进 CI =====
       #
-      # 背景：`docs/覆盖率下限.json` 的逐文件点阈值是在 Windows + Python 3.14
-      # 上实测标定的，而**硬门禁在 .github 的 ubuntu 3.12 job 里**。问题是那条
-      # 流水线一次都没真跑过（github remote 推不上去），阈值等于没被任何真实
-      # CI 验证过。
+      # 这两步此前**只存在于人的手上**：G20 靠人记得看 check_stdlib_contract.py
+      # 末尾那行提示，wheel e2e 只有 .ps1 版、这台 runner 上没有 pwsh。结果是
+      # 「发布前必过」写在文档里，实际每次发版都靠人不忘。BACKLOG §10 那次
+      # 事故（PyPI 0.4.1 的 wheel 里零个 stdlib 文件，坏了三个版本没人发现）
+      # 就是这个缺口的实测代价。
       #
-      # 这一步的唯一职责是**产出第一份非 Windows 的实测数字**：让 `.pth` 子进程
-      # 钩子、combine、逐文件判定这条链路在真 CI 上跑一遍，并把每个文件的百分比
-      # 打出来。标定完（拿到 FreeBSD 数字、确认跨平台落差）再决定要不要把它也
-      # 变成硬门禁。
+      # 只构建一次 wheel，G20 与 e2e 共用——省掉一次 `python -m build`。
+      - name: 构建 wheel（供 G20 与 e2e 复用）
+        run: |
+          . "$VENV_BIN/activate"
+          rm -rf dist
+          python -m build --wheel
+          WHEEL="$(ls -1t dist/*.whl | head -n 1)"
+          test -f "$WHEEL" || { echo "::error::构建后 dist/ 里没有 .whl"; exit 1; }
+          echo "WHEEL=$WHEEL" >> "$GITHUB_ENV"
+          echo "wheel = $WHEEL"
+
+      - name: G20 门禁 - wheel 内容（必需资源 / 无 pyc / 块数 / 块背衬 .py）
+        run: |
+          . "$VENV_BIN/activate"
+          python scripts/check_wheel_contents.py "$WHEEL"
+
+      # 唯一能抓住「editable 假绿」的一步：全新 venv、非 editable、--no-deps。
+      # 注意它断言的是**内容**而不只是退出码——词典没随包发行时 `分词` 会静默
+      # 退化成逐字切，退出码照样 0。
+      - name: 干净 venv wheel e2e 验收
+        run: |
+          . "$VENV_BIN/activate"
+          sh scripts/verify_wheel_e2e.sh "$WHEEL"
+
+      # 三包同发，lsp / dap 的 sdist+wheel 此前从未在任何 CI 里构建过——
+      # v0.24.0 给它们钉了 `jikuai>=0.24.0` 下界，元数据坏掉只有发版当天才知道。
+      # 这里只构建 + 校验元数据，不装（装了要解析依赖，主包还没上线的版本号会失败，
+      # 那是预期不是缺陷，见 v0.24-lessons 坑 2）。
+      - name: 构建 lsp / dap 两包并校验元数据
+        run: |
+          . "$VENV_BIN/activate"
+          python -m build --outdir lsp/dist lsp
+          python -m build --outdir dap/dist dap
+          python -m pip install -q twine
+          python -m twine check dist/* lsp/dist/* dap/dist/*
+
+
+      # 覆盖率两级阈值 —— **W122（v0.25.0）起是硬门禁**。
       #
-      # 为什么不直接卡：在没标定过的第三个平台上开硬阈值，红了大概率是平台差异
-      # 而不是真回归——那种红会训练人忽略门禁，比没有门禁更糟。
+      # 此前这一步是 `continue-on-error: true`，只负责打数字。当时的理由写得没错：
+      # `docs/覆盖率下限.json` 的点阈值是 Windows + Python 3.14 实测标定的，在没
+      # 标定过的第三个平台上直接开硬阈值，红了大概率是平台差异而不是真回归，那种
+      # 红会训练人忽略门禁。
       #
-      # 成本：要在覆盖率模式下把全量测试再跑一遍，这个 job 的耗时大致翻倍。
-      - name: 覆盖率标定（非门禁，只取数）
-        continue-on-error: true
+      # 现在改判，依据是两条：
+      #   1. 阈值已在**两个**平台被真正执行并通过 —— Windows 本机实测，以及
+      #      2026-08-14 commit 48014bd 之后 github 那条 `Coverage thresholds
+      #      (Python 3.12, ubuntu)` job 首次真跑通过（记在 覆盖率下限.json
+      #      的 `_已知风险` 里）。跨平台落差没有大到吃掉那 ~5 个点的余量。
+      #   2. 更要紧的是 **github/gitcode 两条流水线在本机推不上去（反复 300s
+      #      超时）**，能稳定跑的只有 gitea 这一条。门禁只长在跑不起来的流水线上
+      #      等于没有门禁 —— 这正是 v0.22 那条「守卫绿≠守卫在守」教训的另一面。
+      #
+      # **红了怎么办**：先看是不是平台差异。是的话把 FreeBSD 实测数字补进
+      # `docs/覆盖率下限.json` 的 `_实测` 字段（那里至今只有 Windows 一列），
+      # 再带理由调阈值；**不许为了让流水线变绿而调低**（那条纪律写在同文件
+      # `_阈值怎么定的` 里）。
+      #
+      # 成本：要在覆盖率模式下把全量测试再跑一遍，本 job 耗时大致翻倍。
+      - name: 覆盖率门禁（点阈值 + 面阈值）
         run: |
           . "$VENV_BIN/activate"
           python scripts/coverage_baseline.py --检查下限 --按覆盖率升序
           echo "上面的数字是 FreeBSD 实测值；与 docs/覆盖率下限.json 的 _实测 字段（Windows）比对，差值就是跨平台落差。"
+
 
 
 # trigger: re-push to fire Actions (content-API 偶发丢事件)

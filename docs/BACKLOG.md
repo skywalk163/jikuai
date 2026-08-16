@@ -333,11 +333,35 @@ v0.24.0 W119 顺带修了 `向量索引.bin` 的字节序缺陷（文件头显�
 | **PyPI Trusted Publishing（OIDC）在 Gitea 上用不了** —— 只认 GitHub / GitLab / Google Cloud 等几个身份提供方，自建 Gitea 不在名单。所以「不再存长效 token」在 gitea 上做不到。v0.25.0 的处置是**根本不自动上传**，于是一个 token 都不用存——比存 CI secret 更干净。要改成全自动上传就必须存长效 `pypi-` token | `路线图-v0.25.md` §二、W123 | 设计边界 | 不做（除非 CI 迁回 GitHub） |
 | **FreeBSD 逐文件覆盖率数字未采集** —— `覆盖率下限.json` 的 `_实测` 至今只有 Windows 一列，ubuntu 与 FreeBSD 的数字都只在 CI 日志里飘过、没人抄回来。跨平台落差仍是推断而非实测。W122 把 gitea 那步转成硬门禁后，第一次红就该顺手把数字补进去 | `覆盖率下限.json` `_已知风险` | 低 | 待定 |
 | **`verify_wheel_e2e` 有两份实现** —— `.ps1`（PowerShell 5.1 专用）与 `.sh`（POSIX，W121 新增）。两份要保持行为等价，改一份必须改另一份。为什么不统一成一份 Python：它要建 venv、跨 shell 起子进程、断言输出编码，写成 Python 反而要处理更多平台分叉；且 `.ps1` 那些坑（BOM、GBK 管道编码）已经踩完并记在文件头注释里 | W121 | 设计边界 | 不做（除非两份真漂移） |
+| **`twine check` 在 FreeBSD runner 上装不上，已换成 G21** —— twine → readme_renderer → `nh3`（Rust 扩展，无 FreeBSD 轮子，回源码构建要 maturin + Rust）。readme_renderer 42/43/44/45 全都钉 nh3，没有降版本绕过的路。改用 `scripts/check_dist_metadata.py`（G21，纯标准库）。**代价说清**：G21 不验「long_description 能否在 PyPI 页面渲染」，那一项由发版时人做的 TestPyPI 预演兜住 | W127 | 设计边界 | 不做（除非给 runner 装 Rust） |
 | **发正式 PyPI 仍是人肉最后一步** —— `release.yml` 只到「产物 + 全套准入检查 + artifact」，`twine upload` 由人执行。理由三条见 `release.yml` 文件头（不可逆 / yank 无 API / 值钱的是前面那串检查而非 upload 本身）。**这是有意的取舍，不是没做完** | W123 | 设计边界 | 不做（除非另立 ADR） |
+
+### 11.1 门禁自身的三次假红（本轮实测代价，值得单独记）
+
+W121–W123 写完推 gitea，**连红三跑**，三次根因都不在被守护的对象上，而在**门禁自己**：
+
+- **W125**：`确认 gcc 在位` 硬查 gcc，而这台 FreeBSD runner 只有 clang（`cc` 指向它）。
+  AOT 探测本来就认 clang/cc，`.github` 的 freebsd job 也是查 cc/clang —— 同一件事
+  两套口径，严的那个在造假红。
+- **W126**：`.sh` 里用了中文变量名。POSIX `name` 产生式是 `[A-Za-z_][A-Za-z0-9_]*`，
+  `/bin/sh` 把 `仓库根=/x` 当命令执行。**孪生的 `.ps1` 用中文变量名完全正常**
+  （PowerShell 支持 Unicode 标识符），照着它写就会踩；**本机 `sh -n` 也验不出来**
+  （git-bash 的 sh 是 bash，bash 允许）。
+- **W127**：`twine check` 装不上（见上一行）。
+
+**共同教训**：门禁的**前提假设**（有 gcc / shell 认中文标识符 / 装得上 twine）比被守护
+对象的**真实要求**更严时，产出的红是假红 —— 比没有门禁更糟，因为它训练人忽略红灯。
+这是 v0.22「守卫绿≠守卫在守」的镜像面：**守卫红≠真的有问题**。
+
+**可操作的推论**：凡是「门禁行为依赖工具/平台版本长相」的地方一律放宽到与被守护对象
+同宽（W127 的下界正则就同时认 `jikuai>=0.24.0` 与老 setuptools 的 `jikuai (>=0.24.0)`）；
+新门禁上线后**必须亲眼看到它绿过一次**才算落地 —— 本轮之前那 34 次 run 只被确认「有耗时」，
+没被确认「是绿的」，W125 那个假红才藏得住。
 
 ---
 
 ## 相关文档
+
 
 
 

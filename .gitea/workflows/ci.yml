@@ -107,15 +107,24 @@ jobs:
 
       # 三包同发，lsp / dap 的 sdist+wheel 此前从未在任何 CI 里构建过——
       # v0.24.0 给它们钉了 `jikuai>=0.24.0` 下界，元数据坏掉只有发版当天才知道。
-      # 这里只构建 + 校验元数据，不装（装了要解析依赖，主包还没上线的版本号会失败，
+      # 这里只构建 + 查元数据，不装（装了要解析依赖，主包还没上线的版本号会失败，
       # 那是预期不是缺陷，见 v0.24-lessons 坑 2）。
-      - name: 构建 lsp / dap 两包并校验元数据
+      #
+      # **不用 `twine check`**（W127）：twine → readme_renderer → `nh3`，nh3 是 Rust
+      # 扩展、PyPI 上没有 FreeBSD 轮子，pip 只能回源码构建，于是要 maturin + Rust，
+      # 实测直接失败（`Rust not found` / `Unsupported platform: 311`）。查过
+      # readme_renderer 42/43/44/45 的 requires_dist，全都钉 nh3，没有「换版本就
+      # 不用 Rust」这条路。改用 scripts/check_dist_metadata.py（G21，纯标准库）承接
+      # 我们真正需要的那部分断言；「long_description 能否在 PyPI 页面渲染」这一项
+      # 它不覆盖，由发版流程里人做的 TestPyPI 预演兜住。
+      - name: 构建 lsp / dap 两包 + G21 三包元数据门禁
         run: |
           . "$VENV_BIN/activate"
+          rm -rf lsp/dist dap/dist
           python -m build --outdir lsp/dist lsp
           python -m build --outdir dap/dist dap
-          python -m pip install -q twine
-          python -m twine check dist/* lsp/dist/* dap/dist/*
+          python scripts/check_dist_metadata.py dist lsp/dist dap/dist
+
 
 
       # 覆盖率两级阈值 —— **W122（v0.25.0）起是硬门禁**。

@@ -36,7 +36,11 @@ jobs:
 
       - name: 准备持久 venv
         run: |
-          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest coverage[toml] build twine')"
+          # 刻意**不**装 twine：它在这台 FreeBSD runner 上装不上（twine →
+          # readme_renderer → nh3，nh3 是 Rust 扩展且无 FreeBSD 轮子，pip 回源码
+          # 构建要 maturin + Rust，实测失败）。元数据检查改用 G21，纯标准库。
+          # 真正的 `twine upload` 由人在自己机器上执行，见本 job 最后一步。
+          VENV_BIN="$(/usr/local/sbin/ci_venv.sh jikuai 'pytest coverage[toml] build')"
           echo "VENV_BIN=$VENV_BIN" >> "$GITHUB_ENV"
           ln -sfn "$PWD" "/var/db/act_runner/venvs/jikuai.src"
           "$VENV_BIN/pip" install -e "/var/db/act_runner/venvs/jikuai.src" --no-build-isolation >/dev/null 2>&1 || "$VENV_BIN/pip" install -e . --no-build-isolation >/dev/null 2>&1 || true
@@ -89,10 +93,12 @@ jobs:
           . "$VENV_BIN/activate"
           python scripts/check_wheel_contents.py "$WHEEL"
 
-      - name: twine check（三包元数据）
+      - name: G21 门禁 - 三包发行元数据（含 wheel/sdist 成对）
         run: |
           . "$VENV_BIN/activate"
-          python -m twine check dist/* lsp/dist/* dap/dist/*
+          # --要求成对：发版时三包都得 sdist + wheel 全套，缺一种等于少发一条安装路径。
+          # 常规 CI 不加这个开关（主包是 --wheel 单构的，缺 sdist 是预期）。
+          python scripts/check_dist_metadata.py --要求成对
 
       # 发布准入最后一道、也是最要紧的一道：干净 venv、非 editable、--no-deps。
       # 它断言的是**内容**（分词能否整词切出「个人所得税」、stdlib 是否落在

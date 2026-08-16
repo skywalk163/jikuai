@@ -14,6 +14,6 @@ W118（v0.24.0）：与主包同号发布。此前这里写死在 `dap/pyproject
 不必真 import 本包（真 import 会连带跑 `__init__.py` 的 `from .adapter import main`）。
 """
 
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 __all__ = ["__version__"]

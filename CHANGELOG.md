@@ -1,6 +1,97 @@
 # 极快 JiKuai · 变更日志
 
+## v0.25.0（2026-08-16）· 把发布准入的门禁装到真在跑的那条流水线上
+
+> WBS 见 `docs/路线图-v0.25.md`（§三有 W121–W128 全过程，§五是成功度量）。
+> 全量回归 **2682 passed / 1 skipped**（gitea `ci.yml #39`，FreeBSD 14.3 + Python 3.11，
+> AOT 编译-运行比对**真跑**，只剩 1 条 skip）。契约门禁 **G10–G19 全绿**，
+> **G20 / G21 / 干净 venv wheel e2e / 覆盖率硬门禁**四道全部在 CI 里真执行。
+
+> **单主轴版本，零功能改动。** 这一版一行语言实现都没改，只做一件事：把发布准入的检查
+> 从「靠人记得跑」变成「CI 里拦着」。上一版（v0.24.0）修的是 PyPI 上那个坏包，这一版修的是
+> **为什么坏了三个版本没人发现**。
+
+### 进场先订正了一个错误前提
+
+`docs/规划-未来三月.md` 原文断言「现在零自动化门禁，全靠人肉在本机跑」，并把覆盖率线上化
+（W94）、macOS CI（W95）记成两笔待清的老挂账。**逐条核实后这三条都不成立**：gitea 那条
+流水线到立项当天已累计 34 次 run，W94/W95 早在 `e82866c`（v0.21.0）完成。真实缺口比原命题
+窄得多，也具体得多——见路线图 §一。已在规划文档里留下带日期的订正块。
+
+### 拍板：CI 主战场落在 Gitea Actions（自建 FreeBSD runner）
+
+依据不是「github 慢」，而是**只有 gitea 这条真在跑**。`.github` / GitCode 两条降为「可公开
+验证」的镜像，不再往里加新门禁。**门禁装在跑不起来的流水线上等于没有门禁**——这是 v0.22
+那条「守卫绿≠守卫在守」教训的另一面。
+
+代价写清了：**PyPI Trusted Publishing（OIDC）在自建 Gitea 上用不了**（只认 GitHub / GitLab /
+Google Cloud 等几个身份提供方），所以「不再存长效 token」那条做不到。本轮的处置是**根本
+不自动上传**，于是一个 token 都不用存，反而比存 CI secret 更干净。
+
+### M26 · W121–W124
+
+- **W121 · 发布准入两道检查进 CI**：新增 `scripts/verify_wheel_e2e.sh`（`.ps1` 版的 POSIX
+  等价物——FreeBSD runner 上没有 pwsh，只有 `.ps1` 版就等于这一步永远进不了 CI）。CI 加四步：
+  构建 wheel（**一次，G20 与 e2e 共用**）→ G20 → wheel e2e → 构建 lsp/dap 两包 + 元数据门禁。
+  **断言的是内容不是退出码**——词典没随包发行时 `分词` 会静默退化成逐字切、退出码照样 0，
+  那正是 0.4.1 那次事故的形状。
+- **W122 · 覆盖率从「只打数字」转真门禁**：去掉 `continue-on-error`。阈值现已在 **Windows /
+  ubuntu / FreeBSD 三个平台**被真正执行并通过。YAML 注释里写明「红了怎么办」：先判是不是
+  平台差异，是的话把实测数字补进 `覆盖率下限.json` 再带理由调阈值，**不许为了让流水线变绿
+  而调低**。
+- **W123 · tag 触发发版流水线（半自动，刻意不上传）**：新增 `.gitea/workflows/release.yml`。
+  链路：tag↔版本号断言 → 编译器检查 → 全量测试 → G10–G19 → 构建三包 → G20 → G21 → 干净
+  venv e2e → 留 artifact → 打印人该做的两步。**它不上传**：发正式 PyPI 不可逆，而 yank
+  连 API 都没有；真正值钱的不是那条 upload 命令，是它前面那串检查。
+  新增一道原先没有的检查：**tag 名 ↔ `_version.py` 一致**——G15 只保证源码里六处投影互相
+  一致，**它管不到 tag**，打错 tag 照样能过 G15 然后发出去一个版号与 tag 不符的包。
+- **W124 · 收尾**：BACKLOG 新增 §11 / §11.1；`.gitattributes` 钉 `*.sh` 为 LF；
+  **`jikuai` 0.4.1 的 yank 拍定「不做」**（yank 无 API 只能人在网页点，而 0.4.1 已被 0.24.0
+  取代、`pip install jikuai` 默认拿最新版，伤害面接近零。改判条件：有人报「装到 0.4.1」）。
+
+### W125–W128 · 四次红都红在门禁自己身上
+
+从 W121 推上去到 #39 绿，**一共红了四跑，四次根因全在门禁自己或它的执行环境**，被守护的
+对象（测试、块库、三包产物）一次没出问题。这个比例本身是结论：
+
+- **W125 · `确认 gcc 在位` 假红**：那一步硬跑 `gcc --version` 且只认 `which('gcc')`，而这台
+  FreeBSD runner 上根本没有 gcc（base system 自带 clang，`cc` 指向它）。AOT 的
+  `_CC_CANDIDATES` 本来就接受 clang/cc，`.github` 的 freebsd job 也是查 `cc`/`clang`——
+  **同一件事两个文件两套口径，宽的那个才是对的。**
+- **W126 · `.sh` 里的变量名必须 ASCII**：POSIX shell 的 `name` 产生式是
+  `[A-Za-z_][A-Za-z0-9_]*`，FreeBSD `/bin/sh` 把 `仓库根=/x` 当成**命令**去执行。孪生的
+  `.ps1` 用中文变量名完全正常（PowerShell 支持 Unicode 标识符），**照着它写 `.sh` 就会踩**。
+  更要记的是：**本机 `sh -n` 验不出来**——git-bash 的 `sh` 是 bash，bash 允许非 ASCII 变量名，
+  坏版本在本机语法检查里是绿的。
+- **W127 · `twine check` 换成 G21**：twine → readme_renderer → `nh3`，nh3 是 Rust 扩展、
+  PyPI 上没有 FreeBSD 轮子。查过 readme_renderer 42/43/44/45 的 `requires_dist`，**全都**钉
+  `nh3>=0.2.14`，「降版本就不用 Rust」这条路不存在。**不迁就工具，重新问这一步要守什么**：
+  新增 `scripts/check_dist_metadata.py`（**G21**，零第三方依赖）断言五条 —— Name 规范化一致、
+  **Version == `_version.py` 单一真源**（这条 **G15 管不到**：`dist/` 里躺着上一版 wheel 照样
+  过 G15 然后被一起 upload 出去）、有 long_description 就必须有 `Description-Content-Type`、
+  lsp/dap 对主包必须钉 `>=` 下界、`--要求成对` 时 wheel 与 sdist 都得在。
+  long_description 能否在 PyPI 渲染**明确不覆盖**，由发版流程里人做的 TestPyPI 预演兜住。
+- **W128 · coverage 静默退化到纯 Python tracer**：覆盖率那步 20m43s 只走到 45%。不是卡住、
+  不是超时，是 `Couldn't import C tracer` —— PyPI 上 coverage 没有 FreeBSD 轮子，建持久 venv
+  那会儿 C 扩展没编出来，而 coverage 缺 C tracer 时**只 warn 不报错**。**修根因不放宽门禁**：
+  用 clang 就地 `--no-binary` 重建 coverage，编不出来就明确失败；再加 `timeout-minutes: 25`，
+  因为**超时本身就是要报的结论**。修完同一步降到 13m11s。
+
+**统一的教训是「本机绿 ≠ 那台机器上成立」**：本机有 clang 没 gcc、`sh` 是 bash、coverage
+有 C tracer —— 上面四条一条都不可能在本地测出来。可操作的结论记进 BACKLOG §11.1：
+凡是行为依赖工具/平台表面细节的门禁一律放宽判据；**新门禁上线后必须亲眼看到它绿过一次
+才算落地**。
+
+### 顺带采到的数字
+
+覆盖率跨平台落差**从推断转为实测**：总覆盖率 Windows 86.8% → FreeBSD 86.6%，差 **0.2 个点**；
+逐文件 4/6 已核对，`completion.py` / `text_document_store.py` / `main.py` 三个逐字节持平，
+唯一动的是 `pkg/sources.py`（93.4% → 92.7%，−0.7）——正好落在阈值设计时预判的那一类
+（`pkg` 下有按平台分叉的路径处理），**预判方向被证实、幅度远小于留的 5 点余量**。
+
+
 ## v0.24.0（2026-08-15）· 把 `pip install jikuai` 从坏的修成能用的
+
 
 > WBS 见 `docs/路线图-v0.24.md`（§六有实施结果）；方案见 `docs/ADR-39-stdlib包内资源.md`。
 > 全量回归 **2595 passed / 88 skipped**（88 条 skip 是需 C 编译器的 AOT 编译-运行比对，本机无编译器）。契约门禁 **G10-G19 全绿**（`scripts/check_stdlib_contract.py` exit 0）；**G20 wheel 内容门禁**单独跑，430 条条目全绿。

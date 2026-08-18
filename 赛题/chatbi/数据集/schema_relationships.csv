@@ -1,0 +1,15 @@
+source_table,source_key,target_table,target_key,relationship_type,description
+dim_customer,customer_id,fact_orders,customer_id,1:N,一个客户可以有多笔订单
+dim_model,model_id,fact_orders,model_id,1:N,一个车型可以对应多笔订单
+dim_model,model_id,fact_production_plan,model_id,1:N,一个车型可以被多次排产
+dim_workshop_line,line_id,fact_production_plan,line_id,1:N,一条产线可以有多条生产计划
+fact_production_plan,plan_id,fact_production_actual,plan_id,1:1,一条生产计划对应一条生产实绩
+dim_model,model_id,fact_production_actual,model_id,1:N,一个车型可以有多条生产实绩
+dim_workshop_line,line_id,fact_production_actual,line_id,1:N,一条产线可以有多条生产实绩
+dim_model,model_id,fact_quality_defects,model_id,1:N,一个车型可以有多条质量缺陷记录
+dim_workshop_line,line_id,fact_quality_defects,line_id,1:N,一条产线可以有多条质量缺陷记录
+dim_model,model_id,fact_energy_usage,model_id,1:N,一个车型可以有多条能耗记录
+dim_workshop_line,line_id,fact_energy_usage,line_id,1:N,一条产线可以有多条能耗记录
+fact_orders,model_id+planned_delivery_date,fact_production_actual,model_id+production_date,业务关联,订单交付可通过车型和交付时间窗口关联生产实绩
+fact_orders,model_id+planned_delivery_date,fact_quality_defects,model_id+defect_date,业务关联,订单延期可通过车型和交付时间窗口关联质量缺陷与返修风险
+fact_production_actual,line_id+model_id+production_date,fact_energy_usage,line_id+model_id+usage_date,业务关联,产量与能耗可通过产线、车型和日期关联分析单车能耗

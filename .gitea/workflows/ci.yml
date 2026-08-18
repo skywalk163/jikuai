@@ -50,7 +50,7 @@ jobs:
           . "$VENV_BIN/activate"
           python -m pytest -v
 
-      - name: 契约门禁 G10-G19
+      - name: 契约门禁 G10-G22
         run: |
           . "$VENV_BIN/activate"
           python scripts/check_stdlib_contract.py

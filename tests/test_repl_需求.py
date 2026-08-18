@@ -87,9 +87,9 @@ def test_requirement_selection_appends_to_buffer():
     assert call.startswith('定义赵果1=')
     assert '(?)' in call
     assert call.endswith('。')
-    # 均值块导出名是「中位」，两行引用一致
-    assert '中位' in imp
-    assert '中位(' in call
+    # 均值块导出名是「均数」（v0.26.0 W132 由 `中位` 改名），两行引用一致
+    assert '均数' in imp
+    assert '均数(' in call
     printed = out.getvalue()
     assert imp in printed
     assert call in printed
@@ -101,7 +101,7 @@ def test_requirement_selection_with_inline_args():
     s.feed('需求 求个平均')
     s.feed('1 列 1 2 3')
     imp, call = s.buffer
-    assert call == '定义赵果1=中位(列 1 2 3)。'
+    assert call == '定义赵果1=均数(列 1 2 3)。'
     assert '?' not in call
 
 

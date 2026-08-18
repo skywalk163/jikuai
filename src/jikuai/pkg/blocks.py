@@ -81,7 +81,9 @@ VECTOR_INDEX_META_NAME = '向量索引.元信息.json'
 #: 不允许贡献者随手造新领域——否则 CLI 的 `--领域` 过滤会退化成自由文本。
 #: v0.13.0 M2 注册 `财务`（金额计算层，区别于 `中文` 域的金额表现层）与
 #: `历法`（日期数学，区别于 `中文` 域的农历/干支文化表现层）。
-ALLOWED_DOMAINS = frozenset({'数据', '中文', '网络', '工具', '财务', '历法'})
+#: v0.26.0 W131 · ADR-40，制造域承载带业务口径的指标块
+#: （区别于 `数据` 域的通用统计算子）。
+ALLOWED_DOMAINS = frozenset({'数据', '中文', '网络', '工具', '财务', '历法', '制造'})
 
 #: 稳定性等级。CLI 默认只推荐 `stable`。
 STABILITY_LEVELS = frozenset({'experimental', 'stable', 'deprecated'})

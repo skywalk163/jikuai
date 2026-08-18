@@ -1,0 +1,73 @@
+-- 块 `制造.邻期关联` 的单元测试（W137）。
+-- 内联字典列表字面量自造小表，不依赖 CSV 载入。
+
+从 blocks.制造.邻期关联 导入 邻联。
+
+-- 左表：两笔订单，同车型 M003 / M009，各一个计划交付日。
+定义赵订=列 {"model_id": "M003", "planned_delivery_date": "2026-06-10", "order_id": "O1"} {"model_id": "M009", "planned_delivery_date": "2026-05-30", "order_id": "O2"}。
+
+-- 右表：生产实绩，故意在 M003 交付日附近铺几天，含跨月一条（6-02 给 M009 的 5-30 ±3）。
+定义赵实=列 {"model_id": "M003", "production_date": "2026-06-08", "actual_quantity": 5} {"model_id": "M003", "production_date": "2026-06-10", "actual_quantity": 6} {"model_id": "M003", "production_date": "2026-06-13", "actual_quantity": 7} {"model_id": "M003", "production_date": "2026-06-20", "actual_quantity": 8} {"model_id": "M009", "production_date": "2026-06-02", "actual_quantity": 9} {"model_id": "M009", "production_date": "2026-06-10", "actual_quantity": 10}。
+
+-- 测试1：N=0，只关联同一天 → M003 只命中 6-10 那条，M009 的 5-30 右表没有 → 共 1 行
+定义赵左键=列 "model_id"。
+定义赵右键=列 "model_id"。
+定义赵r0=邻联(赵订, 赵左键, "planned_delivery_date", 赵实, 赵右键, "production_date", 0, "右_")。
+打印 "T1 N=0 行数(期望1)：" (长度 赵r0)。
+打印 "T1 命中的右产量(期望6，右非冲突列不加前缀)：" 赵r0[0]["actual_quantity"]。
+打印 "T1 左列保留(期望 O1)：" 赵r0[0]["order_id"]。
+
+-- 测试2：N=3 → M003(6-10) 命中 6-08/6-10/6-13 三条；M009(5-30) 命中 6-02 一条 → 共 4 行
+定义赵r3=邻联(赵订, 赵左键, "planned_delivery_date", 赵实, 赵右键, "production_date", 3, "右_")。
+打印 "T2 N=3 行数(期望4，一对多膨胀)：" (长度 赵r3)。
+
+-- 测试3：跨月边界——M009 计划 5-30，±3 天要能落到 6-02
+定义赵仅九=列 {"model_id": "M009", "planned_delivery_date": "2026-05-30", "order_id": "O2"}。
+定义赵r九=邻联(赵仅九, 赵左键, "planned_delivery_date", 赵实, 赵右键, "production_date", 3, "右_")。
+打印 "T3 跨月 5-30 ±3 命中(期望1)：" (长度 赵r九) " 命中日(期望 2026-06-02)：" 赵r九[0]["production_date"]。
+
+-- 测试4：不传 N（传空）→ 报可读中文错误，绝不静默取默认
+尝试：
+  邻联(赵订, 赵左键, "planned_delivery_date", 赵实, 赵右键, "production_date", 空, "右_")。
+  打印 "T4 失败：缺 N 没报错"。
+捕获 赵误：
+  打印 "T4 缺 N 报错(期望)：" 赵误。
+。
+
+-- 测试5：列名冲突加前缀不覆盖——model_id 两表都有，右侧应变 右_model_id，左侧原样
+打印 "T5 左键在(期望 M003)：" 赵r0[0]["model_id"] " 右键改名后在(期望 M003)：" 赵r0[0]["右_model_id"]。
+
+-- 测试6：右表日期为空的行不参与，也不报错
+定义赵实空=列 {"model_id": "M003", "production_date": 空, "actual_quantity": 99} {"model_id": "M003", "production_date": "2026-06-10", "actual_quantity": 6}。
+定义赵r空=邻联(赵订, 赵左键, "planned_delivery_date", 赵实空, 赵右键, "production_date", 0, "右_")。
+打印 "T6 含空右行 N=0 行数(期望1，空行被跳过)：" (长度 赵r空)。
+
+-- 测试7：右表日期非法 → 报错
+定义赵脏=列 {"model_id": "M003", "production_date": "2026/06/10"}。
+尝试：
+  邻联(赵订, 赵左键, "planned_delivery_date", 赵脏, 赵右键, "production_date", 0, "右_")。
+  打印 "T7 失败：脏右日期没报错"。
+捕获 赵误2：
+  打印 "T7 脏右日期报错(期望)：" 赵误2。
+。
+
+-- 测试8：复合键（model_id + line_id），键不匹配则不关联
+定义赵订2=列 {"model_id": "M003", "line_id": "L002", "planned_delivery_date": "2026-06-10", "order_id": "OX"}。
+定义赵实2=列 {"model_id": "M003", "line_id": "L002", "production_date": "2026-06-10", "actual_quantity": 1} {"model_id": "M003", "line_id": "L005", "production_date": "2026-06-10", "actual_quantity": 2}。
+定义赵键2左=列 "model_id" "line_id"。
+定义赵键2右=列 "model_id" "line_id"。
+定义赵r复=邻联(赵订2, 赵键2左, "planned_delivery_date", 赵实2, 赵键2右, "production_date", 0, "右_")。
+打印 "T8 复合键 N=0 行数(期望1，L005那条键不匹配被排除)：" (长度 赵r复) " 命中产量(期望1)：" 赵r复[0]["actual_quantity"]。
+
+-- 测试9：左右键数量不一致 → 报错
+尝试：
+  邻联(赵订2, 赵键2左, "planned_delivery_date", 赵实2, 赵右键, "production_date", 0, "右_")。
+  打印 "T9 失败：键数不一致没报错"。
+捕获 赵误3：
+  打印 "T9 键数不一致报错(期望)：" 赵误3。
+。
+
+-- 测试10：空左表 → 空结果
+定义赵空表=【】。
+定义赵r空表=邻联(赵空表, 赵左键, "planned_delivery_date", 赵实, 赵右键, "production_date", 3, "右_")。
+打印 "T10 空左表行数(期望0)：" (长度 赵r空表)。

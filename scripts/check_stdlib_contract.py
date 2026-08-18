@@ -279,6 +279,22 @@ def main(argv):
     if check_security_invariants.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
+    # G22：制造域口径契约（W144 · v0.26.0 · ADR-40 §6）。四条断言：预置异常恰好
+    # 命中 5 条 / `制造` 域每块描述含口径声明关键词 / ADR-40 §5 三处分歧点两侧齐 /
+    # 语义层 `表.字段` ↔ 真实 CSV 表头零偏差（W139 并入）。
+    #
+    # 同 G16/G17/G19：**不**学 G13+ 的 `except → 跳过`。新门禁解析不了就是它自己
+    # 坏了，静默跳过等于门禁形同虚设。
+    #
+    # 它自带 `--quiet` 约定「结论走 stderr、只打一行」，所以**无论过不过、也无论
+    # 本脚本是不是 `--json` 模式，G22 的结论行都会单独打出来**——这是刻意的：
+    # G12 之类的红不该把 G22 的成败掩盖掉，而 stdout 在 `--json` 下必须保持纯 JSON。
+    # 第 4 条在数据集（`赛题/`，不进 wheel/sdist）缺席时会打「因数据集缺失跳过」
+    # 而不是静默当通过。
+    import check_manufacturing_contract
+    if check_manufacturing_contract.main(["--quiet"]) != 0:
+        exit_code = exit_code or 1
+
     # G20：wheel 内容门禁（W116 · v0.24.0 · ADR-39 §5）。守 BACKLOG §10 那次
     # 已经发生过的事故——PyPI 0.4.1 的 wheel 里零个 stdlib 文件，装完 `导入 数学`
     # 直接失败，而本机 editable 一切正常。**刻意不在这里跑**：G10–G19 全是秒级

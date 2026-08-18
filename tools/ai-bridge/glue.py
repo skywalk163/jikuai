@@ -49,7 +49,7 @@ _F步骤, = PLAN_REQUIRED
 _F需求, _F共享, _F打印 = PLAN_OPTIONAL
 
 __all__ = ['synthesize', 'result_var', 'TypeGraph', 'type_feeds', 'normalize_type',
-           'strip_surname', 'match_slot_name']
+           '人读类型', 'strip_surname', 'match_slot_name']
 
 
 #: 占位符：参数无法推断时写在实参位，配一行注释提示人工补。
@@ -220,6 +220,12 @@ def _人读(nt):
     if kind == _联合:
         return '联合(%s)' % '|'.join(_人读(x) for x in payload)
     return kind
+
+
+#: 公开别名：planner.py 的 `类型串` 要把块元数据里的类型规格转成 ADR-26 人读串，
+#: 复用这套渲染而不是各写一份（两份必漂）。`normalize_type` + `人读类型` 是一对。
+人读类型 = _人读
+
 
 
 def type_feeds(src, dst):

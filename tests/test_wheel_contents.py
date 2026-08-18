@@ -78,6 +78,31 @@ def test_G20已在静态门禁里留痕():
     assert 'check_wheel_contents' in text
 
 
+def test_块背衬PY数与源码树一致():
+    """G20 用等值断言守背衬数，但这个数是**手写常量**——本文件其它几条全用合成
+    条目名，且「该绿」那条自引用 `G20.块背衬PY数` 本身，常量漂了照样绿。
+
+    v0.26.0 制造域一次加了 21 个背衬（14 → 35），常量没跟着改，
+    gitea run 49（ci.yml）/ run 50（release.yml）**双红**，而本地 pytest 全绿、
+    静态门禁退出码 0——G20 要跑 `python -m build`，没人手动跑。
+    这条把漂移提前到本地回归，不再让 CI 花 9 分钟走到 G20 才发现。
+    """
+    blocks = os.path.join(_REPO, 'src', 'jikuai', 'stdlib', 'blocks')
+    实际 = sum(
+        1
+        for d, _, fs in os.walk(blocks)
+        for f in fs
+        if f.endswith('.py')
+        # 只数「领域/块/文件.py」这一层（相对块根两个分隔符），对齐 G20 的
+        # `n.count('/') >= 5` 深度口径；块目录再往下的 .py 不算背衬。
+        and os.path.relpath(os.path.join(d, f), blocks).count(os.sep) == 2
+    )
+    assert 实际 == G20.块背衬PY数, (
+        '源码树里 %d 个块背衬 .py，check_wheel_contents.块背衬PY数 写着 %d'
+        '——扩块时要同步改常量并在注释里说明为什么变了' % (实际, G20.块背衬PY数)
+    )
+
+
 def _满足其它断言的条目(背衬数=1):
     """造一份除指定维度外全部合规的条目名列表。"""
     条目 = [f'jikuai/stdlib/blocks/领域{i}/块{i}/块{i}.json' for i in range(120)]

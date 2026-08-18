@@ -184,7 +184,10 @@ def test_bench一次跑出四档():
         capture_output=True, cwd=_REPO)
     assert proc.returncode == 0, proc.stderr.decode('utf-8', 'replace')
     报告 = json.loads(proc.stdout.decode('utf-8'))
-    assert 报告['制造域块数'] == 25, '制造域应为 25 块，实为 %s' % 报告['制造域块数']
+    # 25 → 27：v0.27.0 W154-W155 加了 `窗间对比` / `基线偏离`（ADR-40 §5.4 双块）。
+    # 用等值而非下界，理由同 `块背衬PY数`：块数变了就该有人来改这个数并解释一句。
+    assert 报告['制造域块数'] == 27, '制造域应为 27 块，实为 %s' % 报告['制造域块数']
+
     assert set(报告['正例档']) == {'调优', '留出'}
     assert set(报告['负例档']) == {'远离', '近边缘'}
     # 两档负例拒答率如实为 0（检索层无阈值）

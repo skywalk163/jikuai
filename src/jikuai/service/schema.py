@@ -16,6 +16,16 @@ CLI（`jk 块 …`）、LSP（`workspace/executeCommand`）、Web（`tools/web/s
     执行结果 {stdout, stderr, 返回值, 耗时毫秒, 错误?}
              三边 `跑` 共用的输出
 
+v0.27.0 W148 追加**规划器通道**（`jk 块 规划` / `jk 块 问`，正本 ADR-41）：
+
+    规划上下文包 {需求, 语义命中, 候选, 回填契约, 拒答建议, 分歧告警?}
+                 候选比「选响应」候选多 `输入槽`/`输出类型` —— 没有这两项 LLM
+                 就只能猜实参，这是 v0.26.0 W145 静默错绑的直接根因
+
+    回填响应     {需求, 方案, 模型, 溯源?}
+                 LLM 回填后的形状。本层只校验**形状**；ADR-41 §4 那五条硬规则
+                 要拿上下文包做参照，落 `tools/ai-bridge/planner.py`
+
 实现约束：只用标准库。不引 jsonschema——校验规则简单到不值得一个依赖，
 且 `src/jikuai/` 运行时保持零第三方依赖是既有约定。
 """
@@ -33,14 +43,27 @@ __all__ = [
     'SELECT_ENVELOPE_REQUIRED', 'SELECT_ENVELOPE_OPTIONAL',
     'RUN_ENVELOPE_REQUIRED', 'RUN_ENVELOPE_OPTIONAL',
     'SAVED_PLAN_REQUIRED', 'SAVED_PLAN_LIST_FIELDS', 'SAVED_PLAN_LIST_ENVELOPE',
+    'SLOT_REQUIRED',
+    'CONTEXT_CANDIDATE_REQUIRED', 'CONTEXT_CANDIDATE_OPTIONAL',
+    'SEMANTIC_HIT_REQUIRED', 'SEMANTIC_HIT_OPTIONAL',
+    'DIVERGENCE_WARNING_REQUIRED',
+    'FILL_CONTRACT_REQUIRED', 'REJECT_ADVICE_REQUIRED',
+    'CONTEXT_ENVELOPE_REQUIRED', 'CONTEXT_ENVELOPE_OPTIONAL',
+    'FILLED_ENVELOPE_REQUIRED', 'FILLED_ENVELOPE_OPTIONAL',
     'make_candidate', 'make_step', 'make_plan', 'make_result',
     'make_select_envelope', 'make_run_envelope',
     'make_saved_plan', 'make_saved_plan_summary', 'make_saved_plan_list',
+    'make_slot', 'make_context_candidate', 'make_semantic_hit',
+    'make_divergence_warning', 'make_fill_contract', 'make_reject_advice',
+    'make_context_envelope', 'make_filled_envelope',
     'candidate_from_hit', 'level_table', 'export_table', 'diagnostics_from_error',
     'validate_candidate', 'validate_plan', 'validate_result',
     'validate_select_envelope', 'validate_run_envelope',
+    'validate_context_candidate', 'validate_context_envelope',
+    'validate_filled_envelope',
     'ensure_candidate', 'ensure_plan', 'ensure_result',
     'ensure_select_envelope', 'ensure_run_envelope',
+    'ensure_context_envelope', 'ensure_filled_envelope',
 ]
 
 
@@ -116,6 +139,57 @@ SAVED_PLAN_LIST_FIELDS = ('id', '标题', '时间戳')
 #: `已存方案.列` 的响应信封。给它一个信封而不是裸数组：后面要加 `总数`
 #: / `上限` 之类的元信息时不必再做一次破坏性契约变更。
 SAVED_PLAN_LIST_ENVELOPE = ('方案列表',)
+
+
+# ---- 规划器通道（v0.27.0 W148 · M28）--------------------------------
+# 规划器把「问句 + 检索候选 + 语义层 + 块元数据」组装成 LLM 能照着回填的受限结构
+# （规划上下文包），LLM 回填出 `方案`，再过 `validate_filled_envelope` 兜底。
+# 正本：docs/ADR-41-规划器与NL层.md。为什么这套字段是新协议而不是复用「选响应」：
+# 「选响应」的候选**不带输入槽**，这正是 v0.26.0 W145 里 LLM 写不出实参、124 步
+# 全靠人手写的直接根因（ADR-41 §3）。
+
+#: 块的一个**输入槽**：`名` 是形参名，`类型` 是 ADR-26 类型词表里的归一类型。
+#: 上下文包把它喂给 LLM，是把「实参写死」从事后校验前移到信息供给——LLM 知道
+#: 每个槽的名与类型，才有可能一次填对；`validate_filled` 是兜底，不是唯一防线。
+SLOT_REQUIRED = ('名', '类型')
+
+#: 规划上下文包里的**候选**：在「选响应」候选（`CANDIDATE_REQUIRED`）之外补
+#: `输入槽`（数组，每项 `SLOT_REQUIRED`）与 `输出类型`。这两项是新增信息，缺了
+#: LLM 就只能猜实参。`命名空间` 沿用可选语义（第三方块才有）。
+CONTEXT_CANDIDATE_REQUIRED = CANDIDATE_REQUIRED + ('输入槽', '输出类型')
+CONTEXT_CANDIDATE_OPTIONAL = CANDIDATE_OPTIONAL
+
+#: **语义命中**：问句命中的一条业务词及其锚定的表/字段与口径说明，读自
+#: `制造/语义层.json` 的 42 条业务词。`口径说明` 让 LLM 判断「这个词该落哪个口径块」。
+SEMANTIC_HIT_REQUIRED = ('业务词', '表', '字段', '口径说明')
+SEMANTIC_HIT_OPTIONAL = ()
+
+#: **分歧告警**：命中了一处口径分歧点（ADR-40 §5）时给出，逼 LLM 显式选一条。
+#: `两侧块名` 是数组，`实测差值` 是人读字符串（如「缺陷率 0.050550 vs 0.032218，
+#: 差 57%」），`须显式选一条` 恒 True——它存在本身就是「这里不许含糊」的信号。
+DIVERGENCE_WARNING_REQUIRED = ('分歧点', '两侧块名', '实测差值', '须显式选一条')
+
+#: **回填契约**：给 LLM 的回填格式说明。`目标` 固定是「方案」，`必填` 列出回填时
+#: 一个都不能省的字段（尤其 `步骤[].参数`——省略会触发粘合器静默错绑，ADR-41 §4）。
+#: `禁止` 列出会被拒的做法（多余字段、幻觉块名等）。
+FILL_CONTRACT_REQUIRED = ('目标', '必填', '禁止')
+
+#: **拒答建议**：`覆盖` 是布尔——语义层业务词是否登记且有候选块自报对应口径；
+#: 为 False 时 `理由` 说明为什么判为库外能力。**这不是分数阈值**（检索层永远返回
+#: top-K，四轮实测已证伪分数拒答，ADR-41 §5），是词表覆盖判定。`理由` 也用来登记
+#: 已知缺口（如「制造域无领域先验加分」）供人复核。
+REJECT_ADVICE_REQUIRED = ('覆盖', '理由')
+
+#: **规划上下文包**信封（`jk 块 规划` 的出口）。`候选` 每项 `CONTEXT_CANDIDATE_*`；
+#: `语义命中`/`分歧告警` 是数组（可空）；`回填契约`/`拒答建议` 各一个对象。
+CONTEXT_ENVELOPE_REQUIRED = ('需求', '语义命中', '候选', '回填契约', '拒答建议')
+CONTEXT_ENVELOPE_OPTIONAL = ('分歧告警',)
+
+#: **回填响应**信封（LLM 回填后、过校验器前的形状）。`方案` 是 LLM 产出的
+#: `PLAN_*` 结构；`模型` 是回填来源标识（人手填为 `'人工'`，端到端为端点名），
+#: 供录像（ADR-41 §8）与溯源用。`溯源` 可选，端到端时带上每个数字的来源块名。
+FILLED_ENVELOPE_REQUIRED = ('需求', '方案', '模型')
+FILLED_ENVELOPE_OPTIONAL = ('溯源',)
 
 
 # ---- 构造器 -----------------------------------------------------------
@@ -278,6 +352,95 @@ def make_saved_plan_list(条目: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return dict(zip(SAVED_PLAN_LIST_ENVELOPE, (list(条目),)))
 
 
+# ---- 规划器通道构造器（v0.27.0 W148）--------------------------------
+
+def make_slot(名: str, 类型: str) -> Dict[str, str]:
+    """构造一个块**输入槽**。`类型` 应落 ADR-26 类型词表，本层不校验取值域
+    （那是 W149 `共享.类型` 与块元数据的事），只保证键名来自 `SLOT_REQUIRED`。"""
+    return dict(zip(SLOT_REQUIRED, (名, 类型)))
+
+
+def make_context_candidate(名称: str, 领域: str, 层级: int, 导出名: str, 描述: str,
+                           分数: float, 输入槽: Sequence[Dict[str, str]],
+                           输出类型: str, 路径: str = '',
+                           命名空间: Optional[str] = None) -> Dict[str, Any]:
+    """构造一条**规划上下文包候选**：在 `make_candidate` 基础上补 `输入槽`/`输出类型`。
+
+    复用 `make_candidate` 造前七个字段，保证与「选响应」候选逐字节同构（数字口径、
+    键序都一致），再补两个新字段。`输入槽` 每项应是 `make_slot` 的产物。
+    """
+    候选 = make_candidate(名称, 领域, 层级, 导出名, 描述, 分数, 路径, 命名空间)
+    候选['输入槽'] = [dict(s) for s in 输入槽]
+    候选['输出类型'] = 输出类型
+    return 候选
+
+
+def make_semantic_hit(业务词: str, 表: str, 字段: str,
+                      口径说明: str) -> Dict[str, Any]:
+    """构造一条**语义命中**（读自 `制造/语义层.json`）。"""
+    return dict(zip(SEMANTIC_HIT_REQUIRED, (业务词, 表, 字段, 口径说明)))
+
+
+def make_divergence_warning(分歧点: str, 两侧块名: Sequence[str],
+                            实测差值: str,
+                            须显式选一条: bool = True) -> Dict[str, Any]:
+    """构造一条**分歧告警**（命中 ADR-40 §5 口径分歧点时）。
+
+    `须显式选一条` 默认 True——它存在本身就是「这里不许含糊」的信号，留参数只为
+    极少数「两侧口径在本数据集恒等值、可任选」的边界情形显式标 False。
+    """
+    return dict(zip(DIVERGENCE_WARNING_REQUIRED,
+                    (分歧点, list(两侧块名), 实测差值, bool(须显式选一条))))
+
+
+def make_fill_contract(必填: Sequence[str], 禁止: Sequence[str],
+                       目标: str = '方案') -> Dict[str, Any]:
+    """构造**回填契约**（给 LLM 的回填格式说明）。"""
+    return dict(zip(FILL_CONTRACT_REQUIRED, (目标, list(必填), list(禁止))))
+
+
+def make_reject_advice(覆盖: bool, 理由: str) -> Dict[str, Any]:
+    """构造**拒答建议**。`覆盖`=True 表示库内有对应能力；False 表示判为库外
+    （词表覆盖判定，非分数阈值，见 ADR-41 §5）。"""
+    return dict(zip(REJECT_ADVICE_REQUIRED, (bool(覆盖), 理由)))
+
+
+def make_context_envelope(需求: str, 语义命中: Sequence[Dict[str, Any]],
+                          候选: Sequence[Dict[str, Any]],
+                          回填契约: Dict[str, Any],
+                          拒答建议: Dict[str, Any],
+                          分歧告警: Optional[Sequence[Dict[str, Any]]] = None
+                          ) -> Dict[str, Any]:
+    """构造**规划上下文包**信封（`jk 块 规划` 的出口）。
+
+    `分歧告警` 为 None 时不写键（旧形状无关，这是新协议；但沿用「可选字段缺省
+    即不出现」的既有约定，形状最小化）。
+    """
+    信封: Dict[str, Any] = {
+        '需求': 需求,
+        '语义命中': [dict(h) for h in 语义命中],
+        '候选': list(候选),
+        '回填契约': dict(回填契约),
+        '拒答建议': dict(拒答建议),
+    }
+    if 分歧告警 is not None:
+        信封['分歧告警'] = [dict(w) for w in 分歧告警]
+    return 信封
+
+
+def make_filled_envelope(需求: str, 方案: Dict[str, Any], 模型: str,
+                         溯源: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """构造**回填响应**信封（LLM 回填后、过校验器前）。
+
+    `模型` 是回填来源标识：人手填 `'人工'`，端到端填端点名。它进录像（ADR-41 §8）
+    与溯源，不可省。
+    """
+    信封: Dict[str, Any] = {'需求': 需求, '方案': 方案, '模型': 模型}
+    if 溯源 is not None:
+        信封['溯源'] = 溯源
+    return 信封
+
+
 # ---- Hit → 候选 -------------------------------------------------------
 
 _LEVELS: Optional[Dict[str, int]] = None
@@ -411,11 +574,59 @@ def _check_str(obj: dict, 名: str, 位置: str, errs: List[str]) -> None:
         errs.append('%s.%s 必须是字符串' % (位置, 名))
 
 
-def validate_candidate(obj: Any, 位置: str = '候选') -> List[str]:
-    """校验一条 `候选`，返回中文错误列表。"""
-    errs = _check_keys(obj, CANDIDATE_REQUIRED, CANDIDATE_OPTIONAL, 位置)
-    if not isinstance(obj, dict):
-        return errs
+#: `共享[].类型` 的合法取值集，进程级缓存。延迟加载理由与 `_load_index` 同源：
+#: schema 是纯标准库层，不在 import 时反向依赖 `pkg.blocks`。
+_SHARED_TYPE_VOCAB: Optional[frozenset] = None
+
+
+def _shared_type_vocab() -> frozenset:
+    """ADR-26 类型词表里**可作共享常量声明类型**的那部分。
+
+    只收标量（数/字符串/布尔/函数/任意）与容器裸名（列表/字典/元组），**不收结构化
+    类型对象**：`共享[].值` 是一个字面量串，声明它是 `列表<数>` 这种细化类型没有
+    意义——粘合器拿到的仍然是那个串。要细化类型的是块的形参，不是共享常量。
+
+    取不到词表（极端裁剪安装）时返回空集：那种情况下本校验退化为「只查是字符串」，
+    宁可放行也不要把一条 `组` 请求打挂——真正的类型把关在 `glue.py`（W151）。
+    """
+    global _SHARED_TYPE_VOCAB
+    if _SHARED_TYPE_VOCAB is not None:
+        return _SHARED_TYPE_VOCAB
+    try:
+        from ..pkg.blocks import SCALAR_TYPES, CONTAINER_TYPE_NAMES
+        _SHARED_TYPE_VOCAB = frozenset(SCALAR_TYPES) | frozenset(CONTAINER_TYPE_NAMES)
+    except ImportError:
+        _SHARED_TYPE_VOCAB = frozenset()
+    return _SHARED_TYPE_VOCAB
+
+
+def _check_shared_type(项: dict, 位置: str, errs: List[str]) -> None:
+    """校验 `共享[].类型`（v0.27.0 W149 新增的可选键）。
+
+    **非法值一律报错，不静默降级为 `任意`。** 静默降级正是本轮要修的病根：v0.26.0
+    W145 实测，`共享` 常量被无条件当 `任意` 入池后，`任意` 在 `type_feeds` 双向放行，
+    于是每个字符串常量对每个形参都「类型兼容」，粘合器按「最近产出优先」**静默错绑**
+    （`读表(赵产量列)`），既不落 `?` 占位也不写拒绝理由，运行期才死。
+    写错类型名却被当成 `任意` 放行，等于把同一个坑重挖一遍。
+    """
+    if '类型' not in 项:
+        return                      # 不声明是合法的：旧方案一份都不用改
+    值 = 项['类型']
+    if not isinstance(值, str):
+        return                      # 类型错误已由 _check_str 报过，不重复
+    词表 = _shared_type_vocab()
+    if 词表 and 值 not in 词表:
+        errs.append('%s.类型 「%s」不在 ADR-26 类型词表里（允许：%s）；'
+                    '写错的类型名不会被当作「任意」放行——那正是静默错绑的成因'
+                    % (位置, 值, '/'.join(sorted(词表))))
+
+
+def _check_candidate_fields(obj: dict, 位置: str, errs: List[str]) -> None:
+    """候选的**逐字段**类型/取值检查（不含键集）。
+
+    抽出来是给 `validate_candidate` 与 `validate_context_candidate` 共用：两者键集
+    不同（后者多 `输入槽`/`输出类型`），字段口径必须完全一致——分成两份手写必然漂。
+    """
     for 名 in ('名称', '领域', '导出名', '描述', '路径', '命名空间'):
         _check_str(obj, 名, 位置, errs)
     if '导出名' in obj and isinstance(obj['导出名'], str) and not obj['导出名']:
@@ -425,6 +636,14 @@ def validate_candidate(obj: Any, 位置: str = '候选') -> List[str]:
         errs.append('%s.层级 必须是整数' % 位置)
     if '分数' in obj and not isinstance(obj['分数'], (int, float)):
         errs.append('%s.分数 必须是数字' % 位置)
+
+
+def validate_candidate(obj: Any, 位置: str = '候选') -> List[str]:
+    """校验一条 `候选`，返回中文错误列表。"""
+    errs = _check_keys(obj, CANDIDATE_REQUIRED, CANDIDATE_OPTIONAL, 位置)
+    if not isinstance(obj, dict):
+        return errs
+    _check_candidate_fields(obj, 位置, errs)
     return errs
 
 
@@ -454,7 +673,11 @@ def validate_plan(obj: Any, 位置: str = '方案') -> List[str]:
         else:
             for i, 项 in enumerate(共享, 1):
                 where = '%s.共享[%d]' % (位置, i)
-                errs.extend(_check_keys(项, ('名', '值'), (), where))
+                errs.extend(_check_keys(项, ('名', '值'), ('类型',), where))
+                if isinstance(项, dict):
+                    for 名 in ('名', '值', '类型'):
+                        _check_str(项, 名, where, errs)
+                    _check_shared_type(项, where, errs)
     打印 = obj.get('打印')
     if 打印 is not None and not isinstance(打印, list):
         errs.append('%s.打印 必须是数组' % 位置)
@@ -525,6 +748,137 @@ def validate_run_envelope(obj: Any, 位置: str = '跑响应') -> List[str]:
     return errs
 
 
+def validate_context_candidate(obj: Any, 位置: str = '上下文候选') -> List[str]:
+    """校验一条**规划上下文包候选**（候选 + `输入槽` + `输出类型`）。
+
+    与 `validate_candidate` 共用 `_check_candidate_fields`，只在键集与两个新字段上
+    分叉。`输入槽` 必须是数组（**可以是空数组**——零参数块合法），每项键集严格等于
+    `SLOT_REQUIRED`。
+    """
+    errs = _check_keys(obj, CONTEXT_CANDIDATE_REQUIRED,
+                       CONTEXT_CANDIDATE_OPTIONAL, 位置)
+    if not isinstance(obj, dict):
+        return errs
+    _check_candidate_fields(obj, 位置, errs)
+    _check_str(obj, '输出类型', 位置, errs)
+    槽表 = obj.get('输入槽')
+    if 槽表 is not None:
+        if not isinstance(槽表, list):
+            errs.append('%s.输入槽 必须是数组' % 位置)
+        else:
+            for i, 槽 in enumerate(槽表, 1):
+                where = '%s.输入槽[%d]' % (位置, i)
+                errs.extend(_check_keys(槽, SLOT_REQUIRED, (), where))
+                if isinstance(槽, dict):
+                    for 名 in SLOT_REQUIRED:
+                        _check_str(槽, 名, where, errs)
+                        if isinstance(槽.get(名), str) and not 槽[名]:
+                            errs.append('%s.%s 不能是空串（LLM 靠它写实参）'
+                                        % (where, 名))
+    return errs
+
+
+def validate_context_envelope(obj: Any, 位置: str = '规划上下文包') -> List[str]:
+    """校验**规划上下文包**信封（含每条候选/语义命中/分歧告警）。
+
+    `候选` 允许为空数组——`拒答建议.覆盖=False` 时本就该是空的；空候选不是错误，
+    错误是「拒答建议说没覆盖却还塞了候选」这类自相矛盾，那一条在此**不查**：
+    规划器自己保证一致性，校验器只管形状（把语义判断塞进 schema 层会让它反向依赖
+    检索/语义层，违背本模块「纯标准库、不反向依赖上层」的约定）。
+    """
+    errs = _check_keys(obj, CONTEXT_ENVELOPE_REQUIRED,
+                       CONTEXT_ENVELOPE_OPTIONAL, 位置)
+    if not isinstance(obj, dict):
+        return errs
+    _check_str(obj, '需求', 位置, errs)
+
+    候选 = obj.get('候选')
+    if 候选 is not None:
+        if not isinstance(候选, list):
+            errs.append('%s.候选 必须是数组' % 位置)
+        else:
+            for i, c in enumerate(候选, 1):
+                errs.extend(validate_context_candidate(
+                    c, '%s.候选[%d]' % (位置, i)))
+
+    命中 = obj.get('语义命中')
+    if 命中 is not None:
+        if not isinstance(命中, list):
+            errs.append('%s.语义命中 必须是数组' % 位置)
+        else:
+            for i, h in enumerate(命中, 1):
+                where = '%s.语义命中[%d]' % (位置, i)
+                errs.extend(_check_keys(h, SEMANTIC_HIT_REQUIRED,
+                                        SEMANTIC_HIT_OPTIONAL, where))
+                if isinstance(h, dict):
+                    for 名 in SEMANTIC_HIT_REQUIRED:
+                        _check_str(h, 名, where, errs)
+
+    告警 = obj.get('分歧告警')
+    if 告警 is not None:
+        if not isinstance(告警, list):
+            errs.append('%s.分歧告警 必须是数组' % 位置)
+        else:
+            for i, w in enumerate(告警, 1):
+                where = '%s.分歧告警[%d]' % (位置, i)
+                errs.extend(_check_keys(w, DIVERGENCE_WARNING_REQUIRED, (), where))
+                if isinstance(w, dict):
+                    for 名 in ('分歧点', '实测差值'):
+                        _check_str(w, 名, where, errs)
+                    两侧 = w.get('两侧块名')
+                    if 两侧 is not None and not isinstance(两侧, list):
+                        errs.append('%s.两侧块名 必须是数组' % where)
+                    if '须显式选一条' in w and not isinstance(w['须显式选一条'], bool):
+                        errs.append('%s.须显式选一条 必须是布尔' % where)
+
+    契约 = obj.get('回填契约')
+    if 契约 is not None:
+        where = '%s.回填契约' % 位置
+        errs.extend(_check_keys(契约, FILL_CONTRACT_REQUIRED, (), where))
+        if isinstance(契约, dict):
+            _check_str(契约, '目标', where, errs)
+            for 名 in ('必填', '禁止'):
+                if 名 in 契约 and not isinstance(契约[名], list):
+                    errs.append('%s.%s 必须是数组' % (where, 名))
+
+    建议 = obj.get('拒答建议')
+    if 建议 is not None:
+        where = '%s.拒答建议' % 位置
+        errs.extend(_check_keys(建议, REJECT_ADVICE_REQUIRED, (), where))
+        if isinstance(建议, dict):
+            _check_str(建议, '理由', where, errs)
+            if '覆盖' in 建议 and not isinstance(建议['覆盖'], bool):
+                errs.append('%s.覆盖 必须是布尔（不是分数，也不是字符串）' % where)
+            if 建议.get('覆盖') is False and not (建议.get('理由') or '').strip():
+                errs.append('%s.覆盖=False 时 理由 不能为空——判为库外能力必须说清'
+                            '为什么，否则调用方无从复核' % where)
+    return errs
+
+
+def validate_filled_envelope(obj: Any, 位置: str = '回填响应') -> List[str]:
+    """校验**回填响应**信封（含嵌套 `方案`）。
+
+    这里只做**形状**校验。ADR-41 §4 那五条硬规则（实参必填且长度等于输入槽数、
+    块名白名单、分歧点必须选一条…）要拿上下文包做参照，落在
+    `tools/ai-bridge/planner.py` 的 `validate_filled`，不在本层——schema 层拿不到
+    候选清单，也不该拿。
+    """
+    errs = _check_keys(obj, FILLED_ENVELOPE_REQUIRED,
+                       FILLED_ENVELOPE_OPTIONAL, 位置)
+    if not isinstance(obj, dict):
+        return errs
+    _check_str(obj, '需求', 位置, errs)
+    _check_str(obj, '模型', 位置, errs)
+    if isinstance(obj.get('模型'), str) and not obj['模型'].strip():
+        errs.append('%s.模型 不能是空串（录像与溯源要靠它标明回填来源）' % 位置)
+    if '方案' in obj:
+        errs.extend(validate_plan(obj['方案'], '%s.方案' % 位置))
+    溯源 = obj.get('溯源')
+    if 溯源 is not None and not isinstance(溯源, dict):
+        errs.append('%s.溯源 必须是对象' % 位置)
+    return errs
+
+
 def _ensure(errs: List[str], obj):
     if errs:
         raise SchemaError('；'.join(errs))
@@ -554,3 +908,17 @@ def ensure_select_envelope(obj: Any, 位置: str = '选响应'):
 def ensure_run_envelope(obj: Any, 位置: str = '跑响应'):
     """校验 `跑` 的响应信封，不通过抛 `SchemaError`；通过则原样返回。"""
     return _ensure(validate_run_envelope(obj, 位置), obj)
+
+
+def ensure_context_envelope(obj: Any, 位置: str = '规划上下文包'):
+    """校验**规划上下文包**，不通过抛 `SchemaError`；通过则原样返回。"""
+    return _ensure(validate_context_envelope(obj, 位置), obj)
+
+
+def ensure_filled_envelope(obj: Any, 位置: str = '回填响应'):
+    """校验**回填响应**的形状，不通过抛 `SchemaError`；通过则原样返回。
+
+    注意：这只是形状闸门。ADR-41 §4 的五条硬规则在 `planner.validate_filled`，
+    过了本函数**不等于**这份回填可以拿去 `组`。
+    """
+    return _ensure(validate_filled_envelope(obj, 位置), obj)

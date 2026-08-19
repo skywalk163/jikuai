@@ -295,6 +295,24 @@ def main(argv):
     if check_manufacturing_contract.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
+    # G23：规划器契约（W161 · v0.27.0 · ADR-41 §4/§8）。四条断言：协议字段名只从
+    # schema 常量取（AST 扫 planner.py 的键位字面量）+ 上下文包/回填信封字段集冻结 /
+    # 五条硬规则长在原处 / **行为断言**（六个场景证明「缺 `参数` 即拒」这类守卫真在
+    # 守，不只是函数还在）/ 录像回放全绿。
+    #
+    # 同 G16/G17/G19/G22：**不**学 G13+ 的 `except → 跳过`。
+    #
+    # **它比 G10-G19 慢**（第 4 条子进程跑 `bench_planner.py --只回放 --门禁`，
+    # 本机约 8.5 秒：15 份录像逐份过校验器 → 组 → 跑，还要读 8 张 CSV）。刻意仍串在
+    # 这里而不学 G20 只打提示：G20 要 `python -m build`（量级再差两个数量级、多一个
+    # build 依赖），而 8 秒换「录像回放进 CI」是划得来的——v0.25.0 W129 / v0.26.0
+    # W144 的教训是新门禁没在 CI 真跑过就不算落地。录像或 `赛题/` 数据集不在场时
+    # 它打「跳过第 4 条」而不是静默当通过。
+    import check_planner_contract
+    if check_planner_contract.main(["--quiet"]) != 0:
+        exit_code = exit_code or 1
+
+
     # G20：wheel 内容门禁（W116 · v0.24.0 · ADR-39 §5）。守 BACKLOG §10 那次
     # 已经发生过的事故——PyPI 0.4.1 的 wheel 里零个 stdlib 文件，装完 `导入 数学`
     # 直接失败，而本机 editable 一切正常。**刻意不在这里跑**：G10–G19 全是秒级

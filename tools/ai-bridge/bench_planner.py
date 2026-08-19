@@ -176,9 +176,14 @@ def 块库块数() -> int:
     return len(index.get('块') or [])
 
 
-def 读录像() -> List[dict]:
-    """读清单 + 每条录像的回填信封。返回逐条 dict（含 `信封` 键）。"""
-    d = os.path.join(_HERE, 录像目录)
+def 读录像(目录: Optional[str] = None) -> List[dict]:
+    """读清单 + 每条录像的回填信封。返回逐条 dict（含 `信封` 键）。
+
+    `目录` 只为 W161 的 G23 反例而存在：门禁要能指向 `tmp_path` 里的一份篡改副本，
+    验证「篡改块名 / 删 `参数` / 改 `期望判定`」三类反例真能让回放红。缺省走仓内
+    `规划录像/`。
+    """
+    d = 目录 or os.path.join(_HERE, 录像目录)
     with open(os.path.join(d, 录像清单), 'r', encoding='utf-8') as f:
         清单 = json.load(f)
     出 = []
@@ -422,8 +427,14 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
                    help='回放判定与清单登记不一致即退 1（缺省只报数、恒退 0）')
     p.add_argument('--拒因', dest='show_reasons', action='store_true',
                    help='打印被拒录像的逐条拒因首行')
+    p.add_argument('--录像目录', dest='replay_dir', default=None,
+                   help='录像目录（含 清单.json）。缺省 = 仓内 规划录像/；'
+                        'G23 的反例用它指向 tmp_path 里的篡改副本')
     p.add_argument('--json', action='store_true', help='只输出 JSON 指标')
     args = p.parse_args(list(argv) if argv is not None else None)
+
+    # `--录像目录` 先绝对化再 chdir：相对路径是相对调用方的 cwd，chdir 之后就变味了。
+    录像dir = (os.path.abspath(args.replay_dir) if args.replay_dir else None)
 
     # `跑` 要读 赛题/chatbi/数据集/*.csv 的相对路径，钉死工作目录到仓库根。
     os.chdir(_REPO)
@@ -435,7 +446,7 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
     调优 = load_evalset(POS_TUNE)['用例']
     留出 = load_evalset(POS_HOLD)['用例']
     期望结果表 = {c['id']: c.get('期望结果', '') for c in 调优 + 留出}
-    录像 = 读录像()
+    录像 = 读录像(录像dir)
     录像块表 = {条['id']: 条['块'] for 条 in 录像}
 
     报: Dict[str, Any] = {'块数': 块数, '录像数': len(录像)}

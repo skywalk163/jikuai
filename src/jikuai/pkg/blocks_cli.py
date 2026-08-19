@@ -6,6 +6,8 @@
     jk 块 列表 [--领域 X] [--层级 N] [--稳定性 stable]   list
     jk 块 查找 <关键词>                                  search
     jk 块 选 <需求> [--top N] [--json] [--组] [--神经]  select/pick
+    jk 块 规划 <问句> [--top N] [--json]                 plan
+    jk 块 问 <问句> --模型 <端点> [--json] [--严格]      ask
     jk 块 组 <方案.json | ->                             synthesize/assemble
     jk 块 跑 <方案.json | ->                             run
     jk 块 详情 <块名>                                    show
@@ -40,6 +42,20 @@ from ..service import schema
 
 __all__ = ['main', 'run']
 
+#: 规划通道（W158-W159 · ADR-41）的三个常量。定在 `_USAGE` 之前是因为
+#: `_USAGE` 是 f-string，加载时就要取 `_ENV问密钥` 的值。
+#:
+#: `问` 从这个环境变量取端点鉴权 token。**刻意不收命令行传 key**——命令行会进
+#: shell history、进 `ps` 输出、进 CI 日志，是三条各自独立的泄露路径。
+_ENV问密钥 = 'JIKUAI_PLANNER_TOKEN'
+
+#: 端点超时（秒）。一次规划推理比嵌入 sidecar 的冷启动更慢，留足余量。
+_问超时 = 120.0
+
+#: `问` 允许的端点 scheme。`file:`/`data:`/`ftp:` 交给 `urlopen` 会去读本机文件或
+#: 起一条不是「调模型」的连接，一律当输入错误拒掉——白名单比黑名单可靠。
+_问允许协议 = ('http', 'https')
+
 _USAGE = f"""极快块生态 用法：
   jk 块 列表 [--领域 X] [--层级 N] [--稳定性 stable]
                                  列出所有块（可按领域/层级/稳定性过滤）
@@ -50,6 +66,14 @@ _USAGE = f"""极快块生态 用法：
                                  --神经：subprocess 拉 sidecar 生成查询向量走
                                          神经检索（失败自动降级启发式）
                                  --向量 <文件>：查询向量已算好，读文件直用
+  jk 块 规划 <问句> [--top N] [--json]
+                                 问句 → 规划上下文包（ADR-41 §3）。**纯离线、
+                                 不碰模型**：候选带输入槽/输出类型，供 LLM 回填
+                                 --json：出协议原文；默认出四段分级报告
+  jk 块 问 <问句> --模型 <端点> [--json] [--严格]
+                                 端到端：上下文包 → 端点 → 回填 → 校验 → 组 → 跑
+                                 不给 --模型 退 1 并指向 `规划`，不静默降级
+                                 端点 token 从环境变量 {_ENV问密钥} 取，命令行不收 key
   jk 块 组 <方案.json | ->       方案 JSON → 极快源码（synthesize）
   jk 块 跑 <方案.json | ->       方案 JSON → 组 → 执行 → 结果（run）
   jk 块 详情 <块名>              显示某个块的完整元数据与示例
@@ -66,9 +90,11 @@ _USAGE = f"""极快块生态 用法：
 
 三段式：选（需求→候选）→ 组（方案→源码）→ 跑（方案→结果）
   端到端：jk 块 选 "需求" --组 | jk 块 跑 -
+规划通道：规划（问句→上下文包）→ 你回填 → 组 / 跑；`问` 是同一条链的模型自填版
 
-英文别名：list(ls) / search(find) / select(pick) / synthesize(assemble) /
-          run / show(info) / check(validate) / index / new(init) / help
+英文别名：list(ls) / search(find) / select(pick) / plan / ask /
+          synthesize(assemble) / run / show(info) / check(validate) / index /
+          new(init) / help
 
 领域白名单：{'/'.join(sorted(ALLOWED_DOMAINS))}
 稳定性等级：{'/'.join(sorted(STABILITY_LEVELS))}
@@ -79,6 +105,8 @@ _ALIASES = {
     '列表': 'list', 'list': 'list', 'ls': 'list',
     '查找': 'search', '搜索': 'search', 'search': 'search', 'find': 'search',
     '选': 'select', '选块': 'select', 'select': 'select', 'pick': 'select',
+    '规划': 'plan', 'plan': 'plan',
+    '问': 'ask', '问答': 'ask', 'ask': 'ask',
     '组': 'synthesize', '组装': 'synthesize', '粘合': 'synthesize',
     'synthesize': 'synthesize', 'assemble': 'synthesize',
     '跑': 'run', '执行': 'run', 'run': 'run',
@@ -171,6 +199,18 @@ _F参数, _F说明, _F命名空间 = schema.STEP_OPTIONAL
 _F名称, _, _, _F候选导出名, _F描述, _, _ = schema.CANDIDATE_REQUIRED
 _Fstdout, _Fstderr, _F返回值, _F耗时毫秒 = schema.RESULT_REQUIRED
 _F错误, _F诊断 = schema.RESULT_OPTIONAL
+# 规划通道（W158/W159 · ADR-41）。上下文包候选比「选响应」候选多两个键，
+# 整元组解包 9 个名字——协议在中间插一个字段也会当场 ValueError。
+_C需求, _C语义命中, _C候选, _C回填契约, _C拒答建议 = schema.CONTEXT_ENVELOPE_REQUIRED
+_C分歧告警, = schema.CONTEXT_ENVELOPE_OPTIONAL
+(_, _F候选领域, _F候选层级, _, _, _F分数, _F候选路径,
+ _F输入槽, _F输出类型) = schema.CONTEXT_CANDIDATE_REQUIRED
+_F槽名, _F槽类型 = schema.SLOT_REQUIRED
+_F覆盖, _F拒答理由 = schema.REJECT_ADVICE_REQUIRED
+_F分歧点, _F两侧块名, _F实测差值, _F须显式选一条 = schema.DIVERGENCE_WARNING_REQUIRED
+_F业务词, _F表, _F字段, _F口径说明 = schema.SEMANTIC_HIT_REQUIRED
+_R需求, _R方案, _R模型 = schema.FILLED_ENVELOPE_REQUIRED
+_R溯源, = schema.FILLED_ENVELOPE_OPTIONAL
 
 #: `选` 的人读候选行：`  1. 求和（数据）  分数 0.1234`
 import re as _re
@@ -180,6 +220,10 @@ _人读需求行 = _re.compile(r'^需求：(?P<需求>.*?)(?:\s{2,}\[|\s*$)')
 #: 粘合器模块缓存（`tools/ai-bridge/glue.py` 不是包，按文件路径加载）。
 _GLUE = None
 
+#: 规划器模块缓存（`tools/ai-bridge/planner.py`，同上）。
+_PLANNER = None
+
+
 
 def _repo_root() -> str:
     """仓库根目录（`src/jikuai/pkg` → 上三级），与 `blocks.blocks_root()` 同算法。"""
@@ -187,29 +231,53 @@ def _repo_root() -> str:
     return os.path.normpath(os.path.join(here, '..', '..', '..'))
 
 
-def _glue():
-    """按文件路径加载 `tools/ai-bridge/glue.py`。
+def _按路径加载(文件名: str, 模块名: str, 用途: str):
+    """按文件路径加载 `tools/ai-bridge/<文件名>`，返回模块对象。
 
     `tools/ai-bridge` 不是包，也不该是——它是桥接工具而非运行时的一部分。
     比 `sys.path.insert` 干净：用 `importlib` 挂一个带命名空间前缀的模块名
-    （`_jikuai_ai_bridge_glue`），既不污染 `sys.path`，也不会和别人的
-    `import glue` 撞车。glue.py 自己会把 `src/` 插进 sys.path，那是它的事。
+    （`_jikuai_ai_bridge_*`），既不污染 `sys.path`，也不会和别人的
+    `import glue` / `import planner` 撞车。被加载的模块自己会把 `src/` 插进
+    `sys.path`，那是它的事。
+
+    缺文件 / 加载不成一律抛 `BlockError`（带 `用途` 说明），不让裸异常冒到用户脸上。
     """
-    global _GLUE
-    if _GLUE is not None:
-        return _GLUE
     import importlib.util
-    path = os.path.join(_repo_root(), 'tools', 'ai-bridge', 'glue.py')
+    path = os.path.join(_repo_root(), 'tools', 'ai-bridge', 文件名)
     if not os.path.isfile(path):
-        raise BlockError('找不到粘合器 %s；组/跑 需要仓库内的 tools/ai-bridge/' % path)
-    spec = importlib.util.spec_from_file_location('_jikuai_ai_bridge_glue', path)
+        raise BlockError('找不到 %s；%s' % (path, 用途))
+    spec = importlib.util.spec_from_file_location(模块名, path)
     if spec is None or spec.loader is None:      # 理论上不可达，保底不抛裸异常
-        raise BlockError('粘合器 %s 无法作为模块加载' % path)
+        raise BlockError('%s 无法作为模块加载' % path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    _GLUE = mod
     return mod
+
+
+def _glue():
+    """按文件路径加载 `tools/ai-bridge/glue.py`（进程内缓存一次）。"""
+    global _GLUE
+    if _GLUE is None:
+        _GLUE = _按路径加载('glue.py', '_jikuai_ai_bridge_glue',
+                            '组/跑 需要仓库内的 tools/ai-bridge/')
+    return _GLUE
+
+
+def _planner():
+    """按文件路径加载 `tools/ai-bridge/planner.py`（口径同 `_glue`）。
+
+    规划器不进 wheel（ADR-41 §7），所以 `规划`/`问` 只在仓库内可用——
+    装了 wheel 的用户调这两条命令会拿到「找不到 …/planner.py」这条可读错误，
+    而不是一个 `ModuleNotFoundError`。
+    """
+    global _PLANNER
+    if _PLANNER is None:
+        _PLANNER = _按路径加载('planner.py', '_jikuai_ai_bridge_planner',
+                               '规划/问 需要仓库内的 tools/ai-bridge/'
+                               '（规划器按 ADR-41 §7 不进 wheel）')
+    return _PLANNER
+
 
 
 def _块目录(领域: str, 块: str, 命名空间: str = '') -> str:
@@ -1178,10 +1246,298 @@ def _cmd_new(args: List[str]) -> int:
     return _EXIT_OK
 
 
+def _槽摘要(槽表) -> str:
+    """`输入槽` → `名:类型 名:类型` 一行摘要；空槽给「（无入参）」。"""
+    if not 槽表:
+        return '（无入参）'
+    return ' '.join('%s:%s' % (s.get(_F槽名), s.get(_F槽类型))
+                    for s in 槽表 if isinstance(s, dict))
+
+
+def _分级报告(包: dict) -> List[str]:
+    """上下文包 → 人读**分级报告**（W159）。返回行列表，调用方逐行打印。
+
+    分级依据是「拿到这份包之后你该先看什么」，越该先看的排越前：
+
+    1. **拒答判定**——`覆盖` 为假就该停手自己写，后面几段都不必看了。
+    2. **分歧告警**——覆盖了但口径有分歧，必须显式选一条，选不出同样该停。
+    3. **语义命中**——命中的业务词 → 表/字段/口径，回填时的事实依据。
+    4. **候选**——带 `输入槽`/`输出类型`，回填 `参数` 照槽的个数与类型抄。
+
+    刻意**不**打 `回填契约`：那段是给 LLM 读的长文，人读模式打出来只会把前四段
+    冲掉。要看它就 `--json`。
+    """
+    行 = []
+    建议 = 包.get(_C拒答建议) or {}
+    覆盖 = bool(建议.get(_F覆盖))
+    行.append('问句：%s' % 包.get(_C需求))
+    行.append('')
+    行.append('【1/4 拒答判定】%s' % ('库内能力，可继续回填' if 覆盖
+                                     else '**判为库外能力，建议自己写**'))
+    行.append('  %s' % 建议.get(_F拒答理由))
+
+    告警表 = 包.get(_C分歧告警) or []
+    行.append('')
+    if 告警表:
+        行.append('【2/4 口径分歧】%d 处，**每处都要显式选一条**' % len(告警表))
+        for w in 告警表:
+            两侧 = w.get(_F两侧块名) or []
+            行.append('  · %s：%s' % (w.get(_F分歧点), ' / '.join(两侧)
+                                     if len(两侧) > 1 else
+                                     '只有「%s」一侧有块（另一侧的算法是错的，'
+                                     '不许自己另算）' % (两侧[0] if 两侧 else '?')))
+            行.append('    实测差值：%s' % w.get(_F实测差值))
+            if not w.get(_F须显式选一条):
+                行.append('    （本处不强制选一条）')
+    else:
+        行.append('【2/4 口径分歧】无')
+
+    命中表 = 包.get(_C语义命中) or []
+    行.append('')
+    if 命中表:
+        行.append('【3/4 语义命中】%d 个业务词' % len(命中表))
+        for h in 命中表:
+            行.append('  · %s → %s.%s' % (h.get(_F业务词), h.get(_F表),
+                                          h.get(_F字段)))
+            if h.get(_F口径说明):
+                行.append('    口径：%s' % h.get(_F口径说明))
+    else:
+        行.append('【3/4 语义命中】无（这就是上面判库外的一半原因）')
+
+    候选表 = 包.get(_C候选) or []
+    行.append('')
+    行.append('【4/4 候选】%d 条（分数是 TF-IDF 词面相关度，不衡量覆盖度）'
+              % len(候选表))
+    for i, c in enumerate(候选表, 1):
+        行.append('  %d. %s（%s，层级 %s）导出名 %s  分数 %.4f  %s'
+                  % (i, c.get(_F名称), c.get(_F候选领域), c.get(_F候选层级),
+                     c.get(_F候选导出名), c.get(_F分数) or 0.0,
+                     c.get(_F候选路径)))
+        行.append('     入参 %s → 出 %s'
+                  % (_槽摘要(c.get(_F输入槽)), c.get(_F输出类型)))
+        行.append('     %s' % c.get(_F描述))
+    return 行
+
+
+def _cmd_plan(args: List[str]) -> int:
+    """`jk 块 规划 <问句>` —— 问句 → 规划上下文包（ADR-41 §3）。**纯离线**。
+
+    这条命令一个模型都不碰：它只是把「问句 + 检索候选 + 语义层 + 块元数据」组装
+    成 LLM 能照着回填的受限结构。读到这段的 agent 自己就是那个 LLM——`规划` 出包，
+    你回填，再 `jk 块 组`/`跑`。
+
+    `--json` 出协议原文（机读）；默认出分级报告（人读，见 `_分级报告`）。
+    **拒答判定为库外时退出码仍是 0**：包本身是合法产出，判定写在 `拒答建议` 里
+    供调用方决策，不是本命令失败了。
+    """
+    需求 = None
+    top = 8
+    as_json = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--top':
+            if i + 1 >= len(args):
+                return _err('--top 缺少数值')
+            try:
+                top = int(args[i + 1])
+            except ValueError:
+                return _err(f'--top 需要整数，得到 {args[i + 1]!r}')
+            if top <= 0:
+                return _err('--top 必须是正整数')
+            i += 2
+        elif a == '--json':
+            as_json = True
+            i += 1
+        elif a.startswith('--'):
+            return _err(f'未知选项：{a}')
+        else:
+            if 需求 is not None:
+                return _err('问句只能给一条（含空格请用引号括起来）')
+            需求 = a
+            i += 1
+
+    if not 需求:
+        return _err('缺少问句。用法：jk 块 规划 <问句> [--top N] [--json]')
+    try:
+        包 = _planner().build_context(需求, top=top)
+    except (BlockError, ValueError) as e:
+        # ValueError 覆盖 schema.SchemaError（规划器自查未过 / 读不到块索引）。
+        return _err(str(e))
+    if as_json:
+        print(json.dumps(包, ensure_ascii=False, indent=2))
+    else:
+        print('\n'.join(_分级报告(包)))
+    return _EXIT_OK
+
+
+def _请求回填(端点: str, 包: dict, 超时: float = _问超时):
+    """POST 上下文包到端点，收一份**回填响应**。返回 `(回填, None)` 或 `(None, 理由)`。
+
+    契约：请求体是上下文包 JSON，响应体是回填响应 JSON（`需求`/`方案`/`模型`）。
+    鉴权 token 从 `JIKUAI_PLANNER_TOKEN` 取，取到就发 `Authorization: Bearer`。
+
+    **任何情况都不抛异常**（口径同 `embed_client.fetch_query_vector`）：网络错、
+    超时、非 JSON、JSON 不是对象，全收敛成一句可打的中文理由。端点响应是
+    **不可信输入**（ADR-41 §2），形状合不合法交给后面的校验器判，这里只负责
+    「拿到了一个 JSON 对象」这一步。
+    """
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlsplit
+
+    scheme = urlsplit(端点).scheme.lower()
+    if scheme not in _问允许协议:
+        return None, ('端点协议 %r 不在白名单（只收 %s）'
+                      % (scheme or '（空）', '/'.join(_问允许协议)))
+    体 = json.dumps(包, ensure_ascii=False).encode('utf-8')
+    头 = {'Content-Type': 'application/json; charset=utf-8'}
+    token = os.environ.get(_ENV问密钥, '').strip()
+    if token:
+        头['Authorization'] = 'Bearer %s' % token
+    请求 = urllib.request.Request(端点, data=体, headers=头, method='POST')
+    try:
+        with urllib.request.urlopen(请求, timeout=超时) as 响应:
+            原文 = 响应.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        return None, '端点返回 HTTP %s %s' % (e.code, e.reason)
+    except urllib.error.URLError as e:
+        return None, '连不上端点 %s：%s' % (端点, e.reason)
+    except (OSError, ValueError) as e:
+        # OSError 覆盖超时一类；ValueError 覆盖 `UnicodeEncodeError`——请求行必须是
+        # ASCII（CVE-2019-9740 的防线），URL 里带中文路径时 `http.client` 就在这里
+        # 抛。它不是 OSError，漏掉的话用户会吃一个裸 traceback。
+        return None, '请求端点失败：%s' % e
+    try:
+        回填 = json.loads(原文)
+    except ValueError as e:
+        节选 = 原文.strip()[:200]
+        return None, ('端点响应不是合法 JSON：%s；开头 200 字是 %r' % (e, 节选))
+    if not isinstance(回填, dict):
+        return None, '端点响应是 %s，不是回填响应对象' % type(回填).__name__
+    return 回填, None
+
+
+def _cmd_ask(args: List[str]) -> int:
+    """`jk 块 问 <问句> --模型 <端点>` —— 端到端：包 → 端点 → 校验 → 组 → 跑。
+
+    与 `规划` 的分工：`规划` 出包给人/agent 手填，`问` 让外部端点自填。**两条路径
+    回填后走同一个 `planner.validate_filled`**（ADR-41 §2 硬约束）——`问` 不因为
+    「模型是自己调的、应该更可信」就旁路校验。
+
+    不给 `--模型` 直接退 1 并指向 `规划`，**不静默降级**到某个内置默认端点：
+    悄悄换一个端点跑出来的答案，比报错糟得多。
+
+    拒答判定为库外时**在调端点之前就停**，不浪费一次推理，也不给模型一个注定
+    要编的上下文。退出码：0 成功 / 1 输入或校验被拒 / 2 执行期报错。
+    """
+    需求 = None
+    端点 = None
+    top = 8
+    as_json = False
+    严格 = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('--模型', '--model'):
+            if i + 1 >= len(args):
+                return _err('--模型 缺少端点 URL')
+            端点 = args[i + 1]
+            i += 2
+        elif a == '--top':
+            if i + 1 >= len(args):
+                return _err('--top 缺少数值')
+            try:
+                top = int(args[i + 1])
+            except ValueError:
+                return _err(f'--top 需要整数，得到 {args[i + 1]!r}')
+            if top <= 0:
+                return _err('--top 必须是正整数')
+            i += 2
+        elif a == '--json':
+            as_json = True
+            i += 1
+        elif a in ('--严格', '--strict'):
+            严格 = True
+            i += 1
+        elif a.startswith('--'):
+            return _err(f'未知选项：{a}')
+        else:
+            if 需求 is not None:
+                return _err('问句只能给一条（含空格请用引号括起来）')
+            需求 = a
+            i += 1
+
+    if not 需求:
+        return _err('缺少问句。用法：jk 块 问 <问句> --模型 <端点> [--json]')
+    if not 端点:
+        return _err('`问` 必须给 `--模型 <端点>`。只想要上下文包、自己回填的话，'
+                    '用 `jk 块 规划 "%s"`——不给端点时本命令不会静默换一个默认'
+                    '端点顶上（ADR-41 §2）。端点鉴权 token 从环境变量 %s 取，'
+                    '命令行不收 key' % (需求, _ENV问密钥))
+
+    planner = None
+    try:
+        planner = _planner()
+        包 = planner.build_context(需求, top=top)
+    except (BlockError, ValueError) as e:
+        return _err(str(e))
+
+    建议 = 包.get(_C拒答建议) or {}
+    if not 建议.get(_F覆盖):
+        return _err('拒答（调端点前就停）：%s。要自己看这份上下文包就跑 '
+                    '`jk 块 规划 "%s"`' % (建议.get(_F拒答理由), 需求))
+    for w in (包.get(_C分歧告警) or []):
+        print('口径分歧告警：%s（两侧 %s，实测差值 %s）'
+              % (w.get(_F分歧点), '/'.join(w.get(_F两侧块名) or []),
+                 w.get(_F实测差值)), file=sys.stderr)
+
+    回填, 理由 = _请求回填(端点, 包)
+    if 回填 is None:
+        return _err('端点 %s 没给出可用回填：%s' % (端点, 理由))
+
+    拒 = planner.validate_filled(回填, 包, 严格=严格)
+    if 拒:
+        for r in 拒:
+            print('校验拒绝：%s' % r, file=sys.stderr)
+        return _err('端点回填未过校验器（%d 条理由见上）。端点响应一律当不可信'
+                    '输入，不存在「模型自己调的所以放行」' % len(拒))
+
+    try:
+        方案 = _校验方案(回填.get(_R方案) or {})
+        源码 = _组装(方案, 自动链式=False)
+    except (BlockError, ValueError) as e:
+        return _err(str(e))
+    if _占位记号 in 源码:
+        # 校验器过了却还落占位，说明规则 1 与粘合器的推参口径出现缝隙——真发生了
+        # 就是本轮的 bug，报出来比让用户拿一份带 `?` 的源码去跑好。
+        return _err('组出的源码含「%s」，但回填已过五条硬规则——这是规划器与粘合器'
+                    '的口径缝隙，请连问句一起报 issue' % _占位记号)
+
+    执行结果 = _执行源码(源码)
+    溯源 = 回填.get(_R溯源)
+    if as_json:
+        信封 = schema.make_run_envelope(源码, 执行结果, 需求=需求)
+        print(json.dumps(信封, ensure_ascii=False, indent=2))
+    else:
+        sys.stdout.write(执行结果.get(_Fstdout, ''))
+        sys.stderr.write(执行结果.get(_Fstderr, ''))
+        print('（回填来源：%s）' % 回填.get(_R模型), file=sys.stderr)
+        if 溯源 is not None:
+            print('溯源：%s' % json.dumps(溯源, ensure_ascii=False),
+                  file=sys.stderr)
+        错误 = 执行结果.get(_F错误)
+        if 错误:
+            print('执行错误：%s' % 错误, file=sys.stderr)
+    return _EXIT_RUN if 执行结果.get(_F错误) else _EXIT_OK
+
+
 _DISPATCH = {
     'list': _cmd_list,
     'search': _cmd_search,
     'select': _cmd_select,
+    'plan': _cmd_plan,
+    'ask': _cmd_ask,
     'synthesize': _cmd_synthesize,
     'run': _cmd_run,
     'show': _cmd_show,

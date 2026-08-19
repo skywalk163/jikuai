@@ -69,8 +69,8 @@ _S共享类型 = '类型'
 #: `索引.json` 条目的键。**这不是协议字段**，是块索引的落盘格式（真源
 #: `pkg.blocks` 的索引写入侧），所以不从 schema 常量取——把两套键混成一套，
 #: 将来任一侧变了都会牵连另一侧。
-_I名称, _I领域, _I层级, _I描述 = '名称', '领域', '层级', '描述'
-_I输入, _I输出, _I导出 = '输入', '输出', '导出'
+_I名称 = '名称'
+_I输入, _I输出 = '输入', '输出'
 _I类型, _I槽名 = '类型', '名'
 _I块表 = '块'
 
@@ -166,19 +166,26 @@ def _读json(path):
 
 
 def _索引表(索引路径=None):
-    """块名 → `索引.json` 条目。读不到就返回空表。
+    """块名 → `索引.json` 条目。**读不到返回 `None`**（不是空表）。
 
-    读不到不在这里炸（与 `schema._load_index` 同一口径）：索引缺失/损坏是 G11/G12
-    门禁的职责，不该把一次 `规划` 请求打挂。代价是候选的 `输入槽` 会是空数组——
-    那是**如实**的「不知道」，比编一组槽名让 LLM 照着填要好。
+    为什么必须把「读不到」与「读到了但库是空的」分开（W157 review C002）：候选的
+    `输入槽` 是空数组时，`validate_filled` 的规则 1 会把它当「这个块真的零参数」，
+    于是 `参数: []` 全部放行——防「省略实参导致粘合器静默错绑」的唯一闸被悄悄卸掉，
+    而 `build_context` 的自查拦不住（空 `输入槽` 是协议**显式允许**的合法形状，见
+    `schema.validate_context_candidate` 的注释）。
+
+    改前这里吞掉异常返回 `{}`，理由写的是「索引缺失是 G11/G12 门禁的职责，不该把
+    一次请求打挂」。那条理由对 `选` 成立，对 `规划` **不成立**：上下文包的全部价值
+    就在槽信息上，没有索引就没有槽信息，此时吐一个包比不吐更危险。故改由
+    `build_context` 收到 `None` 时显式炸（fail-closed）。
     """
     try:
         data = _读json(索引路径 or 默认索引路径())
     except (OSError, ValueError):
-        return {}
+        return None
     条目表 = data.get(_I块表)
     if not isinstance(条目表, list):
-        return {}
+        return None                     # 键都不对，等于索引损坏，同样不许静默降级
     表 = {}
     for 条目 in 条目表:
         名 = 条目.get(_I名称)
@@ -255,18 +262,14 @@ def _分歧告警(需求):
 # 候选（W156）
 # ---------------------------------------------------------------------------
 
-def _块导出名(条目, 块名):
-    """块名 → 主 `导出名`。tie-break 与 `schema.export_table` 逐字同源：
-    与块同名的优先，否则取排序首位。查不到退回块名（索引过期时的唯一降级点）。"""
-    导出 = 条目.get(_I导出)
-    名单 = sorted(n for n in (导出 or []) if isinstance(n, str) and n)
-    if not 名单:
-        return 块名
-    return 块名 if 块名 in 名单 else 名单[0]
+def _候选(hit, 元表, 导出表, 层级表):
+    """`retrieval.Hit` + 索引条目 → 一条**上下文包候选**（带 `输入槽`/`输出类型`）。
 
-
-def _候选(hit, 元表):
-    """`retrieval.Hit` + 索引条目 → 一条**上下文包候选**（带 `输入槽`/`输出类型`）。"""
+    `导出表`/`层级表` 由调用方一次性从 `schema.export_table` / `schema.level_table`
+    取好传进来（W157 review R001/R002）：那两处的 tie-break 与落 0 兜底是真源，
+    在这里重抄一遍会让「目录名≠导出名」的块在两条通道上拼出不同的导入行。
+    查不到时退回 `hit.name` / 0——索引过期是 G12 门禁的事，这里只保留一处降级。
+    """
     条目 = 元表.get(hit.name) or {}
     槽表 = []
     for slot in (条目.get(_I输入) or []):
@@ -276,14 +279,11 @@ def _候选(hit, 元表):
             名=slot.get(_I槽名) or '', 类型=类型串(slot.get(_I类型))))
     输出 = 条目.get(_I输出)
     输出类型 = 类型串((输出 or {}).get(_I类型) if isinstance(输出, dict) else None)
-    try:
-        层级 = int(条目.get(_I层级, 0))
-    except (TypeError, ValueError):
-        层级 = 0
     命名空间 = getattr(hit, 'namespace', '') or ''
     return schema.make_context_candidate(
-        名称=hit.name, 领域=hit.domain, 层级=层级,
-        导出名=_块导出名(条目, hit.name), 描述=hit.description, 分数=hit.score,
+        名称=hit.name, 领域=hit.domain, 层级=层级表.get(hit.name, 0),
+        导出名=导出表.get(hit.name) or hit.name,
+        描述=hit.description, 分数=hit.score,
         输入槽=槽表, 输出类型=输出类型, 路径=getattr(hit, 'path', '') or '',
         命名空间=命名空间 or None)
 
@@ -372,7 +372,16 @@ def build_context(需求, top=8, 索引路径=None, 语义层路径=None,
     """
     hits = retrieval.retrieve(需求, top, query_vector)
     元表 = _索引表(索引路径)
-    候选表 = [_候选(h, 元表) for h in hits]
+    if 元表 is None:
+        # 见 `_索引表` 的说明：没索引就没槽信息，此时吐包会静默卸掉规则 1。
+        raise schema.SchemaError(
+            '读不到块索引 %s，规划器拒绝出上下文包。没有 `输入槽` 的候选会让'
+            '回填校验器的规则 1 退化成「实参必须是空数组」，等于把防静默错绑的'
+            '唯一闸卸掉。请先跑 scripts/generate_block_index.py 或检查部署'
+            % (索引路径 or 默认索引路径()))
+    导出表 = schema.export_table(索引路径)
+    层级表 = schema.level_table(索引路径)
+    候选表 = [_候选(h, 元表, 导出表, 层级表) for h in hits]
     命中表 = 语义命中(需求, 语义层路径)
     告警表 = _分歧告警(需求)
     信封 = schema.make_context_envelope(
@@ -448,6 +457,22 @@ def _规则1与2(步骤表, 候选表):
             理由.append(
                 '%s「%s」的 %s 给了 %d 个，该块要 %d 个：%s'
                 % (位置, 名, _F参数, len(实参), len(槽表), _槽清单(槽表)))
+            continue
+        # 逐个实参必须是**非空字符串**（变量名或共享常量名）。W157 review C001/C005：
+        # `schema.validate_plan` 只校验 `参数` 是数组、不管元素类型，于是
+        # `参数: [{...}]` / `[null]` / `[123]` 既能过长度检查（静默放行、粘合器
+        # 渲染出无意义实参），又会在规则 5 的 `实 not in 无声明` 上把校验器本身
+        # 打挂（set 成员测试拿不可哈希对象 → TypeError）。一处校验堵两条。
+        for k, 实 in enumerate(实参):
+            if isinstance(实, str) and 实.strip():
+                continue
+            槽 = 槽表[k] if k < len(槽表) else {}
+            理由.append(
+                '%s「%s」的 %s 第 %d 个是 %r，不是变量名/共享常量名。'
+                '该槽是 %s:%s——实参位只能写名字（`赵果1` 这类步骤产出，'
+                '或 %s 里声明的常量名），不能内联字面量或嵌套结构'
+                % (位置, 名, _F参数, k + 1, 实,
+                   槽.get(_F槽名), 槽.get(_F槽类型), _F共享))
     return 理由
 
 
@@ -523,7 +548,10 @@ def _规则5(方案, 步骤表, 候选表):
         if not isinstance(实参, list):
             continue
         for k, 实 in enumerate(实参):
-            if k >= len(槽表) or 实 not in 无声明:
+            # `isinstance` 守卫不是冗余：规则 1 只**记理由**不中断，非字符串实参会一路
+            # 走到这里；`实 not in 无声明`（set 成员测试）拿到 dict/list 会抛
+            # TypeError，把校验器本身打挂（W157 review C001）。
+            if not isinstance(实, str) or k >= len(槽表) or 实 not in 无声明:
                 continue
             槽 = 槽表[k]
             槽类型 = 槽.get(_F槽类型)
@@ -603,6 +631,11 @@ def _cmd校验(args):
 
 
 def main(argv=None):
+    """命令行入口。返回进程退出码，遵循本仓约定：`0` 成功 / `1` 输入错误。
+
+    两个子命令：`上下文 <需求>` 把上下文包打到 stdout（JSON）；
+    `校验 <回填.json> <上下文包.json>` 把拒绝理由打到 stderr 并回 1，通过则回 0。
+    """
     p = argparse.ArgumentParser(
         description='规划器：上下文包构造 + 回填硬校验（ADR-41）')
     subs = p.add_subparsers(dest='子命令')

@@ -127,6 +127,23 @@ def test_类型串_结构化类型按ADR26写法渲染(索引表):
     assert planner.类型串('没这个类型') == '任意'
 
 
+def test_索引读不到时拒绝出包而不是给空槽(tmp_path):
+    """W157 review C002：索引读不到时若把 `输入槽` 一律落成空数组，`validate_filled`
+    的规则 1（`len(实参) == len(槽表)`）会退化成「实参必须是空数组」——`参数: []`
+    全部放行，防静默错绑的唯一闸被悄悄卸掉，而 `build_context` 的自查**拦不住**
+    （空 `输入槽` 是协议显式允许的合法形状）。故这里必须 fail-closed：宁可不出包。
+    """
+    缺 = tmp_path / '没有这个索引.json'
+    with pytest.raises(schema.SchemaError) as e:
+        planner.build_context('2026年6月各车型的总产量', 索引路径=str(缺))
+    assert '读不到块索引' in str(e.value)
+    assert planner._索引表(str(缺)) is None, '读不到要回 None，不是空表'
+
+    坏 = tmp_path / '坏索引.json'
+    坏.write_text('{"不是块": []}', encoding='utf-8')
+    assert planner._索引表(str(坏)) is None, '键都不对等于索引损坏，同样不许静默降级'
+
+
 def test_语义命中把口径备注映射成口径说明():
     """语义层文件里叫 `口径备注`，协议里叫 `口径说明`——映射只在 planner 一处。"""
     命中 = planner.语义命中('2026年6月各车型的总产量')
@@ -152,6 +169,7 @@ def test_语义命中_非制造问句为空这是作用域边界():
 
 
 def test_分歧告警_缺陷率问句出告警且须显式选一条():
+    """缺陷率那处只有一侧有块，`两侧块名` 只装一个名字且 `须显式选一条` 恒 True。"""
     包 = planner.build_context('2026年6月M003车型缺陷率相对5月是否明显上升？')
     名单 = [w['分歧点'] for w in 包['分歧告警']]
     assert any('缺陷率' in n for n in 名单)
@@ -196,6 +214,7 @@ def test_分歧点表与G22门禁的块名集合一致():
 
 
 def test_拒答建议_覆盖是布尔且理由登记已知缺口():
+    """`覆盖` 必须是布尔（不是分数），`理由` 必须登记制造域先验缺口与「非阈值」口径。"""
     包 = planner.build_context('2026年6月各车型的总产量是多少？')
     建议 = 包['拒答建议']
     assert 建议['覆盖'] is True
@@ -222,6 +241,7 @@ def test_拒答建议_非制造问句判未覆盖且说清这是作用域边界(
 
 
 def test_回填契约_必填项点明参数不许省及其根因():
+    """契约不光要说「参数必填」，还要带上 W145 静默错绑的根因，否则读者会当它是洁癖。"""
     包 = planner.build_context('2026年6月各车型的总产量是多少？')
     契约 = 包['回填契约']
     assert 契约['目标'] == '方案'
@@ -309,6 +329,7 @@ def test_反例1_缺参数(表载入候选):
 
 
 def test_反例1b_参数长度不等于槽数(产量汇总候选):
+    """长度不符时理由要报清「给了几个 / 要几个」并列出缺的那个槽的名与类型。"""
     包 = _包([产量汇总候选])
     回填 = _回填([schema.make_step('产量汇总', '制造', '计产', 参数=['赵表'])])
     理由 = planner.validate_filled(回填, 包)
@@ -324,6 +345,26 @@ def test_反例1c_零参数块要空数组而不是省略():
     assert planner.validate_filled(缺, 包)
     空 = _回填([schema.make_step('取时钟', '工具', '现在', 参数=[])])
     assert planner.validate_filled(空, 包) == []
+
+
+@pytest.mark.parametrize('坏实参', [{'嵌套': 1}, None, 123, '', '   ', ['a']],
+                         ids=['字典', '空值', '整数', '空串', '纯空白', '数组'])
+def test_反例1d_实参不是变量名一律拒且严格模式不崩(表载入候选, 坏实参):
+    """W157 review C001/C005：`schema.validate_plan` 只校验 `参数` 是数组、不管元素
+    类型，所以规则 1 只比长度时 `参数: [{...}]` 会**静默放行**（粘合器渲染出无意义
+    实参），而同一份输入在 `严格=True` 下会把校验器本身打挂（`实 not in 无声明` 对
+    set 做成员测试，拿到 dict/list 抛 TypeError）。两条同根，一处校验一起堵。
+    """
+    包 = _包([表载入候选])
+    回填 = _回填([schema.make_step('表载入', '制造', '读表', 参数=[坏实参])],
+                 共享=[{'名': '赵路径', '值': '"a.csv"'}])
+    理由 = planner.validate_filled(回填, 包)
+    assert 理由, '非严格模式也必须拒——静默放行比报错糟得多'
+    assert any('不是变量名/共享常量名' in r for r in 理由)
+    assert any('路径:字符串' in r for r in 理由), '理由要说清该槽要什么'
+    # 严格模式必须同样给出理由，而不是抛 TypeError 把校验器打挂
+    assert planner.validate_filled(回填, 包, 严格=True)
+
 
 
 # --- 反例 2：幻觉块名（规则 2）----------------------------------------------

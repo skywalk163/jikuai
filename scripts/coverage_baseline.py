@@ -55,6 +55,28 @@ REPO_ROOT = os.path.normpath(os.path.join(_HERE, '..'))
 #: 逐文件覆盖率下限（点阈值）的数据文件。W94 纪律「点阈值优先于面阈值」的落地物。
 下限文件 = os.path.join(REPO_ROOT, 'docs', '覆盖率下限.json')
 
+#: 覆盖率跑**排除**的测试文件（W163）。这不是「跳过测试」——排除的文件在 CI 的
+#: 「运行全部测试」那一步已经**全速跑过一遍**（`.gitea/workflows/ci.yml`），
+#: 本脚本是第二遍、只为量 `src/jikuai` 的覆盖率。
+#:
+#: 为什么要排：这两个文件是「起子进程跑门禁 / 回放录像」型测试，而本脚本往
+#: site-packages 装了 `.pth` 钩子让**每个子进程都挂 coverage**，于是嵌套子进程
+#: （测试 → `check_planner_contract` → `bench_planner` → 15 份录像）每一层都要付
+#: coverage 初始化 + 写 `.coverage.*` 的代价，放大倍率远高于同进程测试。
+#: 实测（本机、不带覆盖率）：全套 3086 个测试 265s，其中 ≥10s 的 8 个测试全在
+#: 这两个文件里，合计 77s —— 个数占 0.2%、墙钟占 29%。v0.27.0 就是被这一下
+#: 顶过了 25 分钟的 job 上限（CI 跑到 56% 超时，一个覆盖率数字都没产出）。
+#:
+#: 为什么排了不影响结论：它们测的是 `scripts/check_planner_contract.py` 与
+#: `tools/ai-bridge/`，**都不在** `docs/覆盖率下限.json` 的点阈值表里（表里全是
+#: `src/jikuai/*`）；子进程路过的那些 `src/jikuai` 行另有直接测试覆盖。
+#: **加新条目前必须实测点阈值不掉**，别凭「看着像不影响」就往里加 —— 那是这份
+#: 清单变成藏污纳垢处的开始。
+覆盖率排除 = (
+    'tests/test_v0_27_0_w161_G23规划器契约.py',
+    'tests/test_v0_27_0_w160_规划录像与bench.py',
+)
+
 #: `.pth` 文件名。前缀 `zzz_` 是刻意的：site-packages 里的 `.pth` 按文件名
 #: 排序执行，排在后面能确保 coverage 包本身已可导入。
 PTH_NAME = 'zzz_jikuai_coverage_subprocess.pth'
@@ -170,6 +192,9 @@ def main(argv=None):
     解析器.add_argument('--检查下限', dest='检查下限', action='store_true',
                         help='按 docs/覆盖率下限.json 逐文件卡点阈值，'
                              '任一文件跌破其下限即以非 0 退出（W94 点阈值纪律）')
+    解析器.add_argument('--不排除', dest='不排除', action='store_true',
+                        help='连 覆盖率排除 里的子进程密集文件一起跑（要 ~2 倍时间，'
+                             '只在核对「排除是否真的不影响点阈值」时用）')
     args = 解析器.parse_args(list(sys.argv[1:] if argv is None else argv))
 
     try:
@@ -201,8 +226,15 @@ def main(argv=None):
         if 码 != 0:
             return 码
 
-        测试码 = _跑([sys.executable, '-m', 'coverage', 'run',
-                      '-m', 'pytest', 'tests', '-q'], 环境)
+        测试参数 = [sys.executable, '-m', 'coverage', 'run',
+                    '-m', 'pytest', 'tests', '-q']
+        if not args.不排除:
+            for 文件 in 覆盖率排除:
+                测试参数.append('--ignore=' + 文件)
+            print('覆盖率跑排除 %d 个子进程密集文件（它们在「运行全部测试」那步已全速跑过，'
+                  '这里只是不进覆盖率统计）：%s'
+                  % (len(覆盖率排除), '、'.join(覆盖率排除)))
+        测试码 = _跑(测试参数, 环境)
 
         # 无论测试成败都 combine —— 失败时的部分数据也有诊断价值。
         码 = _跑([sys.executable, '-m', 'coverage', 'combine'], 环境)

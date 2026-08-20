@@ -124,6 +124,33 @@ class Test判定:
         assert 达标
 
 
+class Test覆盖率排除:
+    """`覆盖率排除` 是覆盖率跑默认 `--ignore` 掉的子进程密集文件清单（W163）。
+
+    它不进覆盖率统计，但**在「运行全部测试」那步全速跑过**，所以排除不等于放松门禁。
+    这里的两条测试守的是这份清单不腐烂：条目改名/删除而没同步，只会在 CI 里
+    以「--ignore 一个不存在的文件」静默失效，比表和现实脱节更隐蔽。
+    """
+
+    def test_条目都指向真实存在的文件(self, 编排器):
+        缺失 = [文件 for 文件 in 编排器.覆盖率排除
+                if not os.path.exists(os.path.join(仓库根, *文件.split('/')))]
+        assert not 缺失, '覆盖率排除点名的文件不存在（改名/删除没同步）：%s' % 缺失
+
+    def test_条目是tests下的posix相对路径(self, 编排器):
+        """`--ignore=` 的实参要能在仓库根下对上，反斜杠或绝对路径都会静默失配。"""
+        assert 编排器.覆盖率排除, '覆盖率排除是空的——那 --不排除 分支就成了摆设'
+        for 文件 in 编排器.覆盖率排除:
+            assert '\\' not in 文件, '必须用 posix 分隔符：%s' % 文件
+            assert 文件.startswith('tests/'), '只该排除测试文件：%s' % 文件
+
+    def test_不排除开关存在(self, 编排器):
+        """`--不排除` 是核对「排除是否真的不掉点阈值」的唯一逃生口，删了就没法自证。"""
+        源码 = open(os.path.join(仓库根, 'scripts', 'coverage_baseline.py'),
+                    encoding='utf-8').read()
+        assert "'--不排除'" in 源码
+
+
 class Test其他:
     def test_下限文件缺失时不误判(self, 编排器, 写JSON, monkeypatch):
         """没有下限表就没有点阈值可卡，应当放行而不是把一切判成违规。"""

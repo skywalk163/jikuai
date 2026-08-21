@@ -21,6 +21,7 @@ from .retrieval import (  # noqa: F401
     MODE_NEURAL,
     PATH_HEURISTIC,
     PATH_NEURAL,
+    PATH_SEMANTIC,
     Hit,
     RetrievalError,
     Retriever,
@@ -34,7 +35,7 @@ from .retrieval import (  # noqa: F401
 
 __all__ = [
     'MODE_AUTO', 'MODE_ENV', 'MODE_HEURISTIC', 'MODE_NEURAL',
-    'PATH_HEURISTIC', 'PATH_NEURAL',
+    'PATH_HEURISTIC', 'PATH_NEURAL', 'PATH_SEMANTIC',
     'Hit', 'RetrievalError', 'Retriever', 'VectorIndex',
     'describe', 'load_vector_index', 'reset_cache', 'retrieve',
     'vector_index_path',

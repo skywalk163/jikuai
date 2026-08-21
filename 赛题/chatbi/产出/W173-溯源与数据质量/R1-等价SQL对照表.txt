@@ -1,0 +1,166 @@
+等价 SQL 逐步对照表
+============================================================
+需求：【厂长视角】2026 年 6 月 10–24 日，各产线单车电耗相对自身上半年基线是升是降？——跨产线看趋势，参照系必须写清。
+方言：ANSI SQL（只作展示，本工具从不执行，也不连接任何数据库）
+覆盖：7/7 步登记了等价 SQL
+
+------------------------------------------------------------
+第 1 步 · 表载入 → 读表
+  .jk ：定义赵果1=读表(赵能耗路)。
+  SQL ：
+        SELECT *
+        FROM fact_energy_usage
+
+------------------------------------------------------------
+第 2 步 · 窗口 → 截期
+  .jk ：定义赵果2=截期(赵果1 赵耗日列 赵窗起 赵窗止)。
+  SQL ：
+        SELECT *
+        FROM 赵果1
+        WHERE usage_date BETWEEN '2026-06-10' AND '2026-06-24'  -- 闭区间，两端都含
+
+------------------------------------------------------------
+第 3 步 · 单车电耗现成 → 车耗现
+  .jk ：定义赵果3=车耗现(赵果2 赵产线维)。
+  SQL ：
+        SELECT line_id,
+               COUNT(*)                    AS 记录数,
+               COUNT(energy_per_vehicle)   AS 非空记录数,
+               AVG(energy_per_vehicle)     AS 单车电耗均值
+               -- 口径 A：现成比率列记录等权平均，分母是**非空记录数**。
+               -- SQL 的 AVG 本就跳过 NULL，与块一致；别改写成 SUM/COUNT(*)。
+        FROM 赵果2
+        GROUP BY line_id
+        ORDER BY line_id
+
+------------------------------------------------------------
+第 4 步 · 窗口 → 截期
+  .jk ：定义赵果4=截期(赵果1 赵耗日列 赵基线始 赵基线末)。
+  SQL ：
+        SELECT *
+        FROM 赵果1
+        WHERE usage_date BETWEEN '2026-01-01' AND '2026-06-09'  -- 闭区间，两端都含
+
+------------------------------------------------------------
+第 5 步 · 单车电耗现成 → 车耗现
+  .jk ：定义赵果5=车耗现(赵果4 赵产线维)。
+  SQL ：
+        SELECT line_id,
+               COUNT(*)                    AS 记录数,
+               COUNT(energy_per_vehicle)   AS 非空记录数,
+               AVG(energy_per_vehicle)     AS 单车电耗均值
+               -- 口径 A：现成比率列记录等权平均，分母是**非空记录数**。
+               -- SQL 的 AVG 本就跳过 NULL，与块一致；别改写成 SUM/COUNT(*)。
+        FROM 赵果4
+        GROUP BY line_id
+        ORDER BY line_id
+
+------------------------------------------------------------
+第 6 步 · 基线偏离 → 基偏
+  .jk ：定义赵果6=基偏(赵果3 赵果5 赵产线维 赵现成列名)。
+  SQL ：
+        SELECT COALESCE(甲.line_id, 乙.line_id) AS line_id,
+               CASE WHEN 甲.line_id IS NULL THEN '只基线窗有'
+                    WHEN 乙.line_id IS NULL THEN '只观察窗有'
+                    ELSE '两窗都有' END AS 对齐,
+               乙.单车电耗均值 AS 基线值,
+               甲.单车电耗均值 AS 观察值,
+               甲.单车电耗均值 - 乙.单车电耗均值 AS 偏离,
+               (甲.单车电耗均值 - 乙.单车电耗均值) / 乙.单车电耗均值 AS 升幅
+               -- 甲 = 赵果3、乙 = 赵果5（两个表参数粘合器分不清，方案里必须显式写）。
+        FROM 赵果3 甲
+        FULL OUTER JOIN 赵果5 乙 ON 甲.line_id = 乙.line_id
+          -- 内连接会丢掉「只有一侧有」的组，而那恰是「对齐」要报的事；
+          -- SQLite/MySQL 无 FULL OUTER JOIN，需改写成两个 LEFT JOIN 的 UNION。
+        ORDER BY line_id
+
+------------------------------------------------------------
+第 7 步 · 趋势判定 → 判势
+  .jk ：定义赵果7=判势(赵果6 赵比率列 赵参照系 赵持平阈)。
+  SQL ：
+        SELECT *,
+               CASE WHEN 升幅 IS NULL     THEN '无法判断'
+                    WHEN 升幅 >  0.05       THEN '上升'
+                    WHEN 升幅 < -0.05       THEN '下降'
+                    ELSE '持平' END AS 趋势,
+               '自身基线窗 2026-01-01～2026-06-09 的单车电耗均值（同产线、口径 A 现成列 energy_per_vehicle 等权平均）' AS 参照系,
+               '升幅' AS 判据比率列,
+               0.05 AS 持平阈值
+               -- 两端都算持平（|r| ≤ 阈值）；比率为空是「无法判断」，
+               -- **不折进持平**。阈值与比率同量纲（0-1 小数）。
+        FROM 赵果6
+
+============================================================
+WITH 链全文（一步一个 CTE，只作展示、不执行）：
+
+-- ANSI SQL（只作展示，本工具从不执行，也不连接任何数据库）
+-- 一步一个 CTE，CTE 名 = 方案里那一步的结果变量。
+-- 已知失真：CTE 里的 ORDER BY 在多数引擎里**不保证**传到外层，而块
+-- 是保证行序的（汇总块按维度键升序、缺陷两块按度量降序）。要拿到与
+-- 极快一致的行序，得把 ORDER BY 再写一遍在最外层。
+WITH 赵果1 AS (
+  SELECT *
+  FROM fact_energy_usage
+),
+赵果2 AS (
+  SELECT *
+  FROM 赵果1
+  WHERE usage_date BETWEEN '2026-06-10' AND '2026-06-24'  -- 闭区间，两端都含
+),
+赵果3 AS (
+  SELECT line_id,
+         COUNT(*)                    AS 记录数,
+         COUNT(energy_per_vehicle)   AS 非空记录数,
+         AVG(energy_per_vehicle)     AS 单车电耗均值
+         -- 口径 A：现成比率列记录等权平均，分母是**非空记录数**。
+         -- SQL 的 AVG 本就跳过 NULL，与块一致；别改写成 SUM/COUNT(*)。
+  FROM 赵果2
+  GROUP BY line_id
+  ORDER BY line_id
+),
+赵果4 AS (
+  SELECT *
+  FROM 赵果1
+  WHERE usage_date BETWEEN '2026-01-01' AND '2026-06-09'  -- 闭区间，两端都含
+),
+赵果5 AS (
+  SELECT line_id,
+         COUNT(*)                    AS 记录数,
+         COUNT(energy_per_vehicle)   AS 非空记录数,
+         AVG(energy_per_vehicle)     AS 单车电耗均值
+         -- 口径 A：现成比率列记录等权平均，分母是**非空记录数**。
+         -- SQL 的 AVG 本就跳过 NULL，与块一致；别改写成 SUM/COUNT(*)。
+  FROM 赵果4
+  GROUP BY line_id
+  ORDER BY line_id
+),
+赵果6 AS (
+  SELECT COALESCE(甲.line_id, 乙.line_id) AS line_id,
+         CASE WHEN 甲.line_id IS NULL THEN '只基线窗有'
+              WHEN 乙.line_id IS NULL THEN '只观察窗有'
+              ELSE '两窗都有' END AS 对齐,
+         乙.单车电耗均值 AS 基线值,
+         甲.单车电耗均值 AS 观察值,
+         甲.单车电耗均值 - 乙.单车电耗均值 AS 偏离,
+         (甲.单车电耗均值 - 乙.单车电耗均值) / 乙.单车电耗均值 AS 升幅
+         -- 甲 = 赵果3、乙 = 赵果5（两个表参数粘合器分不清，方案里必须显式写）。
+  FROM 赵果3 甲
+  FULL OUTER JOIN 赵果5 乙 ON 甲.line_id = 乙.line_id
+    -- 内连接会丢掉「只有一侧有」的组，而那恰是「对齐」要报的事；
+    -- SQLite/MySQL 无 FULL OUTER JOIN，需改写成两个 LEFT JOIN 的 UNION。
+  ORDER BY line_id
+),
+赵果7 AS (
+  SELECT *,
+         CASE WHEN 升幅 IS NULL     THEN '无法判断'
+              WHEN 升幅 >  0.05       THEN '上升'
+              WHEN 升幅 < -0.05       THEN '下降'
+              ELSE '持平' END AS 趋势,
+         '自身基线窗 2026-01-01～2026-06-09 的单车电耗均值（同产线、口径 A 现成列 energy_per_vehicle 等权平均）' AS 参照系,
+         '升幅' AS 判据比率列,
+         0.05 AS 持平阈值
+         -- 两端都算持平（|r| ≤ 阈值）；比率为空是「无法判断」，
+         -- **不折进持平**。阈值与比率同量纲（0-1 小数）。
+  FROM 赵果6
+)
+SELECT * FROM 赵果7;

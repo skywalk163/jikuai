@@ -20,6 +20,7 @@
 单文件的话门禁会因「加载失败」而红——红得对但原因不对，那种反例证明不了断言本身。
 """
 
+import ast
 import importlib.util
 import io
 import json
@@ -233,9 +234,35 @@ class 串进主门禁(unittest.TestCase):
             源 = f.read()
         self.assertIn('import check_planner_contract', 源)
         self.assertIn('check_planner_contract.main(["--quiet"])', 源)
-        # G13+ 那套 `except → 跳过` 不许蔓延到新门禁：G23 的调用不能在 try 里
-        段 = 源.split('import check_planner_contract', 1)[1][:400]
-        self.assertNotIn('except', 段)
+        # G13+ 那套「捕获异常就跳过」不许蔓延到新门禁：G23 的调用不能在 try 里。
+        #
+        # 这里走 **AST** 而不是「取后 400 字符再 grep except」（W167 修）：那种写法
+        # 会被**注释文本**误判——v0.28.0 在 G23 之后插 G24 时，G24 的注释里写了
+        # 「不学 G13+ 的 except → 跳过」这句说明，400 字符窗口当场扫到 `except`
+        # 假红一次。窗口大小与注释措辞本来就没关系，按语法树问「这个调用有没有被
+        # try 包住」才是真判据。
+        树 = ast.parse(源, filename=路径)
+
+        def 是G23调用(节点):
+            if not isinstance(节点, ast.Call):
+                return False
+            f = 节点.func
+            return (isinstance(f, ast.Attribute) and f.attr == 'main'
+                    and isinstance(f.value, ast.Name)
+                    and f.value.id == 'check_planner_contract')
+
+        命中 = False
+        for 节点 in ast.walk(树):
+            if isinstance(节点, ast.Try):
+                for 子 in ast.walk(节点):
+                    self.assertFalse(
+                        是G23调用(子),
+                        'G23 的 check_planner_contract.main 被包在 try 里了——'
+                        '门禁失败会被吞成「跳过」，等于没有这道门禁')
+            if 是G23调用(节点):
+                命中 = True
+        self.assertTrue(命中, 'AST 里找不到 check_planner_contract.main 调用')
+
 
 
 if __name__ == '__main__':

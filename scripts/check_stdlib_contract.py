@@ -312,6 +312,48 @@ def main(argv):
     if check_planner_contract.main(["--quiet"]) != 0:
         exit_code = exit_code or 1
 
+    # G24：演示端点安全契约（W165 · v0.28.0 · ADR-42）。两套断言：
+    # 静态（AST 扫 demo_server.py：无进程内 run_source/exec/eval、块白名单非空、
+    # Token 只从环境变量取、subprocess.run 带 timeout）+ **行为**（起 port=0 真实例，
+    # 发四类请求断言无 Token→401 / 带「源码」键→400 / 白名单外块→400 / 路径逃逸→400）。
+    #
+    # 同 G16/G17/G19/G22/G23：**不**学 G13+ 的 `except → 跳过`。它比 G10-G19 略慢
+    # （起一个 HTTP 实例发 4 个请求，约 1 秒），远快于 G23 的录像回放，串在主流程里
+    # 没有负担。演示端点是「可以给人点」的信任边界，守卫不进 CI 等于没有。
+    import check_demo_endpoint_contract
+    if check_demo_endpoint_contract.main(["--quiet"]) != 0:
+        exit_code = exit_code or 1
+
+    # G25：块 `.jk` 形参名词法原子性（W171 · v0.28.0）。目录名（G11 侧
+    # `check_module_segment_atomicity`）与导出名（`check_export_atomicity`）早有
+    # 校验，**形参名一直没有**。W167 真踩过一次：`赵维度列` 里的 `列` 是内建动词，
+    # 分词切成 `IDENT 赵维度` + `VERB 列`，`计停(赵表, 赵维度列)` 被编译成
+    # `计停(赵表, 赵维度, 列())`，报「takes 2 positional arguments but 3 were
+    # given」——看着像模块加载器的锅，其实是词法。`jk 块 新建` 有形参名预检，但
+    # **手写块文件绕得过它**，所以这把尺必须挪到门禁上（BACKLOG §12.4 记的账）。
+    #
+    # 判定复用 `check_export_atomicity`（走 lexer 实测 token 数），**不拿正则判
+    # 原子性**——正则判等于旁路分词器，那正是 W167 那个坑的成因。正则只用来定位
+    # `函数 … 接收 …：` 子句、切出作者写下的那个词；也刻意不读 parser 的
+    # `FuncDef.params`，因为 parser 只收 IDENT，`赵维度列` 到它手上已经变成
+    # `赵维度` 了，拿它当输入等于让门禁跟着一起瞎。
+    #
+    # 同 G16/G17/G19/G22-G24：**不**学 G13+ 的 `except → 跳过`。纯文本扫描，
+    # 288 个 `.jk` / 131 个函数定义 / 285 个形参，耗时可忽略。
+    from jikuai.pkg.blocks import check_stdlib_param_atomicity
+    形参问题 = check_stdlib_param_atomicity()
+    if 形参问题:
+        print("G25 块形参名非词法原子（%d 处）：" % len(形参问题))
+        for 相对路径, 函数名, 形参名, 碎片 in 形参问题:
+            碎 = '+'.join('%s(%s)' % (v, t) for t, v in 碎片)
+            print("  - %s 的 函数 %s：形参「%s」被切成 %s"
+                  % (相对路径, 函数名, 形参名, 碎))
+        print("  修复：换一个不含内建动词/副词的形参名（`赵维度列` → `赵维度清单`）。"
+              "判据与 导出名 同一把尺：整体必须是单个 IDENT。")
+        exit_code = exit_code or 1
+
+
+
 
     # G20：wheel 内容门禁（W116 · v0.24.0 · ADR-39 §5）。守 BACKLOG §10 那次
     # 已经发生过的事故——PyPI 0.4.1 的 wheel 里零个 stdlib 文件，装完 `导入 数学`

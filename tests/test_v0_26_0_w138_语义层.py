@@ -87,7 +87,8 @@ def 校验语义层(数据: dict):
     for i, 条 in enumerate(条目):
         词 = 条.get("业务词")
         位置 = "第 %d 条（%s）" % (i + 1, 词)
-        for 必填 in ("业务词", "表", "字段", "口径备注", "现成比率列", "派生"):
+        for 必填 in ("业务词", "表", "字段", "口径备注", "现成比率列", "派生",
+                     "时间锚点"):
             if 必填 not in 条:
                 问题.append("%s 缺字段「%s」" % (位置, 必填))
         if not isinstance(词, str) or not 词.strip():

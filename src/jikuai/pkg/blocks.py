@@ -1360,6 +1360,72 @@ def check_export_atomicity(name):
     return atomic, pieces
 
 
+#: `函数 <名> 接收 <形参...>：` 定义行。**它只负责定位子句、切出作者写下的那个词**，
+#: 原子性判定一律交给 `check_export_atomicity`（走 lexer 实测）——拿正则判原子性
+#: 就是在旁路分词器，那正是 W167 那个 bug 的成因（v0.18.0「`_token_at` 走 lexer」同源）。
+_FUNC_DEF_RE = re.compile(r'^\s*函数\s+([^\s：:]+)(?:\s+接收\s+([^：:]*))?\s*[：:]')
+
+
+def extract_func_params(jk_path):
+    """从一个 `.jk` 里取出 `[(函数名, [形参名, ...]), ...]`。
+
+    **刻意读源码里作者写下的那个词，不读 parser 出来的 `FuncDef.params`**：
+    `parser._parse_param_list` 只收 `TokenType.IDENT`，形参名 `赵维度列` 被切成
+    `IDENT 赵维度` + `VERB 列` 之后它记下的形参是 `赵维度` —— 那正是 bug 本身，
+    拿它当输入等于让门禁跟着一起瞎。
+
+    行级实现，`--` 行内注释先剥掉；分隔符与 `导出` 同口径（中英逗号/顿号/空白）。
+    """
+    结果 = []
+    with open(jk_path, 'r', encoding='utf-8') as f:
+        for 行 in f:
+            m = _FUNC_DEF_RE.match(行.split('--', 1)[0])
+            if not m:
+                continue
+            形参 = [片 for 片 in _EXPORT_SEP_RE.split(m.group(2) or '') if 片]
+            结果.append((m.group(1), 形参))
+    return 结果
+
+
+def check_stdlib_param_atomicity(root=None, 含测试=True):
+    """G25：块 `.jk` 的**形参名**词法原子性（v0.28.0 W171）。
+
+    目录名（`check_module_segment_atomicity`）与导出名（`check_export_atomicity`）
+    早有校验，形参名一直没有。W167 因此真踩了一次：形参名 `赵维度列` 里的 `列` 是
+    内建动词（变长列表构造），分词切成 `IDENT 赵维度` + `VERB 列`，
+    `计停(赵表, 赵维度列)` 于是被编译成 `计停(赵表, 赵维度, 列())`，报
+    「takes 2 positional arguments but 3 were given」——看着像模块加载器的锅，
+    其实是词法。
+
+    `jk 块 新建` 有形参名预检（`blocks_cli.py`），但**手写块文件绕得过它**，所以
+    这把尺必须挪到门禁上。判定直接复用 `check_export_atomicity`：形参名与导出名在
+    调用侧面临同一个分词处境，都必须是单个 `IDENT`。
+
+    `含测试=True` 时连 `测试.jk` 一起扫 —— 块自测里写坏形参照样是坏形参，而
+    「块的对外接口才算」这种豁免只会给下一次同样的坑留门。
+
+    返回 `[(相对路径, 函数名, 形参名, 切分结果), ...]`，空列表 = 门禁绿。
+    """
+    if root is None:
+        root = blocks_root()
+    问题 = []
+    for 目录, 子目录, 文件们 in os.walk(root):
+        子目录.sort()                        # 报告顺序确定可复现
+        for 名 in sorted(文件们):
+            if not 名.endswith('.jk'):
+                continue
+            if not 含测试 and 名 == '测试.jk':
+                continue
+            jk = os.path.join(目录, 名)
+            for 函数名, 形参 in extract_func_params(jk):
+                for 形 in 形参:
+                    原子, 碎片 = check_export_atomicity(形)
+                    if not 原子:
+                        问题.append((os.path.relpath(jk, root),
+                                     函数名, 形, 碎片))
+    return 问题
+
+
 def extract_exports(jk_path):
     """从一个块的 `.jk` 文件里提取所有 `导出 X` 声明的名字集合。
 

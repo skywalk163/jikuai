@@ -79,12 +79,18 @@ class 录像本体(unittest.TestCase):
             self.assertTrue(信封['模型'].strip(), '%s 模型为空' % 条['id'])
 
     def test_录像需求与评测集逐字一致(self):
-        """回放喂给 `build_context` 的问句必须与评测集同源，否则量的不是同一件事。"""
+        """回放喂给 `build_context` 的问句必须与评测集同源，否则量的不是同一件事。
+
+        v0.28.0 W175 起同一问句可有多份不同 `模型` 的录像（`_v27` 口径重录），
+        它们的 `id` 带后缀、`问句id` 指回评测集原 id，评测集查表按 `问句id or id`。
+        """
         需求表 = _评测集需求表()
         for 条 in _清单()['录像']:
             信封 = _读(os.path.join(_录像目录, 条['文件']))
-            self.assertEqual(信封['需求'], 需求表[条['id']], 条['id'])
-            self.assertEqual(条['需求'], 需求表[条['id']], 条['id'])
+            源id = 条.get('问句id', 条['id'])
+            self.assertEqual(信封['需求'], 需求表[源id], 条['id'])
+            self.assertEqual(条['需求'], 需求表[源id], 条['id'])
+
 
     def test_清单的块与步数与方案一致(self):
         """`白名单可承载率` 拿清单的 `块` 当分母，它跟方案脱节就直接算错。"""

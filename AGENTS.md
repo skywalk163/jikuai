@@ -232,6 +232,19 @@ LSP（`python -m jikuai_lsp`）有 `workspace/executeCommand` 命令 `极快.选
   即可（`赵维度列` → `赵维度清单`）。
 - 改块元数据后要重跑 embeddings 才能过 G12；本机离线要设
   `HF_HUB_OFFLINE=1` `TRANSFORMERS_OFFLINE=1`。
+- **`tools/ai-bridge/select.py` 遮蔽标准库 `select`**：在 `tools/ai-bridge/` 下写任何
+  起 HTTP 服务的脚本时，Python 会把脚本目录塞进 `sys.path[0]`，`selectors` 于是导到这个
+  同名文件。症状很误导——端口 bind 成功、URL 也打印了，`serve_forever()` 才抛
+  `AttributeError: module 'select' has no attribute 'select'` 进程即死，客户端只看到
+  `WinError 10061 目标计算机积极拒绝`。修法是把 `sys.path` 里脚本目录挪到末尾，且这段
+  **必须排在 `http.server`/`socketserver` 导入之前**（`selectors` 一旦导入就缓存了）。
+- **真跑台架不进 CI，绿了也不等于真实模型端点验过**：
+  `tools/ai-bridge/真跑_问.py` + `参考回填端点.py`（v0.29.0 W181-W183）是跨进程真跑
+  `jk 块 问 --模型`，归档在 `tools/ai-bridge/真跑记录/`。它按 ADR-41 §8 **故意不进**
+  门禁与回归（要拉起真实网络服务），由 `tests/test_v0_29_0_w182_w183_真跑台架.py::
+  test_台架不进CI` 反向钉住。参考端点是**机械对拍端点、不是模型**（`模型` 字段恒以
+  `参考端点·` 开头），所以它 5/5 一致只销了 `docs/BACKLOG.md` §12.4 的**契约半边**，
+  真实模型半边照旧挂账——别把这条读成「真端点已验证」。
 - **改本文件第四节要重跑对照实验**：`tools/ai-bridge/agents-md-ab/` 是三臂 A/B 台架
   （裸协议 / 全文 / 只给规则），`构建判分.py 构建|判分`。它需要人在仓外空目录开三个
   独立会话跑，做不成 CI 门禁——但改了拒答相关文字就该重跑，否则等于凭感觉写文档。
